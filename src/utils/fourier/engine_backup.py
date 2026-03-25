@@ -100,67 +100,50 @@ class PolyFourierConverter(nn.Module):
         U_ = U * (xr - xq) + V * (yr - yq)
         V_ = U * (xs - xr) + V * (ys - yr)
         
-        # 相移项：exp(-2j * pi * phi) = cos(2*pi*phi) - j*sin(2*pi*phi)
-        phi = U * xq + V * yq
-        ps_real = torch.cos(-2 * pi * phi)
-        ps_imag = torch.sin(-2 * pi * phi)
+        # 修正: 相移只需采用平移原点 q 即可
+        phase_shift = torch.exp(-2j * pi * (U * xq + V * yq))
         
+        # 处理解析极限 (0分母情况，严格排他避免计算崩溃)
         zero_mask = (U_ == 0) & (V_ == 0)
         mask = (U_ + V_ == 0) & ~zero_mask
         u_mask = (U_ == 0) & ~zero_mask
         v_mask = (V_ == 0) & ~zero_mask
         normal_mask = ~(mask | zero_mask | u_mask | v_mask)
         
-        # 预计算 exp(-2j * pi * ...) 的各个部分
-        def get_exp_parts(freq):
-            return torch.cos(-2 * pi * freq), torch.sin(-2 * pi * freq)
-
-        bu_r, bu_i = get_exp_parts(U_)
-        bv_r, bv_i = get_exp_parts(V_)
-        buv_r, buv_i = get_exp_parts(U_ + V_)
-
-        p1 = torch.zeros_like(U_)
-        p2_r = torch.zeros_like(U_)
-        p2_i = torch.zeros_like(U_)
-
-        # Normal case
-        p1[normal_mask] = 1.0 / (4 * pi**2 * (U_[normal_mask]*V_[normal_mask]*(U_[normal_mask]+V_[normal_mask])))
-        p2_r[normal_mask] = U_[normal_mask]*(-buv_r[normal_mask]) + (U_[normal_mask]+V_[normal_mask])*bu_r[normal_mask] - V_[normal_mask]
-        p2_i[normal_mask] = U_[normal_mask]*(-buv_i[normal_mask]) + (U_[normal_mask]+V_[normal_mask])*bu_i[normal_mask]
-
+        base_u = torch.exp(-2j * pi * U_)
+        base_v = torch.exp(-2j * pi * V_)
+        base_uv = torch.exp(-2j * pi * (U_ + V_))
+        
+        part1 = torch.zeros_like(U_, dtype=torch.complex64)
+        part2 = torch.zeros_like(U_, dtype=torch.complex64)
+        
+        # Normal
+        part1[normal_mask] = (1.0 / (4 * pi**2 * (U_[normal_mask]*V_[normal_mask]*(U_[normal_mask]+V_[normal_mask])))).to(torch.complex64)
+        part2[normal_mask] = U_[normal_mask]*(-base_uv[normal_mask]) + (U_[normal_mask]+V_[normal_mask])*base_u[normal_mask] - V_[normal_mask]
+        
         # U+V == 0
-        p1[mask] = -1.0 / (4 * pi**2 * U_[mask]**2)
-        p2_r[mask] = bu_r[mask] - 1.0
-        p2_i[mask] = bu_i[mask] + 2 * pi * U_[mask] # j * (2*pi*U)
-
+        part1[mask] = (-1.0 / (4 * pi**2 * U_[mask]**2)).to(torch.complex64)
+        part2[mask] = base_u[mask] + 2j * pi * U_[mask] - 1.0
+        
         # U == 0
-        p1[u_mask] = -1.0 / (4 * pi**2 * V_[u_mask]**2)
-        p2_r[u_mask] = bv_r[u_mask] - 1.0
-        p2_i[u_mask] = bv_i[u_mask] + 2 * pi * V_[u_mask]
-
+        part1[u_mask] = (-1.0 / (4 * pi**2 * V_[u_mask]**2)).to(torch.complex64)
+        part2[u_mask] = base_v[u_mask] + 2j * pi * V_[u_mask] - 1.0
+        
         # V == 0
-        p1[v_mask] = 1.0 / (4 * pi**2 * U_[v_mask]**2)
-        p2_r[v_mask] = (1.0)*bu_r[v_mask] - (2 * pi * U_[v_mask])*bu_i[v_mask] - 1.0
-        p2_i[v_mask] = (1.0)*bu_i[v_mask] + (2 * pi * U_[v_mask])*bu_r[v_mask]
-
-        # 复数乘法: (p1 * p2) * phase_shift
-        # 先算 p1 * p2 (p1是实数)
-        res_r = p1 * p2_r
-        res_i = p1 * p2_i
+        part1[v_mask] = (1.0 / (4 * pi**2 * U_[v_mask]**2)).to(torch.complex64)
+        part2[v_mask] = (2j * pi * U_[v_mask] + 1.0)*base_u[v_mask] - 1.0
         
-        # 再算 (res_r + j*res_i) * (ps_real + j*ps_imag)
-        final_r = 2.0 * area * (res_r * ps_real - res_i * ps_imag)
-        final_i = 2.0 * area * (res_r * ps_imag + res_i * ps_real)
+        # 依据傅里叶变换的仿射特性，由于积分域变化，结果需要乘以 |det(A)| = 2 * area
+        FT = 2.0 * area * part1 * part2 * phase_shift
+        FT = torch.where(zero_mask, area.to(torch.complex64), FT)
         
-        final_r = torch.where(zero_mask, area, final_r)
-        final_i = torch.where(zero_mask, torch.zeros_like(final_i), final_i)
-
+        # 补全区域的频谱置为0
         if self.pad_h > 0:
-            final_r[:, -self.pad_h:, :], final_i[:, -self.pad_h:, :] = 0.0, 0.0
+            FT[:, -self.pad_h:, :] = 0.0
         if self.pad_w > 0:
-            final_r[:, :, -self.pad_w:], final_i[:, :, -self.pad_w:] = 0.0, 0.0
+            FT[:, :, -self.pad_w:] = 0.0
             
-        return final_r, final_i
+        return FT
 
     def cft_polygon_batch(self, batch_triangles, lengths):
         """
@@ -169,91 +152,109 @@ class PolyFourierConverter(nn.Module):
         B, max_N, _, _ = batch_triangles.shape
         H, W = self.U.shape
         
-        # 拆分为两个实数容器
-        FT_res_r = torch.zeros((B, H, W), device=self.device)
-        FT_res_i = torch.zeros((B, H, W), device=self.device)
-        
+        FT_total = torch.zeros((B, H, W), dtype=torch.complex64, device=self.device)
         batch_triangles = batch_triangles.to(self.device)
         lengths = lengths.to(self.device)
         
         # 1. 创建 [B, max_N] 的有效性掩码
         mask = torch.arange(max_N, device=self.device).unsqueeze(0) < lengths.unsqueeze(1)
-        valid_tris = batch_triangles[mask]
+        
+        # 2. 扁平化提取所有有效的三角形，直接消灭 max_N Python 循环！
+        valid_tris = batch_triangles[mask] # 形状: [Total_valid_tris, 3, 2]
+        
+        # 对应记录每个有效三角形属于原始批次中的哪一个索引 [Total_valid_tris]
         batch_indices = torch.arange(B, device=self.device).unsqueeze(1).expand(B, max_N)[mask]
         
+        # 3. 分块并行处理 (Chunking)，防止一次性并发所有三角形导致 OOM
         chunk_size = 50000 
         for i in range(0, valid_tris.shape[0], chunk_size):
             tris_chunk = valid_tris[i:i+chunk_size]
             b_idx_chunk = batch_indices[i:i+chunk_size]
             
-            ft_r, ft_i = self._cft_single_triangle_batch(tris_chunk, None)
-            FT_res_r.index_add_(0, b_idx_chunk, ft_r)
-            FT_res_i.index_add_(0, b_idx_chunk, ft_i)
+            # 直接计算这一大块三角形的 CFT (此处的 None 表示不需要 valid_mask)
+            ft_chunk = self._cft_single_triangle_batch(tris_chunk, None) # 形状: [chunk, H, W]
             
-        # 计算幅值和相位
-        mag = torch.sqrt(FT_res_r**2 + FT_res_i**2).unsqueeze(1)
-        phase = torch.atan2(FT_res_i, FT_res_r).unsqueeze(1)
+            # 采用 PyTorch 极速的底层索引累加，加回到它们各自的 Batch 位置
+            FT_total.index_add_(0, b_idx_chunk, ft_chunk)
+            
+        mag = torch.abs(FT_total).unsqueeze(1)    # [B, 1, H, W]
+        phase = torch.angle(FT_total).unsqueeze(1) # [B, 1, H, W]
+        
+        # 归一化/稳定化幅值
         mag = torch.log1p(mag)
         
         return mag, phase
 
-    def icft_2d(self, F_r, F_i, spatial_size=256):
+    def icft_2d(self, F_uv, spatial_size=256):
         """
-        离散非均匀傅里叶逆变换 (不支持Complex版)
-        输入: F_r, F_i 是 [B, H, W] 的实部和虚部
+        离散非均匀傅里叶逆变换 (ICFT)
+        输入:
+            F_uv: [B, H, W] complex tensor (原始未经过log1p的复数频谱)
+            spatial_size: int, 生成的空域图像的分辨率
+        输出:
+            f_norm: [B, spatial_size, spatial_size] real tensor, 归一化到[0,1]用于可视化的空域图
         """
-        B, H, W = F_r.shape
+        B, H, W = F_uv.shape
         x = torch.linspace(-1, 1, spatial_size, device=self.device)
-        y = torch.linspace(1, -1, spatial_size, device=self.device)
+        y = torch.linspace(1, -1, spatial_size, device=self.device) # y轴向下匹配图像坐标系
         X, Y = torch.meshgrid(x, y, indexing='xy')
         
-        X_flat = X.reshape(-1)
-        Y_flat = Y.reshape(-1)
-        U_flat = self.U.reshape(-1)
-        V_flat = self.V.reshape(-1)
+        X_flat = X.reshape(-1) # [S^2]
+        Y_flat = Y.reshape(-1) # [S^2]
+        U_flat = self.U.reshape(-1) # [H*W]
+        V_flat = self.V.reshape(-1) # [H*W]
         
-        # 1. 权重计算 (保持不变)
-        valid_h, valid_w = H - self.pad_h, W - self.pad_w
-        Wx, Wy = self.U[:valid_h, 0].clone(), self.V[0, :valid_w].clone()
+        # 1. 精确计算非均匀积分权重 (避免几何频域低频被过度放大)
+        valid_h = H - self.pad_h
+        valid_w = W - self.pad_w
+        Wx = self.U[:valid_h, 0].clone()
+        Wy = self.V[0, :valid_w].clone()
         
-        def get_diff(w, size):
-            d = torch.zeros_like(w)
-            for i in range(size):
-                if i == 0: d[i] = w[1] - w[0] if size > 1 else 1.0
-                elif i == size - 1: d[i] = w[i] - w[i-1]
-                else: d[i] = (w[i+1] - w[i-1]) / 2.0
-            return d
-
-        dU, dV = torch.meshgrid(get_diff(Wx, valid_h), get_diff(Wy, valid_w), indexing='ij')
+        du = torch.zeros_like(Wx)
+        for i in range(valid_h):
+            if i == 0: du[i] = Wx[1] - Wx[0] if valid_h > 1 else 1.0
+            elif i == valid_h - 1: du[i] = Wx[i] - Wx[i-1]
+            else: du[i] = (Wx[i+1] - Wx[i-1]) / 2.0
+            
+        dv = torch.zeros_like(Wy)
+        for j in range(valid_w):
+            if j == 0: dv[j] = Wy[1] - Wy[0] if valid_w > 1 else 1.0
+            elif j == valid_w - 1: dv[j] = Wy[j] - Wy[j-1]
+            else: dv[j] = (Wy[j+1] - Wy[j-1]) / 2.0
+            
+        dU, dV = torch.meshgrid(du, dv, indexing='ij')
+        
+        # 构建全平面积分权重，并去除pad部分
         weights = torch.zeros((H, W), device=self.device)
         weights[:valid_h, :valid_w] = dU * dV
-        weights = weights.reshape(-1).unsqueeze(0)
+        weights = weights.reshape(-1).unsqueeze(0) # [1, H*W]
         
-        sym_weights = torch.where(V_flat > 1e-6, 2.0, 1.0).unsqueeze(0)
+        # 2. 处理1/2象限共轭对称
+        # 当 V > 0 时，全平面还应该加上共轭部分 F(-u,-v) = F*(u,v)
+        # 积分 f(x,y) = \sum_{v>0} (F*E + F**E*) + \sum_{v=0} F*E 
+        #           = 2 * Re(\sum_{v>0} F*E) + \sum_{v=0} F*E
+        # 为统合计算，我们将 v>0 部分的权重直接 x2，最后统一取实部即可
+        sym_weights = torch.where(V_flat > 1e-6, 2.0, 1.0).unsqueeze(0) # [1, H*W]
         weights = weights * sym_weights
         
-        # 2. 计算相位矩阵的实部和虚部
-        # phase = 2 * pi * (U*X + V*Y)
-        # E = cos(phase) + j*sin(phase)
-        angle = 2 * torch.pi * (U_flat.unsqueeze(1) * X_flat.unsqueeze(0) + V_flat.unsqueeze(1) * Y_flat.unsqueeze(0))
-        E_r = torch.cos(angle)
-        E_i = torch.sin(angle)
+        # 3. 计算相位偏移矩阵 E
+        # 相位 = 2 * pi * (U*X + V*Y)
+        phase_mat = 2 * torch.pi * (U_flat.unsqueeze(1) * X_flat.unsqueeze(0) + V_flat.unsqueeze(1) * Y_flat.unsqueeze(0))
+        E = torch.exp(1j * phase_mat) # [H*W, S^2]
         
-        # 3. 矩阵乘法求解
-        # F_flat = (F_r + j*F_i) * weights
-        Fr_w = F_r.reshape(B, -1) * weights
-        Fi_w = F_i.reshape(B, -1) * weights
+        # 4. 矩阵乘法求解离散逆变换
+        F_flat = F_uv.reshape(B, -1) * weights # [B, H*W]
+        f_recon_complex = torch.matmul(F_flat, E) # [B, S^2]
         
-        # 只需要实部: Re[(Fr_w + j*Fi_w) * (E_r + j*E_i)]
-        # = Fr_w * E_r - Fi_w * E_i
-        f_recon = torch.matmul(Fr_w, E_r) - torch.matmul(Fi_w, E_i)
-        f_recon = f_recon.reshape(B, spatial_size, spatial_size)
+        f_recon = f_recon_complex.real.reshape(B, spatial_size, spatial_size)
         
-        # 4. 归一化
+        # 5. 归一化到 [0, 1] 以便于二值化或直观对比
         f_min = f_recon.amin(dim=(1, 2), keepdim=True)
         f_max = f_recon.amax(dim=(1, 2), keepdim=True)
-        return (f_recon - f_min) / (f_max - f_min + 1e-8)
-
+        f_norm = (f_recon - f_min) / (f_max - f_min + 1e-8)
+        
+        return f_norm
+    
 if __name__ == '__main__':
     test_triangles = torch.tensor([[[[ 0.4355, -0.4662],
           [ 0.4166, -0.4766],

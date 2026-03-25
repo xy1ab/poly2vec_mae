@@ -551,7 +551,7 @@ def build_arg_parser():
     parser.add_argument('--data_path', default='./data/processed/polygon_triangles_normalized.pt', type=str)
     parser.add_argument('--save_dir', default='./outputs/checkpoints/', type=str)
     
-    parser.add_argument('--gpu', default="0,1,2,3,4,5,6,7", type=str)
+    parser.add_argument('--gpu', default="0", type=str)
     parser.add_argument('--weight_mag', default=1.0, type=float)
     parser.add_argument('--weight_mag_hf', default=1.0, type=float, help='幅值的高频跨度惩罚权重 (alpha)')
     parser.add_argument('--weight_phase', default=1.0, type=float)
@@ -591,14 +591,14 @@ def build_arg_parser():
 def run_cli(argv=None):
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    # os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    # gpus = str(args.gpu).split(',')
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    gpus = str(args.gpu).split(',')
     
-    # if len(gpus) > 1 and "LOCAL_RANK" not in os.environ:
-    #     cmd = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", str(len(gpus)), sys.argv[0]]
-    #     cmd.extend(sys.argv[1:])
-    #     subprocess.run(cmd, start_new_session=True)
-    #     sys.exit(0)
+    if len(gpus) > 1 and "LOCAL_RANK" not in os.environ:
+        cmd = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", str(len(gpus)), sys.argv[0]]
+        cmd.extend(sys.argv[1:])
+        subprocess.run(cmd, start_new_session=True)
+        sys.exit(0)
         
     main(args)
 
