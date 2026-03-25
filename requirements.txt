@@ -37,9 +37,10 @@ nvidia-cusparselt-cu12==0.6.3
 nvidia-nccl-cu12==2.26.2
 nvidia-nvjitlink-cu12==12.6.85
 nvidia-nvtx-cu12==12.6.77
-packaging @ file:///home/task_176104874243446/conda-bld/packaging_1761049080023/work
+packaging==25.0
 pandas==3.0.1
 pillow==12.1.1
+pip==26.0.1
 Pygments==2.19.2
 pyogrio==0.12.1
 pyparsing==3.3.2
