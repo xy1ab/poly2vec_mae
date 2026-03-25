@@ -1,93 +1,180 @@
 # poly2vec_mae
 
+本项目采用 `configs + src + scripts` 架构，MAE 预训练服务下游任务。
 
+## 目录结构
 
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
+```text
+poly2vec_mae/
+├── configs/
+│   ├── mae/
+│   └── downstream/
+├── data/
+│   ├── raw/
+│   └── processed/
+├── models/
+├── outputs/
+│   ├── checkpoints/
+│   └── exports/
+├── src/
+│   ├── mae_core/
+│   ├── downstream/
+│   │   ├── task_recons/
+│   │   └── task_classify/
+│   └── utils/
+│       ├── config/
+│       ├── data/
+│       ├── fourier/
+│       ├── geometry/
+│       ├── io/
+│       └── viz/
+├── scripts/
+│   ├── mae/
+│   └── downstream/
+├── tests/
+├── requirements.txt
+└── README.md
 ```
-cd existing_repo
-git remote add origin https://gitlab.zhejianglab.com/hubin/poly2vec_mae.git
-git branch -M main
-git push -uf origin main
+
+## 环境安装
+
+```bash
+pip install -r requirements.txt
 ```
 
-## Integrate with your tools
+## MAE 预训练
 
-- [ ] [Set up project integrations](https://gitlab.zhejianglab.com/hubin/poly2vec_mae/-/settings/integrations)
+默认读取 `configs/mae/pretrain.yaml`：
 
-## Collaborate with your team
+```bash
+python scripts/mae/run_pretrain.py
+```
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+指定配置：
 
-## Test and Deploy
+```bash
+python scripts/mae/run_pretrain.py --config configs/mae/pretrain.yaml
+```
 
-Use the built-in continuous integration in GitLab.
+默认使用 `bf16` 混合精度训练与 `bf16` 权重导出（可在配置中改为 `fp32/fp16`）。
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+训练产物默认保存到：
 
-***
+- `outputs/checkpoints/<timestamp>/train_log.txt`
+- `outputs/checkpoints/<timestamp>/recon_epoch_*.png`
+- `outputs/checkpoints/<timestamp>/mae_ckpt_*.pth`
+- `outputs/checkpoints/<timestamp>/poly_encoder_epoch_*.pth`
 
-# Editing this README
+评估与下游可视化也建议保存到同一实验目录：
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+- `outputs/checkpoints/<timestamp>/cft_visualize_*.png`
+- `outputs/checkpoints/<timestamp>/resnet_integration_proof_*.png`
 
-## Suggestions for a good README
+训练结束后会自动导出交付包到：
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+- `outputs/exports/mae_<timestamp>/config.yaml`
+- `outputs/exports/mae_<timestamp>/encoder_decoder.pth`
+- `outputs/exports/mae_<timestamp>/encoder.pth`
+- `outputs/exports/mae_<timestamp>/train_log.txt`
 
-## Name
-Choose a self-explaining name for your project.
+## MAE 评估可视化
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+```bash
+python scripts/mae/run_eval.py
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## 下游重建流水线示例
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+```bash
+python scripts/downstream/run_pipeline_mae.py
+```
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+可指定推理精度：
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+```bash
+python scripts/downstream/run_pipeline_mae.py --precision bf16
+```
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+## 编码器导出接口
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+- 主实现文件：`src/mae_core/model.py`
+- 入口函数：
+  - `export_encoder_from_mae_checkpoint(...)`
+  - `load_pretrained_encoder(...)`
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+---
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+## 📖 Poly2Vec OCF (Occupancy Field) 隐式几何重建模块
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+利用预训练提取的 **384维Embedding**，通过 **FiLM 调制机制** 控制 **SIREN (正弦表示网络)**。模型不再输出离散像素，而是学习一个连续的空间占用场函数 $f(x, y | v) \to[0, 1]$，从而支持无限分辨率的完美多边形矢量提取与快速的空间布尔运算（图斑求交集）。
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+---
 
-## License
-For open source projects, say how it is licensed.
+## 📂 核心项目架构
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+本模块遵循标准的配置分离架构，核心文件分布如下：
+
+```text
+poly2vec_mae/
+├── configs/downstream/
+│   └── recons.yaml                  # 统一配置文件
+├── src/downstream/task_recons/
+│   ├── model_siren.py               # SIREN 核心网络架构 
+│   └── loader_ocf.py                # 数据加载
+└── scripts/downstream/
+    └── run_siren_train.py           # 训练主入口脚本
+```
+
+---
+
+## 🛠️ 核心文件深度解析
+
+### 1. `configs/downstream/recons.yaml` 
+所有的实验参数均在此设置。
+*   包含采样策略（如 `num_points: 1024`, `boundary_ratio: 0.7`）。
+*   包含网络维度配置（`embed_dim: 384`, `hidden_dim: 256`, `num_layers: 5`）。
+
+### 2. `src/downstream/task_recons/loader_ocf.py` 
+负责从 `.pt` 提取数据。
+*   **智能采样 (Smart Sampling)**
+    *   **70%** 的坐标点生成在原始三角形边界附近。
+    *   **30%** 的坐标点在全局 $[-1, 1]$ 平面随机生成。
+*   **动态标签判定**：利用 `matplotlib.path` 底层 C 接口极速计算坐标点是否在多边形内（1.0 内部，0.0 外部）。
+
+### 3. `src/downstream/task_recons/model_siren.py` 
+将静态的 Embedding 转化为动态的几何函数。
+*   **FiLM 调制**：将 384 维 Embedding 映射为缩放系数 ($\gamma$) 和偏移系数 ($\beta$)，逐层改变 SIREN 网络的状态。
+*   **SIREN 正弦波层**：采用 $\sin(\omega_0 \cdot x)$ 激活函数，第一层 $\omega_0=30$。
+
+### 4. `scripts/downstream/run_siren_train.py` 
+*   **严谨切分**：自动按 **90% 训练 / 5% 验证 / 5% 测试** 划分数据。
+*   **防数据泄露**：使用固定随机种子，并将测试集索引封存于 `siren_test_indices.pt`。
+*   **实时评估**：每轮结束自动计算验证集 **mIoU (平均交并比)**。
+*   **容灾存档**：自动跟踪最高 mIoU 并保存为 `siren_ocf_best.pth`。
+
+---
+
+## 🚀 快速启动
+
+### 启动训练
+在项目根目录 (`poly2vec_mae/`) 下执行以下命令：
+
+```bash
+# 1. 声明项目搜索路径 (极其重要，否则报 ModuleNotFoundError)
+export PYTHONPATH=$PYTHONPATH:.
+
+# 2. 后台挂起全量训练任务
+nohup python scripts/downstream/run_siren_train.py > siren_train.log 2>&1 &
+
+# 3. 实时监控训练进度与 Loss 表现
+tail -f siren_train.log
+```
+
+---
+
+## 📊 训练产出物 (Outputs)
+
+在 `checkpoints_siren/` (或 YAML 指定目录) 获得以下资产：
+
+1.  **`siren_ocf_best.pth`**: 验证集 mIoU 最高的最优模型权重。可直接用于后续的**无限分辨率可视化**与**图斑交集运算**。
+2.  **`siren_test_indices.pt`**: 被严格隔离的测试集名单，用于撰写论文或评估报告时，证明模型的泛化能力。

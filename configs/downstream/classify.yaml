@@ -1,0 +1,9 @@
+# 占位配置：下游分类任务
+train_data: ./data/processed/
+val_data: ./data/processed/
+batch_size: 64
+epochs: 50
+lr: 1.0e-3
+precision: bf16
+encoder_weight: ./outputs/checkpoints/latest/poly_encoder_epoch_150.pth
+encoder_config: ./outputs/checkpoints/latest/poly_mae_config.json

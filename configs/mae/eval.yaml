@@ -1,0 +1,9 @@
+index: 0
+data_path: ./data/processed/polygon_triangles_normalized.pt
+save_dir: ./outputs/checkpoints/eval
+spatial_size: 256
+pos_freqs: 31
+w_min: 0.1
+w_max: 100.0
+freq_type: geometric
+patch_size: 2

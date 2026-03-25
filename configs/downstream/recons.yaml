@@ -1,0 +1,21 @@
+# configs/downstream/recons.yaml
+# OCF 几何重建任务配置
+
+# 数据路径
+data_path: "./data/processed/encoded_samples_20260324_1910.pt"
+save_dir: "./outputs/checkpoints_siren/"
+test_indices_path: "./data/processed/siren_test_indices.pt"
+
+# 模型架构参数
+embed_dim: 384
+hidden_dim: 256
+num_layers: 5
+omega_0: 30.0
+
+# 训练超参数
+batch_size: 128
+epochs: 100
+lr: 1.0e-4
+num_points: 1024   # 采样点数
+boundary_ratio: 0.7 # 边界点比例
+precision: "fp16"   # 训练精度

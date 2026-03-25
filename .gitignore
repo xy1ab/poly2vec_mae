@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Envs & IDE
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+.DS_Store
+
+# Project artifacts
+outputs/*
+!outputs/.gitkeep
+models/*
+!models/.gitkeep
+# Data (通常不上传原始/处理后数据)
+data/*
+!data/.gitkeep
+# Optional: logs/temp
+*.log
+*.tmp

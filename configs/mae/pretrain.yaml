@@ -1,0 +1,37 @@
+# MAE pretrain defaults (mapped to src/mae_core/trainer.py arguments)
+data_path: ./data/processed/polygon_triangles_normalized.pt
+save_dir: ./outputs/checkpoints/
+export_dir: ./outputs/exports/
+train_type: mae
+
+gpu: "0,1,2,3,4,5,6,7"
+weight_mag: 1.0
+weight_mag_hf: 1.0
+weight_phase: 1.0
+
+val_ratio: 0.05
+warmup_epochs: 15
+min_lr: 1.0e-6
+
+pos_freqs: 31
+w_min: 0.1
+w_max: 100.0
+freq_type: geometric
+
+patch_size: 2
+embed_dim: 384
+depth: 12
+num_heads: 8
+
+dec_embed_dim: 128
+dec_depth: 4
+dec_num_heads: 4
+
+epochs: 150
+batch_size: 512
+lr: 2.0e-3
+weight_decay: 0.05
+mask_ratio: 0.75
+augment_times: 10
+precision: bf16
+checkpoint_dtype: bf16
