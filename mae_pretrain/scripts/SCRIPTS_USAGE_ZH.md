@@ -89,9 +89,10 @@ python scripts/run_export.py \
 
 - 入口脚本：`scripts/run_build_dataset.py`
   
-- 具体功能：扫描输入目录中的矢量数据，完成 polygon 三角剖分并保存为 `.pt` 训练数据。
+- 具体功能：扫描输入目录中的矢量数据，按“每个文件一个任务”并行执行 polygon 三角剖分，并保存为单个 `.pt` 或多个分块 `.pt` 文件。
   
-- 配置说明：不依赖 YAML，仅使用 CLI 参数；必须传 `--input_dirs`，可选 `--output_path`。
+- 配置说明：不依赖 YAML，仅使用 CLI 参数；必须传 `--input_dirs`。  
+  常用可选参数：`--output_path`（输出基路径）、`--num_workers`（文件级并行进程数，`<=0` 自动）、`--shard_size_mb`（分块大小，`<=0` 不分块）。
   
 - 调取示例：
   
@@ -101,7 +102,11 @@ python scripts/run_build_dataset.py \
 
   --input_dirs /data/raw/vector_a /data/raw/vector_b \
 
-  --output_path ./data/processed/polygon_triangles_normalized.pt
+  --output_path ./data/processed/polygon_triangles_normalized.pt \
+
+  --num_workers 16 \
+
+  --shard_size_mb 500
 ```
 
 ### 5 批量编码产物生成
