@@ -13,7 +13,8 @@ venv/
 .vscode/
 .idea/
 .DS_Store
-
+data/
+outputs/
 # Project artifacts
 mae_pretrain/outputs/*
 !mae_pretrain/outputs/.gitkeep
