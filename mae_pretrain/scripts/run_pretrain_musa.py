@@ -206,6 +206,7 @@ def main() -> None:
     gpu_from_config = str(config.get("gpu", "0"))
     gpu_list = _split_gpu_list(gpu_from_config)
     musa_available = _is_musa_available()
+    print("************************musa**", musa_available)
     if len(gpu_list) > 1 and "LOCAL_RANK" not in os.environ and not pre_args.no_auto_spawn and musa_available:
         visible_gpu_csv = _normalize_gpu_csv(gpu_list)
         cmd = [
