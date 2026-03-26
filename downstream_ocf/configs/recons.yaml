@@ -1,0 +1,20 @@
+# OCF 隐式几何重建任务配置
+
+# 1. 路径设置 
+data_path: "./data/encoded_samples_20260324_1910.pt"
+save_dir: "./checkpoints/"
+test_indices_path: "./data/siren_test_indices.pt"
+
+# 2. SIREN 模型架构参数
+embed_dim: 384
+hidden_dim: 256
+num_layers: 5
+omega_0: 30.0
+
+# 3. 训练与采样参数
+batch_size: 128       
+epochs: 100
+lr: 1.0e-4
+num_points: 1024      # 每次查询的坐标点数
+boundary_ratio: 0.7   # 边界难例挖掘比例 (70%)
+jitter_std: 0.005     # 边界点扰动范围

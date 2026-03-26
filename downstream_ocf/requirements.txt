@@ -1,0 +1,17 @@
+# 核心深度学习框架
+torch>=2.0.0
+torchvision
+torchaudio
+
+# 几何与数学计算
+numpy<2.0.0
+scipy
+shapely
+
+# 图像处理与评估指标
+matplotlib
+scikit-image
+
+# 训练辅助与配置管理
+pyyaml
+tqdm
