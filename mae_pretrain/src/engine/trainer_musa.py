@@ -36,7 +36,7 @@ from utils.checkpoint import export_model_bundle, save_checkpoint
 from utils.dist_musa import DistContext, all_reduce_mean, cleanup_distributed, init_distributed_musa, is_main_process
 from utils.filesystem import make_timestamped_dir
 from utils.logger import attach_tee_stdout
-from utils.precision import autocast_context, build_grad_scaler, normalize_precision
+from utils.precision_musa import autocast_context, build_grad_scaler, normalize_precision
 from utils.safe_load import register_numpy_safe_globals
 from utils.seed import set_global_seed
 
