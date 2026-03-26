@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+import torch_musa
 import torch
 import torch.distributed as dist
 
@@ -30,24 +31,23 @@ class DistContext:
     world_size: int
     device: torch.device
 
-
-def init_distributed() -> DistContext:
+def init_distributed_musa() -> DistContext:
     """Initialize distributed training when LOCAL_RANK is provided.
 
     Returns:
         DistContext describing runtime process/device state.
     """
     if "LOCAL_RANK" not in os.environ:
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = torch.device("musa:0" if torch.musa.is_available() else "cpu")
         return DistContext(enabled=False, rank=0, local_rank=0, world_size=1, device=device)
 
     local_rank = int(os.environ["LOCAL_RANK"])
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    backend = "mccl" if torch.musa.is_available() else "gloo"
     dist.init_process_group(backend=backend)
 
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
+    if torch.musa.is_available():
+        torch.musa.set_device(local_rank)
+        device = torch.device(f"musa:{local_rank}")
     else:
         device = torch.device("cpu")
 
