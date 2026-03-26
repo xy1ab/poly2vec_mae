@@ -1,18 +1,21 @@
-# CFT/ICFT 可视化评估默认配置。
-# 对应 `src/engine/evaluator.py` 的参数。
+# MAE 重建可视化默认配置（对应 `scripts/run_eval.py`）。
+# 说明：
+# 1) 优先推荐通过 `model_dir` 指向 exports 下完整模型目录。
+# 2) 命令行同名参数会覆盖此处配置。
+# 3) 频域参数默认由模型 config 自动读取；如需强制覆盖，可在命令行显式传入。
 
-# 待可视化样本索引（在数据集中按顺序取）。
+# 样本选择参数
 index: 0
-# 与训练一致的预处理数据路径。
 data_path: ./data/processed/polygon_triangles_normalized.pt
-# 评估可视化图像输出目录。
-save_dir: ./outputs/ckpt/eval
-# 空间域重建栅格大小（S x S）。
 spatial_size: 256
 
-# 频域参数，建议与训练配置保持一致以便对齐。
-pos_freqs: 63
-w_min: 0.1
-w_max: 200.0
-freq_type: geometric
-patch_size: 4
+# 模型目录（建议改为你要评估的 export 目录）
+model_dir: ./outputs/exports/mae_20260325_1724
+
+# MAE 推理参数
+mask_ratio: 0.75
+precision: bf16
+# device: cuda
+
+# 可视化输出目录（默认）
+save_dir: ./outputs/viz

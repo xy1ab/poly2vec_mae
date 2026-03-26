@@ -171,6 +171,33 @@ def _build_meta(tris: np.ndarray, node_count: int) -> np.ndarray:
     return np.array([center[0], center[1], side_len, float(node_count)], dtype=np.float32)
 
 
+def _normalize_output_mode(mode_value: str | int) -> int:
+    """Normalize user-provided output mode into canonical integer id.
+
+    Supported modes:
+    1) `meta(4) + embedding(N) + triangles(T,3,2)`.
+    2) `meta(4) + embedding(N)`.
+
+    Args:
+        mode_value: Raw CLI mode value.
+
+    Returns:
+        Canonical mode id (1 or 2).
+
+    Raises:
+        ValueError: If mode is unsupported.
+    """
+    key = str(mode_value).strip().lower()
+    if key in {"1", "mode1", "meta_embedding_triangles", "with_triangles"}:
+        return 1
+    if key in {"2", "mode2", "meta_embedding", "no_triangles", "without_triangles"}:
+        return 2
+    raise ValueError(
+        "Unsupported output mode. Use mode 1 (`meta+embedding+triangles`) "
+        "or mode 2 (`meta+embedding`)."
+    )
+
+
 def _resolve_model_artifacts(model_dir: str) -> tuple[Path, Path]:
     """Resolve encoder weight and config file paths from model directory.
 
@@ -230,6 +257,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--model_dir", type=str, required=True)
     parser.add_argument("--output_path", type=str, default="")
+    parser.add_argument(
+        "--output_mode",
+        type=str,
+        default="1",
+        help=(
+            "Output schema mode: "
+            "1 => meta+embedding+triangles; "
+            "2 => meta+embedding."
+        ),
+    )
     parser.add_argument("--dry_run", action="store_true")
     return parser
 
@@ -248,6 +285,7 @@ def main() -> None:
 
     args = build_arg_parser().parse_args()
     args.precision = normalize_precision(args.precision)
+    args.output_mode = _normalize_output_mode(args.output_mode)
 
     vector_files = _iter_vector_files([args.data_dir], recursive=args.recursive)
     if not vector_files:
@@ -332,13 +370,13 @@ def main() -> None:
 
         emb = pipeline.triangles_to_embedding(pending_tris).cpu()
         for i, tri_np in enumerate(pending_tris):
-            output_samples.append(
-                {
-                    "meta": torch.from_numpy(pending_meta[i]),
-                    "embedding": emb[i],
-                    "triangles": torch.from_numpy(tri_np.astype(np.float32)),
-                }
-            )
+            sample = {
+                "meta": torch.from_numpy(pending_meta[i]),
+                "embedding": emb[i],
+            }
+            if args.output_mode == 1:
+                sample["triangles"] = torch.from_numpy(tri_np.astype(np.float32))
+            output_samples.append(sample)
 
         pending_tris.clear()
         pending_meta.clear()
@@ -381,7 +419,12 @@ def main() -> None:
         print(f"[DONE] Saved samples to: {output_path}")
         print(f"[DONE] Sample count: {len(output_samples)}")
         print(f"[DONE] Embedding dimension: {emb_dim}")
-        print(f"[DONE] Sample schema: {{'meta':(4), 'embedding':({emb_dim}), 'triangles':(T,3,2)}}")
+        if args.output_mode == 1:
+            print(f"[DONE] Output mode: 1 (meta+embedding+triangles)")
+            print(f"[DONE] Sample schema: {{'meta':(4), 'embedding':({emb_dim}), 'triangles':(T,3,2)}}")
+        else:
+            print(f"[DONE] Output mode: 2 (meta+embedding)")
+            print(f"[DONE] Sample schema: {{'meta':(4), 'embedding':({emb_dim})}}")
     else:
         print("[DONE] No samples were produced.")
 
