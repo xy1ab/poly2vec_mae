@@ -29,7 +29,7 @@ def _inject_src_path() -> Path:
 
 def main() -> None:
     """CLI main function for dataset building."""
-    ensure_cuda_runtime_libs()
+    # ensure_cuda_runtime_libs()
     project_root = _inject_src_path()
 
     from datasets.build_dataset import process_and_save

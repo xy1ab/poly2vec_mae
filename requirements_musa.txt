@@ -4,3 +4,4 @@ shapely==2.1.2
 timm==1.0.26
 torch==2.7.1
 triangle==20250106
+scikit-image==0.25.2
