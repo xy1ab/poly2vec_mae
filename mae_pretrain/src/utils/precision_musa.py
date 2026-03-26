@@ -17,7 +17,6 @@ _ALIAS_MAP = {
     "float32": "fp32",
     "float16": "fp16",
     "half": "fp16",
-    "fp13": "fp16",  # compatibility alias requested by user
     "bfloat16": "bf16",
 }
 
