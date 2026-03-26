@@ -173,7 +173,7 @@ def main() -> None:
     # ensure_cuda_runtime_libs()
     project_root = _inject_src_path()
 
-    from engine.trainer import run_cli
+    from engine.trainer_musa import run_cli
     from utils.config import load_yaml_config
 
     pre_parser = argparse.ArgumentParser(add_help=False)
