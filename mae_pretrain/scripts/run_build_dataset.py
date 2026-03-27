@@ -32,7 +32,7 @@ def main() -> None:
     # ensure_cuda_runtime_libs()
     project_root = _inject_src_path()
 
-    from datasets.build_dataset import process_and_save
+    from datasets.build_dataset_triangle import process_and_save
 
     parser = argparse.ArgumentParser(description="Build triangulated polygon dataset")
     parser.add_argument(
@@ -47,6 +47,19 @@ def main() -> None:
         default=str(project_root / "data" / "processed" / "polygon_triangles_normalized.pt"),
     )
     parser.add_argument(
+        "--file_type",
+        type=str,
+        default="shp",
+        choices=["shp", "gdb", "geojs"],
+        help="Input vector file type. One of: shp, gdb, geojs.",
+    )
+    parser.add_argument(
+        "--layer",
+        type=str,
+        default="all",
+        help="Layer selector for gdb input. Use 'all' to read every layer.",
+    )
+    parser.add_argument(
         "--num_workers",
         type=int,
         default=0,
@@ -58,13 +71,37 @@ def main() -> None:
         default=0.0,
         help="Target shard size in MB. <=0 means single .pt output.",
     )
+    parser.add_argument(
+        "--min_triangle_area",
+        type=float,
+        default=1e-8,
+        help="Minimum triangle area in normalized [-1,1] space.",
+    )
+    parser.add_argument(
+        "--min_triangle_height",
+        type=float,
+        default=1e-5,
+        help="Minimum triangle altitude proxy in normalized [-1,1] space.",
+    )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="Save triangulation quality log JSON beside output .pt.",
+    )
     args = parser.parse_args()
+    if args.file_type != "gdb" and str(args.layer).strip().lower() != "all":
+        print(f"[WARN] --layer is ignored when --file_type={args.file_type}.")
 
     process_and_save(
         input_dirs=args.input_dirs,
         output_path=args.output_path,
+        file_type=args.file_type,
+        layer=args.layer,
         num_workers=args.num_workers,
         shard_size_mb=args.shard_size_mb,
+        min_triangle_area=args.min_triangle_area,
+        min_triangle_height=args.min_triangle_height,
+        log=args.log,
     )
 
 
