@@ -30,3 +30,6 @@ downstream/*
 # Optional: logs/temp
 *.log
 *.tmp
+checkpoints/
+downstream_ocf/checkpoints
+*.pth

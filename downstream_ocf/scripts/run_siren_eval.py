@@ -69,18 +69,21 @@ def main():
     import numpy
     if not hasattr(numpy, '_core'): sys.modules['numpy._core'] = numpy.core
     
-    data_path = os.path.join(PROJECT_ROOT, cfg['data_path'])
+    # data_path = os.path.join(PROJECT_ROOT, cfg['data_path'])
+    data_path = "/home/HB/github/poly2vec_mae/data/processed/encoded_samples_20260324_1910.pt"
+    test_indices_path = "/home/HB/github/poly2vec_mae/data/processed/siren_test_indices.pt"
     print(f"📦 正在载入全量数据: {data_path}")
     all_data = torch.load(data_path, weights_only=False, map_location='cpu')
-    test_indices = torch.load(os.path.join(PROJECT_ROOT, cfg['test_indices_path']))
-    
+    # test_indices = torch.load(os.path.join(PROJECT_ROOT, cfg['test_indices_path']))
+    test_indices = torch.load(test_indices_path)
     # 3. 加载模型
     model = FiLMSirenOCF(
         embed_dim=cfg['embed_dim'], 
         hidden_dim=cfg['hidden_dim'], 
         num_layers=cfg['num_layers']
     ).to(device)
-    model_path = os.path.join(PROJECT_ROOT, cfg['save_dir'], 'siren_ocf_best.pth')
+    # model_path = os.path.join(PROJECT_ROOT, cfg['save_dir'], 'siren_ocf_best.pth')
+    model_path = "/home/HB/github/poly2vec_mae/checkpoints/siren_ocf_best.pth"
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 

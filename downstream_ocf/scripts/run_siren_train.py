@@ -14,11 +14,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-# ---------------------------------------------------------
-# 1. 兼容性补丁：防止加载 Numpy 2.x 数据时在 1.x 环境报错
-# ---------------------------------------------------------
-if not hasattr(numpy, '_core'):
-    sys.modules['numpy._core'] = numpy.core
+# # ---------------------------------------------------------
+# # 1. 兼容性补丁：防止加载 Numpy 2.x 数据时在 1.x 环境报错
+# # ---------------------------------------------------------
+# if not hasattr(numpy, '_core'):
+#     sys.modules['numpy._core'] = numpy.core
 
 # ---------------------------------------------------------
 # 2. 解决路径依赖
@@ -53,8 +53,11 @@ def main():
     # =========================================================
     parser = argparse.ArgumentParser(description="Full-Blood SIREN OCF Training")
     parser.add_argument('--config', type=str, default='configs/recons.yaml')
+    parser.add_argument('--data_path', type=str, default='./data/processed/encoded_samples_20260324_1910.pt')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints/')
+    parser.add_argument('--test_indices_path', type=str, default="./data/processed/siren_test_indices.pt")
     parser.add_argument('--epochs', type=int, default=None)
-    parser.add_argument('--batch_size', type=int, default=None)
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--num_points', type=int, default=None)
     args = parser.parse_args()
@@ -92,11 +95,11 @@ def main():
     # =========================================================
     # 5. 数据准备
     # =========================================================
-    save_dir = os.path.join(PROJECT_ROOT, cfg['save_dir'])
+    save_dir = cfg['save_dir']
     if local_rank == 0: os.makedirs(save_dir, exist_ok=True)
 
     dataset = OCFDataset(
-        data_path=os.path.join(PROJECT_ROOT, cfg['data_path']),
+        data_path=cfg['data_path'],
         num_points=cfg['num_points'],
         boundary_ratio=cfg['boundary_ratio'],
         jitter_std=cfg.get('jitter_std', 0.005)
@@ -110,7 +113,7 @@ def main():
     train_set, val_set, test_set = random_split(dataset, [train_size, val_size, test_size])
     
     if local_rank == 0:
-        indices_save_path = os.path.join(PROJECT_ROOT, cfg['test_indices_path'])
+        indices_save_path = cfg['test_indices_path']
         os.makedirs(os.path.dirname(indices_save_path), exist_ok=True)
         torch.save(test_set.indices, indices_save_path)
         print_info(f"📊 数据就绪: 训练({len(train_set)}) | 验证({len(val_set)}) | 测试({len(test_set)} 封存)")

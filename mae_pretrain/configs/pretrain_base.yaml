@@ -61,7 +61,7 @@ min_lr: 1.0e-6
 # Polygon 频域参数
 # =========================
 # 频率采样数量（越大表示频域网格越密）。
-pos_freqs: 31
+pos_freqs: 63
 # 最小频率。
 w_min: 0.1
 # 最大频率。
@@ -73,16 +73,16 @@ freq_type: geometric
 # 模型结构（ViT-MAE）
 # =========================
 # patch 边长，需与频域网格尺寸匹配。
-patch_size: 2
+patch_size: 4
 # 编码器 token 维度。
-embed_dim: 384
+embed_dim: 512
 # 编码器层数。
-depth: 12
+depth: 24
 # 编码器注意力头数。
-num_heads: 8
+num_heads: 16
 
 # 解码器 token 维度。
-dec_embed_dim: 128
+dec_embed_dim: 256
 # 解码器层数。
 dec_depth: 4
 # 解码器注意力头数。
@@ -92,7 +92,7 @@ dec_num_heads: 4
 # 训练超参数
 # =========================
 # 总训练轮数。
-epochs: 150
+epochs: 500
 # batch size（按单进程计算，DDP 下为每进程 batch）。
 batch_size: 512
 # 初始学习率。
@@ -109,9 +109,9 @@ augment_times: 1
 # =========================
 # 训练计算精度：支持 fp32 / bf16 / fp16。
 # A800 上优先建议 bf16 以兼顾收敛稳定性与吞吐。
-precision: bf16
+precision: fp32
 # 检查点落盘精度：支持 fp32 / bf16 / fp16。
-checkpoint_dtype: bf16
+checkpoint_dtype: fp32
 
 # =========================
 # 保存与日志

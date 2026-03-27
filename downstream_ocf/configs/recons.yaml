@@ -1,7 +1,7 @@
 # OCF 隐式几何重建任务配置
 
 # 1. 路径设置 
-data_path: "./data/encoded_samples_20260324_1910.pt"
+data_path: "./data/processed/encoded_samples_20260324_1910.pt"
 save_dir: "./checkpoints/"
 test_indices_path: "./data/siren_test_indices.pt"
 
