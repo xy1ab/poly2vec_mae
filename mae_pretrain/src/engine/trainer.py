@@ -422,55 +422,6 @@ def _prepare_fixed_visual_sample(args, codec, val_dataset, device: torch.device)
 
     return fixed_batch_tris, fixed_lengths, spatial_gt, spatial_icft_orig
 
-
-def polt_result(args, epoch, codec, fixed_batch_tris, fixed_lengths,model,spatial_gt, spatial_icft_orig, run_dir, device):
-    with torch.no_grad():
-        mag_fix, phase_fix = codec.cft_batch(fixed_batch_tris, fixed_lengths)
-        imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
-
-        with autocast_context(device, args.precision):
-            _, _, _, pred_fix, mask_fix = model(imgs_fix, mask_ratio=args.mask_ratio)
-
-        pred_fix = pred_fix.float()
-        mask_fix = mask_fix.float()
-
-        p = args.patch_size
-        h, w = imgs_fix.shape[2], imgs_fix.shape[3]
-        h_p, w_p = h // p, w // p
-
-        img_orig = imgs_fix[0].cpu()
-
-        mask_map = mask_fix[0].cpu().reshape(h_p, w_p, 1, 1).expand(-1, -1, p, p)
-        mask_map = mask_map.permute(0, 2, 1, 3).reshape(h, w)
-
-        img_masked = img_orig.clone()
-        img_masked[:, mask_map == 1] = torch.nan
-
-        pred_img = pred_fix[0].cpu().reshape(h_p, w_p, 3, p, p)
-        pred_img = torch.einsum("hwcpq->chpwq", pred_img).reshape(3, h, w)
-
-        img_recon = img_orig.clone()
-        img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
-
-        mag_recon = img_recon[0].unsqueeze(0).to(device)
-        cos_recon = img_recon[1].unsqueeze(0).to(device)
-        sin_recon = img_recon[2].unsqueeze(0).to(device)
-
-        phase_recon = torch.atan2(sin_recon, cos_recon)
-        real_recon, imag_recon = mag_phase_to_real_imag(mag_recon, phase_recon)
-        spatial_icft_recon = codec.icft_2d(real_recon, imag_recon)[0].squeeze().cpu()
-
-        plot_reconstruction(
-            img_orig=img_orig,
-            img_masked=img_masked,
-            img_recon=img_recon,
-            spatial_gt=spatial_gt,
-            spatial_icft_orig=spatial_icft_orig.squeeze(),
-            spatial_icft_recon=spatial_icft_recon,
-            epoch=epoch + 1,
-            save_dir=run_dir,
-        )
-
 def count_parameters(model):
     model = model.module if hasattr(model, 'module') else model
     # 计算总参数量 (单位: 百万 M)
@@ -740,7 +691,6 @@ def train_main(args) -> None:
                         model_to_save.encoder.state_dict(),
                         precision=args.checkpoint_dtype,
                     )
-                    polt_result(args, epoch, codec, fixed_batch_tris, fixed_lengths,model,spatial_gt, spatial_icft_orig, run_dir, device)
                     print(f"  [Save] Saved checkpoints at epoch {epoch + 1}")
 
             scheduler.step()
