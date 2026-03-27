@@ -53,7 +53,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from loaders.dataloader_mae import PolyMAEDataset, mae_collate_fn
-from utils.poly_fourier_engine import PolyFourierConverter
+from mae_pretrain.src.datasets.geometry_polygon import PolyFourierConverter
 from models.vit_poly import MaskedAutoencoderViTPoly
 from tqdm import tqdm
 

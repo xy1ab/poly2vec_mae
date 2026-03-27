@@ -5,10 +5,17 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import numpy as np
 import matplotlib.path as mpltPath
-
+import argparse
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.poly_fourier_engine import PolyFourierConverter
+# 获取当前文件的绝对路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# 向上退两级回到根目录 (preprocessing -> downstream_unet -> root)
+project_root = os.path.abspath(os.path.join(current_dir, "../../"))
+
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
+from mae_pretrain.src.datasets.geometry_polygon import PolyFourierConverter
 from config import FourierConfig as cfg
 
 def rasterize_triangles(tris, spatial_size=256):
@@ -23,15 +30,23 @@ def rasterize_triangles(tris, spatial_size=256):
         mask |= path.contains_points(points)
     return mask.reshape((spatial_size, spatial_size)).astype(np.float32)
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="downstream_UNet")
+    parser.add_argument("--data_path", type=str, default="./data/processed/polygon_triangles_normalized.pt")
+    parser.add_argument("--save_dir", type=str, default="./data/unet_dataset")
+    return parser
+
 def main():
     # ==========================================
     # 🌟 快速测试开关：True 只生成 100 个，False 生成全部
     TEST_MODE = False
     # ==========================================
-    
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    save_dir = './data/v2_dataset_test' if TEST_MODE else './data/v2_dataset_full'
-    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(args.save_dir, exist_ok=True)
     
     print("初始化傅里叶引擎...")
     engine = PolyFourierConverter(
@@ -39,13 +54,13 @@ def main():
         freq_type=cfg.FREQ_TYPE, patch_size=cfg.PATCH_SIZE, device=device
     )
     
-    all_polys = torch.load('./data/processed/polygon_triangles_normalized.pt', weights_only=False)
+    all_polys = torch.load(args.data_path, weights_only=False)
     total_samples = 100 if TEST_MODE else len(all_polys)
     
     print(f"🚀 开始生成3通道输入数据, 目标数量: {total_samples}")
     
     for i in tqdm(range(total_samples)):
-        save_path = os.path.join(save_dir, f"pair_{i}.pt")
+        save_path = os.path.join(args.save_dir, f"pair_{i}.pt")
         if os.path.exists(save_path): continue
         
         tris = all_polys[i]

@@ -6,7 +6,7 @@ import geopandas as gpd
 from tqdm import tqdm
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.poly_fourier_engine import PolyFourierConverter
+from mae_pretrain.src.datasets.geometry_polygon import PolyFourierConverter
 
 def process_and_save(input_dirs, output_dir):
     os.makedirs(output_dir, exist_ok=True)

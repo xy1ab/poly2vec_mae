@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from datasets.geometry_polygon import PolyFourierConverter
+from mae_pretrain.src.datasets.geometry_polygon import PolyFourierConverter
 
 
 _PER_SAMPLE_OVERHEAD_BYTES = 1024

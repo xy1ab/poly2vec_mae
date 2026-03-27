@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.path as mpltPath
-from utils.poly_fourier_engine import PolyFourierConverter
+from mae_pretrain.src.datasets.geometry_polygon import PolyFourierConverter
 
 def rasterize_triangles(tris, spatial_size=256):
     """将一组三角形空间坐标光栅化为 0/1 的二值图掩码"""
