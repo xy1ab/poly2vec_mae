@@ -193,6 +193,12 @@ def main() -> None:
         default=None,
         help="Optional torchrun master port override for DDP rendezvous.",
     )
+    pre_parser.add_argument(
+        "--viz_every",
+        type=int,
+        default=None,
+        help="Optional visualization-epoch interval override.",
+    )
     pre_parser.add_argument("--no_auto_spawn", action="store_true")
     pre_args, remaining = pre_parser.parse_known_args()
 
@@ -201,6 +207,8 @@ def main() -> None:
     # Apply early GPU override so DDP process-count follows CLI user intent.
     if pre_args.gpu is not None:
         config["gpu"] = str(pre_args.gpu)
+    if pre_args.viz_every is not None:
+        config["viz_every"] = int(pre_args.viz_every)
 
     gpu_from_config = str(config.get("gpu", "0"))
     gpu_list = _split_gpu_list(gpu_from_config)
@@ -225,6 +233,8 @@ def main() -> None:
             "--no_auto_spawn",
             ]
         )
+        if pre_args.viz_every is not None:
+            cmd.extend(["--viz_every", str(pre_args.viz_every)])
         cmd.extend(remaining)
         env = dict(os.environ)
         # Ensure torchrun local ranks map strictly to requested GPU subset.

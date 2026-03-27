@@ -406,8 +406,10 @@ def _prepare_fixed_visual_sample(args, codec, val_dataset, device: torch.device)
     random.seed(args.split_seed)
     np.random.seed(args.split_seed)
 
-    fixed_tris_np = val_dataset.apply_augmentation(fixed_tris_orig)
-    fixed_tris = torch.tensor(fixed_tris_np, dtype=torch.float32)
+    # Use the raw validation sample for visualization.
+    # This keeps train/val/viz behavior aligned when augment_times=1 and avoids
+    # hidden augmentation in reconstruction PNGs.
+    fixed_tris = torch.tensor(fixed_tris_orig, dtype=torch.float32)
 
     fixed_batch_tris = fixed_tris.unsqueeze(0).to(device)
     fixed_lengths = torch.tensor([fixed_tris.shape[0]], device=device)

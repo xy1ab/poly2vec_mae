@@ -405,8 +405,10 @@ def _prepare_fixed_visual_sample(args, codec, val_dataset, device: torch.device)
     random.seed(args.split_seed)
     np.random.seed(args.split_seed)
 
-    fixed_tris_np = val_dataset.apply_augmentation(fixed_tris_orig)
-    fixed_tris = torch.tensor(fixed_tris_np, dtype=torch.float32)
+    # Use the raw validation sample for visualization.
+    # This keeps train/val/viz behavior aligned when augment_times=1 and avoids
+    # hidden augmentation in reconstruction PNGs.
+    fixed_tris = torch.tensor(fixed_tris_orig, dtype=torch.float32)
 
     fixed_batch_tris = fixed_tris.unsqueeze(0).to(device)
     fixed_lengths = torch.tensor([fixed_tris.shape[0]], device=device)
@@ -498,6 +500,7 @@ def train_main(args) -> None:
     args.checkpoint_dtype = normalize_precision(args.checkpoint_dtype)
 
     scaler = build_grad_scaler(device=device, precision=args.precision)
+    args.viz_every = max(1, int(args.viz_every))
 
     if is_main_process(dist_ctx):
         run_dir, run_timestamp = make_timestamped_dir(args.save_dir)
@@ -677,6 +680,54 @@ def train_main(args) -> None:
                 print(f"  [Train] Total: {avg_train_loss.item():.4f} | Mag: {avg_train_mag.item():.4f} | Phase: {avg_train_phase.item():.4f}")
                 print(f"  [Val]   Total: {avg_val_loss.item():.4f} | Mag: {avg_val_mag.item():.4f} | Phase: {avg_val_phase.item():.4f}")
 
+                if (epoch + 1) % args.viz_every == 0:
+                    with torch.no_grad():
+                        mag_fix, phase_fix = codec.cft_batch(fixed_batch_tris, fixed_lengths)
+                        imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
+
+                        with autocast_context(device, args.precision):
+                            _, _, _, pred_fix, mask_fix = model(imgs_fix, mask_ratio=args.mask_ratio)
+
+                        pred_fix = pred_fix.float()
+                        mask_fix = mask_fix.float()
+
+                        p = args.patch_size
+                        h, w = imgs_fix.shape[2], imgs_fix.shape[3]
+                        h_p, w_p = h // p, w // p
+
+                        img_orig = imgs_fix[0].cpu()
+
+                        mask_map = mask_fix[0].cpu().reshape(h_p, w_p, 1, 1).expand(-1, -1, p, p)
+                        mask_map = mask_map.permute(0, 2, 1, 3).reshape(h, w)
+
+                        img_masked = img_orig.clone()
+                        img_masked[:, mask_map == 1] = torch.nan
+
+                        pred_img = pred_fix[0].cpu().reshape(h_p, w_p, 3, p, p)
+                        pred_img = torch.einsum("hwcpq->chpwq", pred_img).reshape(3, h, w)
+
+                        img_recon = img_orig.clone()
+                        img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
+
+                        mag_recon = img_recon[0].unsqueeze(0).to(device)
+                        cos_recon = img_recon[1].unsqueeze(0).to(device)
+                        sin_recon = img_recon[2].unsqueeze(0).to(device)
+
+                        phase_recon = torch.atan2(sin_recon, cos_recon)
+                        real_recon, imag_recon = mag_phase_to_real_imag(mag_recon, phase_recon)
+                        spatial_icft_recon = codec.icft_2d(real_recon, imag_recon)[0].squeeze().cpu()
+
+                        plot_reconstruction(
+                            img_orig=img_orig,
+                            img_masked=img_masked,
+                            img_recon=img_recon,
+                            spatial_gt=spatial_gt,
+                            spatial_icft_orig=spatial_icft_orig.squeeze(),
+                            spatial_icft_recon=spatial_icft_recon,
+                            epoch=epoch + 1,
+                            save_dir=run_dir,
+                        )
+
                 if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
                     model_to_save = model.module if isinstance(model, DDP) else model
                     save_checkpoint(
@@ -771,6 +822,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint_dtype", type=str, default="bf16")
 
     parser.add_argument("--save_every", type=int, default=20)
+    parser.add_argument("--viz_every", type=int, default=1)
     parser.add_argument("--log_interval", type=int, default=50)
 
     return parser

@@ -12,9 +12,9 @@ cd /home/xiaoyang/workspace/poly2vec_mae_v1/mae_pretrain
 
 - 入口脚本：`scripts/run_pretrain.py`
   
-- 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`。
+- 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`；支持用 `--viz_every` 控制 PNG 可视化输出间隔（按 epoch）。
   
-- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。
+- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--viz_every` 默认 `1`（每个 epoch 输出），例如 `10` 表示每 10 个 epoch 输出一次。
   
 - 调取示例：
   
@@ -32,7 +32,9 @@ python scripts/run_pretrain.py \
 
   --precision bf16 \
 
-  --mask_ratio 0.75
+  --mask_ratio 0.75 \
+
+  --viz_every 10
 ```
 
 ### 2 模型重建可视化评估
