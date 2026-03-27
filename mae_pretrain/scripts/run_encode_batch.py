@@ -95,20 +95,39 @@ def _expand_polygons(geom):
     return []
 
 
-def _limit_normalize(coords: np.ndarray, eps: float = 1e-6):
-    """Normalize coordinates to max-abs unit range.
+def _normalize_with_bbox_limit(coords: np.ndarray, eps: float = 1e-6):
+    """Normalize polygon coordinates into bbox-based limit range.
+
+    This function performs strict bbox normalization:
+    1) Compute physical bbox center `(cx, cy)`.
+    2) Compute physical bbox square side length `side_len = max(dx, dy)`.
+    3) Normalize by `(coords - center) / (side_len / 2)`.
+
+    After normalization, all coordinates are within `[-1, 1]`, and the longer
+    bbox axis reaches the limit value `±1` (up to floating-point precision).
 
     Args:
-        coords: Coordinate array.
-        eps: Degenerate threshold.
+        coords: Coordinate array with shape `[N,2]` in physical coordinates.
+        eps: Degenerate threshold for side length.
 
     Returns:
-        Normalized coordinates or None for degenerate input.
+        Tuple `(coords_norm, cx, cy, side_len)` or None for degenerate input.
     """
-    max_abs = float(np.max(np.abs(coords)))
-    if max_abs < eps:
+    coords_np = np.asarray(coords, dtype=np.float64)
+    if coords_np.ndim != 2 or coords_np.shape[1] != 2:
         return None
-    return (coords / max_abs).astype(np.float32)
+
+    min_xy = coords_np.min(axis=0)
+    max_xy = coords_np.max(axis=0)
+    cx = float((min_xy[0] + max_xy[0]) * 0.5)
+    cy = float((min_xy[1] + max_xy[1]) * 0.5)
+    side_len = float(max(max_xy[0] - min_xy[0], max_xy[1] - min_xy[1]))
+
+    if side_len <= eps:
+        return None
+
+    coords_norm = (coords_np - np.array([cx, cy], dtype=np.float64)) / (side_len * 0.5)
+    return coords_norm.astype(np.float32), cx, cy, side_len
 
 
 def _augment_triangles(tris: np.ndarray, rng: np.random.Generator, scale_min: float = 0.5, scale_max: float = 1.0) -> np.ndarray:
@@ -153,22 +172,19 @@ def _augment_triangles(tris: np.ndarray, rng: np.random.Generator, scale_min: fl
     return pts.reshape(tris.shape).astype(np.float32)
 
 
-def _build_meta(tris: np.ndarray, node_count: int) -> np.ndarray:
-    """Build metadata vector from triangle coordinates.
+def _build_meta(cx: float, cy: float, side_len: float, node_count: int) -> np.ndarray:
+    """Build physical metadata vector for one polygon sample.
 
     Args:
-        tris: Triangle array `[T,3,2]`.
+        cx: Physical bbox center x.
+        cy: Physical bbox center y.
+        side_len: Physical bbox square side length.
         node_count: Original polygon node count.
 
     Returns:
         Metadata array `[cx, cy, side_len, node_count]`.
     """
-    pts = tris.reshape(-1, 2)
-    min_xy = pts.min(axis=0)
-    max_xy = pts.max(axis=0)
-    center = (min_xy + max_xy) * 0.5
-    side_len = float(max(max_xy[0] - min_xy[0], max_xy[1] - min_xy[1]))
-    return np.array([center[0], center[1], side_len, float(node_count)], dtype=np.float32)
+    return np.array([cx, cy, side_len, float(node_count)], dtype=np.float32)
 
 
 def _normalize_output_mode(mode_value: str | int) -> int:
@@ -319,10 +335,11 @@ def main() -> None:
                     skipped_invalid += 1
                     continue
 
-                norm_coords = _limit_normalize(coords)
-                if norm_coords is None:
+                normalized = _normalize_with_bbox_limit(coords)
+                if normalized is None:
                     skipped_invalid += 1
                     continue
+                norm_coords, cx_phy, cy_phy, side_len_phy = normalized
 
                 tris = triangulator.triangulate_polygon(norm_coords)
                 if tris.shape[0] == 0:
@@ -332,6 +349,12 @@ def main() -> None:
                 base_records.append(
                     {
                         "triangles": tris.astype(np.float32),
+                        "meta": _build_meta(
+                            cx=cx_phy,
+                            cy=cy_phy,
+                            side_len=side_len_phy,
+                            node_count=node_count,
+                        ),
                         "node_count": node_count,
                         "src_file": str(file_path),
                         "row_idx": row_idx,
@@ -383,7 +406,7 @@ def main() -> None:
 
     for rec in tqdm(base_records, desc="Augment + Encode"):
         base_tri = rec["triangles"]
-        node_count = rec["node_count"]
+        base_meta = rec["meta"]
 
         for aug_id in range(args.augment_times + 1):
             if aug_id == 0:
@@ -396,7 +419,9 @@ def main() -> None:
                     scale_max=args.scale_max,
                 )
 
-            meta = _build_meta(tri_aug, node_count=node_count)
+            # Metadata describes physical bbox of the original polygon and
+            # must stay unchanged across augmented variants.
+            meta = base_meta
             pending_tris.append(tri_aug)
             pending_meta.append(meta)
 

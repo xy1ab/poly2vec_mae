@@ -24,6 +24,7 @@ mae_pretrain/scripts/__pycache__
 mae_pretrain/src/__pycache__
 mae_pretrain/src/utils/__pycache__
 mae_pretrain/tests/__pycache__
+mae_pretrain/src/datasets/__pycache__
 # Data (通常不上传原始/处理后数据)
 downstream/*
 !downstream/.gitkeep
