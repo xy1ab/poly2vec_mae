@@ -45,7 +45,7 @@ def spectral_consistency_loss(pred, target):
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="downstream_UNet")
     parser.add_argument("--data_path", type=str, default="./data/unet_dataset")
-    parser.add_argument("--test_data_path", type=str, default="./data/unet_dataset/test_dataset.pt")
+    parser.add_argument("--test_dataset", type=str, default="./data/unet_dataset/test_dataset.pt")
     parser.add_argument("--save_dir", type=str, default="./outputs/unet_checkpoints")
     return parser
 
