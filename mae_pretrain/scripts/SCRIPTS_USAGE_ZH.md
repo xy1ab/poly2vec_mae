@@ -94,7 +94,7 @@ python scripts/run_export.py \
 - 具体功能：扫描输入目录中的矢量数据，按“输入任务”并行执行 polygon 三角剖分（`shp/geojs` 为每文件任务，`gdb` 为每图层任务；支持 MultiPolygon 与 donut），对退化三角形进行过滤（面积过小/近共线），并保存为单个 `.pt` 或多个分块 `.pt` 文件。
   
 - 配置说明：不依赖 YAML，仅使用 CLI 参数；必须传 `--input_dirs`。  
-  常用可选参数：`--file_type`（输入类型：`shp/gdb/geojs`，默认 `shp`）、`--layer`（仅 `gdb` 生效，默认 `all`，可指定单层名）、`--output_path`（输出基路径）、`--num_workers`（文件级并行进程数，`<=0` 自动）、`--shard_size_mb`（分块大小，`<=0` 不分块）、`--min_triangle_area`（最小三角面积阈值）、`--min_triangle_height`（最小高阈值）、`--log`（输出三角剖分日志）。  
+  常用可选参数：`--file_type`（输入类型：`shp/gdb/geojs`，默认 `shp`）、`--layer`（仅 `gdb` 生效，默认 `all`，可指定单层名）、`--output_path`（输出基路径）、`--num_workers`（文件级并行进程数，`<=0` 自动）、`--shard_size_mb`（分块大小，`<=0` 不分块）、`--min_triangle_area`（最小三角面积阈值，默认 `1e-8`）、`--min_triangle_height`（最小高阈值，默认 `1e-5`）、`--log`（输出三角剖分日志）。  
   当使用 `--log` 时，日志默认保存到与输出 `.pt` 同目录，命名为 `<output_path_stem>.triangulation_log.json`。
   
 - 调取示例：
