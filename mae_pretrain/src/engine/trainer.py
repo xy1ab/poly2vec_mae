@@ -481,9 +481,10 @@ def train_main(args) -> None:
             json.dump(model_config, fp, indent=4, ensure_ascii=False)
 
     freq_span_patches = compute_freq_span_patches(converter, args.patch_size, device=device)
-
+    
     model = _build_model(args, img_size=img_size, device=device, dist_ctx=dist_ctx)
-    count_parameters(model)
+    if is_main_process(dist_ctx):
+        count_parameters(model)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     if args.warmup_epochs > 0:
