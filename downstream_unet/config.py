@@ -8,4 +8,4 @@ class FourierConfig:
     PATCH_SIZE = 4
     
     # --- 空间域参数 ---
-    SPATIAL_SIZE = 512      # 图像分辨率
+    SPATIAL_SIZE = 256      # 图像分辨率

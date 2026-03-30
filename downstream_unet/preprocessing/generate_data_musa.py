@@ -1,5 +1,6 @@
 # preprocessing/generate_data.py
 import os
+import torch_musa
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -39,7 +40,7 @@ def main():
     args = parser.parse_args()
 
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('musa' if torch.musa.is_available() else 'cpu')
     os.makedirs(args.save_dir, exist_ok=True)
     
     print("初始化傅里叶引擎...")
@@ -73,8 +74,11 @@ def main():
             
             # 逆变换出模糊空间图 (通道1)
             raw_mag = torch.expm1(mag_log)
-            F_uv = raw_mag * torch.exp(1j * phase)
-            x_spatial = engine.icft_2d(F_uv.squeeze(1), spatial_size=cfg.SPATIAL_SIZE)
+            # F_uv = raw_mag * torch.exp(1j * phase)
+            F_uv_real = raw_mag * torch.cos(phase)
+            F_uv_imag = raw_mag * torch.sin(phase)
+            # x_spatial = engine.icft_2d(F_uv.squeeze(1), spatial_size=cfg.SPATIAL_SIZE)
+            x_spatial = engine.icft_2d(F_uv_real.squeeze(1), F_uv_imag.squeeze(1), spatial_size=cfg.SPATIAL_SIZE)
             x_spatial = x_spatial.unsqueeze(1) #[1, 1, 256, 256]
             
             # 使用双线性插值, 将频域特征强制缩放到 256x256 (通道2, 通道3)

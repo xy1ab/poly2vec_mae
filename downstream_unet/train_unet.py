@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import segmentation_models_pytorch as smp
 import numpy as np
-
+import argparse
 # ==========================================
 # 🚀 增加 DDP 所需的分布式依赖
 # ==========================================
@@ -42,7 +42,17 @@ def spectral_consistency_loss(pred, target):
     fft_target = torch.fft.rfft2(target)
     return torch.mean(torch.abs(fft_pred - fft_target))
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="downstream_UNet")
+    parser.add_argument("--data_path", type=str, default="./data/unet_dataset")
+    parser.add_argument("--test_dataset", type=str, default="./data/unet_dataset/test_dataset.pt")
+    parser.add_argument("--save_dir", type=str, default="./outputs/unet_checkpoints")
+    return parser
+
 def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
     # ==========================================
     # ⚙️ 初始化 DDP 分布式环境
     # ==========================================
@@ -59,12 +69,9 @@ def main():
     # ==========================================
     TEST_MODE = False  # 正式训练保持 False
     
-    data_dir = './data/v2_dataset_test' if TEST_MODE else './data/v2_dataset_full'
-    save_dir = './checkpoints_v2'
-    
     # 仅主进程(Rank 0)负责创建目录和打印日志
     if local_rank == 0:
-        os.makedirs(save_dir, exist_ok=True)
+        os.makedirs(args.save_dir, exist_ok=True)
         print(f"🚀训练启动！测试模式: {TEST_MODE} | DDP进程数: {world_size}")
     
     epochs = 10 if TEST_MODE else 100
@@ -74,10 +81,10 @@ def main():
     # ==========================================
     # 1. 严谨的数据加载与切分
     # ==========================================
-    dataset = V2Dataset(data_dir)
+    dataset = V2Dataset(args.data_path)
     total_len = len(dataset)
     if total_len == 0:
-        raise ValueError(f"❌ 找不到数据，请检查 {data_dir} 是否已生成！")
+        raise ValueError(f"❌ 找不到数据，请检查 {args.data_path} 是否已生成！")
         
     train_len = int(0.9 * total_len)
     val_len = int(0.05 * total_len)
@@ -90,8 +97,7 @@ def main():
     )
     
     if local_rank == 0:
-        os.makedirs('./data', exist_ok=True)
-        torch.save(test_set.indices, './data/v2_test_indices.pt')
+        torch.save(test_set.indices, args.test_dataset)
         print(f"📊 数据切分: 训练({train_len}) | 验证({val_len}) | 测试({test_len} 已封存)")
     
     # 为训练集和验证集增加 DistributedSampler
@@ -212,18 +218,18 @@ def main():
             # 1. 保存最佳模型
             if avg_val_iou > best_iou:
                 best_iou = avg_val_iou
-                torch.save(state_dict_to_save, os.path.join(save_dir, 'v2_unet_best.pth'))
+                torch.save(state_dict_to_save, os.path.join(args.save_dir, 'v2_unet_best.pth'))
                 print(f"   🏆 发现最佳 V2 模型！当前最高 IoU: {best_iou:.4f}，已保存。")
 
             # 2. 每5轮保存一个定期备份
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 20 == 0:
                 ckpt_name = f'v2_unet_epoch_{epoch+1}.pth'
-                torch.save(state_dict_to_save, os.path.join(save_dir, ckpt_name))
+                torch.save(state_dict_to_save, os.path.join(args.save_dir, ckpt_name))
                 print(f"   💾 定期备份已保存: {ckpt_name}")
 
     # 训练彻底结束后，保存最后一轮的快照
     if local_rank == 0:
-        torch.save(model.module.state_dict(), os.path.join(save_dir, 'v2_unet_last.pth'))
+        torch.save(model.module.state_dict(), os.path.join(args.save_dir, 'v2_unet_last.pth'))
         print(f"🎉 训练全部完成！最优验证 IoU 锁定在: {best_iou:.4f}")
 
     # 销毁进程组，退出 DDP

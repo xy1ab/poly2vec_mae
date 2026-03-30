@@ -771,6 +771,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint_dtype", type=str, default="bf16")
 
     parser.add_argument("--save_every", type=int, default=20)
+    parser.add_argument("--viz_every", type=int, default=1)
     parser.add_argument("--log_interval", type=int, default=50)
 
     return parser
