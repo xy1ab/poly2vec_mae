@@ -4,6 +4,10 @@ This module reads vector files, normalizes polygons, triangulates each polygon
 (including MultiPolygon parts and donut holes), filters degenerate triangles,
 and saves triangle tensors into one or multiple `.pt` shards.
 
+Serialization note:
+Shard files are saved with `torch.save` for full compatibility with existing
+training/evaluation readers (`torch.load`).
+
 Key features:
 1) File-level parallel triangulation with process pool.
 2) Stable file-order merge even when futures complete out-of-order.
@@ -24,14 +28,32 @@ from typing import Any, Iterable
 
 import geopandas as gpd
 import numpy as np
-import torch
-from shapely.geometry import Point, Polygon
+from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Point, Polygon
+from shapely.ops import polygonize, triangulate as shapely_triangulate, unary_union
 import triangle as tr
 from tqdm import tqdm
 
+try:
+    from shapely.validation import make_valid as _shapely_make_valid
+except Exception:  # pragma: no cover - compatibility fallback
+    _shapely_make_valid = None
 
-_PER_SAMPLE_OVERHEAD_BYTES = 1024
+
 _NORMALIZATION_EPS = 1e-6
+_TRIANGLE_SUBPROC_TIMEOUT_SEC = 20.0
+
+
+def _save_samples_torch(samples: list[np.ndarray], output_file: Path) -> None:
+    """Serialize one shard with torch format for downstream compatibility.
+
+    Args:
+        samples: Triangle sample list.
+        output_file: Target output file path.
+    """
+    # Local import avoids triggering torch import during module import phase.
+    import torch
+
+    torch.save(samples, output_file)
 
 
 def _normalize_file_type(file_type: str) -> str:
@@ -226,6 +248,312 @@ def _normalize_polygon_to_unit_box(poly: Polygon, eps: float = _NORMALIZATION_EP
     return poly_norm
 
 
+def _extract_polygons_from_geometry(geom) -> list[Polygon]:
+    """Extract polygon components from a generic geometry object.
+
+    Args:
+        geom: Any shapely geometry.
+
+    Returns:
+        Flat polygon list. Empty when no polygon components exist.
+    """
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, Polygon):
+        return [geom]
+    if isinstance(geom, MultiPolygon):
+        return [poly for poly in geom.geoms if poly is not None and not poly.is_empty]
+    if isinstance(geom, GeometryCollection):
+        out: list[Polygon] = []
+        for sub in geom.geoms:
+            out.extend(_extract_polygons_from_geometry(sub))
+        return out
+    return []
+
+
+def _polygon_has_shell_hole_intersection(poly: Polygon) -> bool:
+    """Check whether polygon shell intersects any hole boundary.
+
+    This catches topology patterns where an inner ring touches the shell at a
+    point/segment, which is a known instability trigger for some triangulators.
+
+    Args:
+        poly: Input polygon.
+
+    Returns:
+        True when shell and at least one hole ring intersect.
+    """
+    if poly is None or poly.is_empty or len(poly.interiors) == 0:
+        return False
+
+    shell_line = LineString(np.asarray(poly.exterior.coords)[:, :2])
+    for interior in poly.interiors:
+        hole_line = LineString(np.asarray(interior.coords)[:, :2])
+        inter = shell_line.intersection(hole_line)
+        if not inter.is_empty:
+            return True
+    return False
+
+
+def _split_polygon_touching_holes(poly: Polygon) -> list[Polygon]:
+    """Split polygons whose holes touch shell using boundary polygonization.
+
+    Args:
+        poly: Input polygon geometry.
+
+    Returns:
+        Repaired polygon parts. Returns `[poly]` when no split is needed or
+        when split fails.
+    """
+    if poly is None or poly.is_empty:
+        return []
+    if len(poly.interiors) == 0:
+        return [poly]
+    if not _polygon_has_shell_hole_intersection(poly):
+        return [poly]
+
+    lines = [LineString(np.asarray(poly.exterior.coords)[:, :2])]
+    lines.extend(LineString(np.asarray(interior.coords)[:, :2]) for interior in poly.interiors)
+
+    try:
+        merged = unary_union(lines)
+        pieces = list(polygonize(merged))
+    except Exception:
+        return [poly]
+
+    out: list[Polygon] = []
+    for piece in pieces:
+        if piece is None or piece.is_empty:
+            continue
+        rep_pt = piece.representative_point()
+        if not poly.covers(rep_pt):
+            continue
+        fixed = piece.buffer(0)
+        out.extend(_extract_polygons_from_geometry(fixed))
+
+    return out if out else [poly]
+
+
+def _shrink_touching_holes(poly: Polygon) -> Polygon | None:
+    """Try to separate touching shell-hole boundaries by shrinking holes.
+
+    Args:
+        poly: Input polygon geometry that may contain touching interior rings.
+
+    Returns:
+        Repaired polygon when shrinking succeeds, otherwise None.
+    """
+    if poly is None or poly.is_empty or len(poly.interiors) == 0:
+        return None
+
+    shell = _clean_ring_coords(np.asarray(poly.exterior.coords))
+    if shell is None:
+        return None
+
+    shell_poly = Polygon(shell)
+    if shell_poly.is_empty:
+        return None
+
+    # Escalate epsilon gradually to avoid over-shrinking small holes.
+    for eps in (1e-9, 1e-8, 1e-7, 1e-6):
+        hole_parts: list[Polygon] = []
+        for interior in poly.interiors:
+            hole = _clean_ring_coords(np.asarray(interior.coords))
+            if hole is None:
+                continue
+            ring_poly = Polygon(hole)
+            if ring_poly.is_empty:
+                continue
+            shrunk = ring_poly.buffer(-float(eps), join_style=2)
+            hole_parts.extend(_extract_polygons_from_geometry(shrunk))
+
+        if hole_parts:
+            try:
+                holes_union = unary_union(hole_parts)
+                repaired = shell_poly.difference(holes_union).buffer(0)
+            except Exception:
+                continue
+        else:
+            repaired = shell_poly.buffer(0)
+
+        repaired_polys = _extract_polygons_from_geometry(repaired)
+        if len(repaired_polys) != 1:
+            continue
+
+        candidate = repaired_polys[0]
+        if candidate.is_empty:
+            continue
+        if _polygon_has_shell_hole_intersection(candidate):
+            continue
+        return candidate
+
+    return None
+
+
+def _prepare_polygon_candidates(poly: Polygon) -> list[Polygon]:
+    """Prepare robust polygon candidates before triangulation.
+
+    Repair flow:
+    1) `buffer(0)` cleanup (already done by caller in most paths but harmless).
+    2) `make_valid` expansion to polygon components.
+    3) Split shell-hole touching cases with polygonize.
+
+    Args:
+        poly: Raw polygon geometry.
+
+    Returns:
+        Candidate polygon list for triangulation.
+    """
+    if poly is None or poly.is_empty:
+        return []
+
+    # Fast path: already valid and no shell-hole touching topology.
+    if poly.geom_type == "Polygon" and poly.is_valid:
+        if len(poly.interiors) == 0:
+            return [poly]
+        if not _polygon_has_shell_hole_intersection(poly):
+            return [poly]
+
+    fixed = poly.buffer(0)
+    if fixed.is_empty:
+        return []
+
+    if _shapely_make_valid is not None:
+        try:
+            valid_geom = _shapely_make_valid(fixed)
+        except Exception:
+            valid_geom = fixed
+    else:
+        valid_geom = fixed
+
+    polygons = _extract_polygons_from_geometry(valid_geom)
+    out: list[Polygon] = []
+    for pg in polygons:
+        if pg is None or pg.is_empty:
+            continue
+        if len(pg.interiors) > 0 and _polygon_has_shell_hole_intersection(pg):
+            shrunk = _shrink_touching_holes(pg)
+            if shrunk is not None:
+                out.append(shrunk)
+                continue
+        out.extend(_split_polygon_touching_holes(pg))
+
+    # Deduplicate candidates to avoid redundant triangulation work.
+    deduped: list[Polygon] = []
+    seen_wkb: set[bytes] = set()
+    for pg in out:
+        if pg is None or pg.is_empty:
+            continue
+        key = bytes(pg.wkb)
+        if key in seen_wkb:
+            continue
+        seen_wkb.add(key)
+        deduped.append(pg)
+    return deduped
+
+
+def _triangle_triangulate_subprocess_entry(conn, tri_input: dict[str, Any], options: str) -> None:
+    """Child-process entry for isolated triangle triangulation.
+
+    Args:
+        conn: Multiprocessing pipe endpoint.
+        tri_input: Triangle-library input dictionary.
+        options: Triangle options string.
+    """
+    try:
+        result = tr.triangulate(tri_input, options)
+        conn.send({"ok": True, "result": result})
+    except Exception as exc:
+        conn.send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _triangle_triangulate_isolated(
+    tri_input: dict[str, Any],
+    options: str = "pq",
+    timeout_sec: float = _TRIANGLE_SUBPROC_TIMEOUT_SEC,
+) -> dict[str, Any] | None:
+    """Run triangle triangulation in an isolated child process.
+
+    This prevents native segfault from crashing the main worker process.
+
+    Args:
+        tri_input: Triangle-library input dictionary.
+        options: Triangle options string.
+        timeout_sec: Child-process timeout in seconds.
+
+    Returns:
+        Triangle output dict when successful, else None.
+    """
+    ctx = mp.get_context("spawn")
+    recv_conn, send_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_triangle_triangulate_subprocess_entry,
+        args=(send_conn, tri_input, options),
+        daemon=True,
+    )
+    proc.start()
+    send_conn.close()
+
+    payload: dict[str, Any] | None = None
+    try:
+        if recv_conn.poll(timeout=max(0.1, float(timeout_sec))):
+            payload = recv_conn.recv()
+    except Exception:
+        payload = None
+    finally:
+        try:
+            recv_conn.close()
+        except Exception:
+            pass
+        if proc.is_alive():
+            proc.terminate()
+        proc.join(timeout=1.0)
+
+    if not payload or not bool(payload.get("ok", False)):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    return result
+
+
+def _triangulate_polygon_fallback(poly_norm: Polygon) -> np.ndarray:
+    """Fallback triangulation using shapely triangulate + centroid clipping.
+
+    Args:
+        poly_norm: Normalized polygon geometry.
+
+    Returns:
+        Triangle array `[T,3,2]`.
+    """
+    try:
+        tri_geoms = shapely_triangulate(poly_norm)
+    except Exception:
+        return np.zeros((0, 3, 2), dtype=np.float32)
+
+    tris: list[np.ndarray] = []
+    for tri_poly in tri_geoms:
+        if tri_poly is None or tri_poly.is_empty or tri_poly.geom_type != "Polygon":
+            continue
+        coords = np.asarray(tri_poly.exterior.coords, dtype=np.float64)
+        if coords.ndim != 2 or coords.shape[0] < 4 or coords.shape[1] < 2:
+            continue
+        tri = coords[:3, :2]
+        centroid = tri.mean(axis=0)
+        if not poly_norm.covers(Point(float(centroid[0]), float(centroid[1]))):
+            continue
+        tris.append(tri.astype(np.float32))
+
+    if not tris:
+        return np.zeros((0, 3, 2), dtype=np.float32)
+    return np.stack(tris, axis=0).astype(np.float32)
+
+
 def _build_triangle_input(poly: Polygon) -> dict[str, Any] | None:
     """Build Triangle-library input dictionary for one polygon with holes.
 
@@ -292,19 +620,33 @@ def _triangulate_polygon_with_holes(poly_norm: Polygon) -> np.ndarray:
     if tri_input is None:
         return np.zeros((0, 3, 2), dtype=np.float32)
 
-    try:
-        tri_data = tr.triangulate(tri_input, "pq")
-    except Exception:
-        return np.zeros((0, 3, 2), dtype=np.float32)
+    # Keep fast path in-process for regular polygons.
+    # Isolated subprocess is enabled only for risky shell-hole touching cases.
+    has_holes = len(poly_norm.interiors) > 0
+    need_isolated = bool(has_holes and _polygon_has_shell_hole_intersection(poly_norm))
+
+    tri_data: dict[str, Any] | None
+    if need_isolated:
+        tri_data = _triangle_triangulate_isolated(tri_input, options="pq")
+    else:
+        try:
+            tri_data = tr.triangulate(tri_input, "pq")
+        except Exception:
+            tri_data = None
+            if has_holes:
+                tri_data = _triangle_triangulate_isolated(tri_input, options="pq")
+
+    if tri_data is None:
+        return _triangulate_polygon_fallback(poly_norm)
 
     vertices = tri_data.get("vertices")
     tri_index = tri_data.get("triangles")
     if vertices is None or tri_index is None:
-        return np.zeros((0, 3, 2), dtype=np.float32)
+        return _triangulate_polygon_fallback(poly_norm)
 
     tris = np.asarray(vertices, dtype=np.float64)[np.asarray(tri_index, dtype=np.int64)]
     if tris.ndim != 3 or tris.shape[1:] != (3, 2):
-        return np.zeros((0, 3, 2), dtype=np.float32)
+        return _triangulate_polygon_fallback(poly_norm)
 
     # Final safety check: keep only triangles whose centroids are covered by the polygon.
     # This avoids accidental hole leakage from triangulation edge cases.
@@ -393,8 +735,67 @@ def _expand_geometry_to_polygons(geom) -> list[tuple[Polygon, bool]]:
     return []
 
 
-def _triangulate_file_worker(
-    file_index: int,
+def _init_result_counters() -> dict[str, Any]:
+    """Create a reusable counter payload for triangulation statistics.
+
+    Returns:
+        Dictionary containing all scalar counters and list fields.
+    """
+    return {
+        "skipped_count": 0,
+        "triangles": [],
+        "total_samples": 0,
+        "multi_sample_count": 0,
+        "donut_sample_count": 0,
+        "triangulated_raw_sample_count": 0,
+        "normal_sample_count": 0,
+        "degenerate_sample_count": 0,
+        "dropped_sample_count": 0,
+        "degenerate_records": [],
+    }
+
+
+def _merge_result_counters(target: dict[str, Any], partial: dict[str, Any]) -> None:
+    """Merge one partial statistics payload into target payload in-place.
+
+    Args:
+        target: Mutable aggregate payload.
+        partial: Partial payload from row/chunk computation.
+    """
+    target["skipped_count"] += int(partial.get("skipped_count", 0))
+    target["triangles"].extend(list(partial.get("triangles", [])))
+    target["total_samples"] += int(partial.get("total_samples", 0))
+    target["multi_sample_count"] += int(partial.get("multi_sample_count", 0))
+    target["donut_sample_count"] += int(partial.get("donut_sample_count", 0))
+    target["triangulated_raw_sample_count"] += int(partial.get("triangulated_raw_sample_count", 0))
+    target["normal_sample_count"] += int(partial.get("normal_sample_count", 0))
+    target["degenerate_sample_count"] += int(partial.get("degenerate_sample_count", 0))
+    target["dropped_sample_count"] += int(partial.get("dropped_sample_count", 0))
+    target["degenerate_records"].extend(list(partial.get("degenerate_records", [])))
+
+
+def _count_geometry_samples(geom) -> int:
+    """Count polygon samples contributed by one geometry row.
+
+    Args:
+        geom: Shapely geometry object.
+
+    Returns:
+        Number of polygon parts (`Polygon=1`, `MultiPolygon=n`, others=0).
+    """
+    if geom is None or geom.is_empty:
+        return 0
+    if geom.geom_type == "Polygon":
+        return 1
+    if geom.geom_type == "MultiPolygon":
+        return int(len(geom.geoms))
+    return 0
+
+
+def _triangulate_row_geometry(
+    row_idx: int,
+    geom,
+    local_sample_base: int,
     file_path: str,
     layer_name: str | None,
     source_type: str,
@@ -402,33 +803,208 @@ def _triangulate_file_worker(
     min_triangle_height: float,
     enable_log: bool,
 ) -> dict[str, Any]:
-    """Triangulate polygons from one vector file in a worker process.
+    """Triangulate one geometry row and collect per-row counters.
 
     Args:
-        file_index: Stable index of source file in sorted file list.
+        row_idx: Geometry row index in current task.
+        geom: Geometry instance from GeoDataFrame.
+        local_sample_base: Prefix sample index before this row within task.
         file_path: Source vector path.
-        layer_name: Layer name when source is `.gdb`, else None.
+        layer_name: Optional layer name for gdb task.
         source_type: Input source type token (`shp` / `geojs` / `gdb`).
         min_triangle_area: Minimum area threshold in normalized space.
-        min_triangle_height: Minimum height threshold in normalized space.
-        enable_log: Whether to collect detailed degenerate sample records.
+        min_triangle_height: Minimum altitude threshold in normalized space.
+        enable_log: Whether to collect detailed degenerate-sample records.
 
     Returns:
-        Dictionary containing worker status, triangle outputs, and statistics.
+        Per-row result payload with counters and triangle sample list.
     """
-    out_triangles: list[np.ndarray] = []
-    skipped_count = 0
+    row_out = _init_result_counters()
 
-    total_samples = 0
-    multi_sample_count = 0
-    donut_sample_count = 0
-    triangulated_raw_sample_count = 0
-    normal_sample_count = 0
-    degenerate_sample_count = 0
-    dropped_sample_count = 0
+    polygon_parts = _expand_geometry_to_polygons(geom)
+    if not polygon_parts:
+        row_out["skipped_count"] = 1
+        return row_out
 
-    degenerate_records: list[dict[str, Any]] = []
+    for part_idx, (poly_raw, from_multi) in enumerate(polygon_parts):
+        row_out["total_samples"] += 1
+        local_sample_index = int(local_sample_base + part_idx)
+        if from_multi:
+            row_out["multi_sample_count"] += 1
 
+        poly_fixed = poly_raw.buffer(0)
+        if poly_fixed.is_empty:
+            row_out["skipped_count"] += 1
+            row_out["dropped_sample_count"] += 1
+            continue
+
+        if poly_fixed.geom_type != "Polygon":
+            # Non-polygon after repair is treated as dropped sample.
+            row_out["skipped_count"] += 1
+            row_out["dropped_sample_count"] += 1
+            continue
+
+        is_donut = len(poly_fixed.interiors) > 0
+        if is_donut:
+            row_out["donut_sample_count"] += 1
+
+        candidate_polys = _prepare_polygon_candidates(poly_fixed)
+        if not candidate_polys:
+            row_out["skipped_count"] += 1
+            row_out["dropped_sample_count"] += 1
+            continue
+
+        topology_repaired = bool(len(candidate_polys) > 1)
+        tri_blocks: list[np.ndarray] = []
+        for candidate_poly in candidate_polys:
+            poly_norm = _normalize_polygon_to_unit_box(candidate_poly)
+            if poly_norm is None:
+                continue
+            tris_part = _triangulate_polygon_with_holes(poly_norm)
+            if tris_part.shape[0] == 0:
+                continue
+            tri_blocks.append(tris_part)
+
+        if not tri_blocks:
+            row_out["skipped_count"] += 1
+            row_out["dropped_sample_count"] += 1
+            continue
+
+        tris_raw = np.concatenate(tri_blocks, axis=0).astype(np.float32)
+        row_out["triangulated_raw_sample_count"] += 1
+
+        tris_kept, filter_stats = _filter_degenerate_triangles(
+            tris_raw,
+            min_triangle_area=min_triangle_area,
+            min_triangle_height=min_triangle_height,
+        )
+
+        filtered_total = int(filter_stats["filtered_total"])
+        if filtered_total > 0:
+            row_out["degenerate_sample_count"] += 1
+            if enable_log:
+                row_out["degenerate_records"].append(
+                    {
+                        "local_sample_index": int(local_sample_index),
+                        "file_path": str(file_path),
+                        "layer_name": layer_name,
+                        "source_type": source_type,
+                        "row_idx": int(row_idx),
+                        "part_idx": int(part_idx),
+                        "from_multipolygon": bool(from_multi),
+                        "is_donut": bool(is_donut),
+                        "topology_repaired": bool(topology_repaired),
+                        "candidate_polygon_count": int(len(candidate_polys)),
+                        "filtered_triangle_count": filtered_total,
+                        "filtered_by_area_small": int(filter_stats["filtered_by_area_small"]),
+                        "filtered_by_near_collinear": int(filter_stats["filtered_by_near_collinear"]),
+                        "kept_triangle_count": int(filter_stats["kept_count"]),
+                    }
+                )
+
+        if tris_kept.shape[0] > 0:
+            row_out["triangles"].append(tris_kept.astype(np.float32))
+            if filtered_total == 0:
+                row_out["normal_sample_count"] += 1
+        else:
+            row_out["skipped_count"] += 1
+            row_out["dropped_sample_count"] += 1
+
+    return row_out
+
+
+def _triangulate_chunk_worker(
+    chunk_index: int,
+    row_payloads: list[tuple[int, int, Any]],
+    file_path: str,
+    layer_name: str | None,
+    source_type: str,
+    min_triangle_area: float,
+    min_triangle_height: float,
+    enable_log: bool,
+) -> dict[str, Any]:
+    """Worker function for one row-chunk in task-internal parallelization.
+
+    Args:
+        chunk_index: Stable chunk index in current task.
+        row_payloads: List of `(row_idx, local_sample_base, geometry)` tuples.
+        file_path: Source vector path.
+        layer_name: Optional layer name for gdb task.
+        source_type: Input source type token (`shp` / `geojs` / `gdb`).
+        min_triangle_area: Minimum area threshold in normalized space.
+        min_triangle_height: Minimum altitude threshold in normalized space.
+        enable_log: Whether to collect detailed degenerate-sample records.
+
+    Returns:
+        Chunk-level result payload.
+    """
+    chunk_out = _init_result_counters()
+    row_sample_count = int(sum(_count_geometry_samples(payload[2]) for payload in row_payloads))
+    try:
+        for row_idx, local_sample_base, geom in row_payloads:
+            row_out = _triangulate_row_geometry(
+                row_idx=int(row_idx),
+                geom=geom,
+                local_sample_base=int(local_sample_base),
+                file_path=file_path,
+                layer_name=layer_name,
+                source_type=source_type,
+                min_triangle_area=min_triangle_area,
+                min_triangle_height=min_triangle_height,
+                enable_log=enable_log,
+            )
+            _merge_result_counters(chunk_out, row_out)
+    except Exception as exc:
+        return {
+            "index": int(chunk_index),
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "row_count": int(len(row_payloads)),
+            "row_sample_count": int(row_sample_count),
+            **_init_result_counters(),
+        }
+
+    return {
+        "index": int(chunk_index),
+        "ok": True,
+        "error": "",
+        "row_count": int(len(row_payloads)),
+        "row_sample_count": int(row_sample_count),
+        **chunk_out,
+    }
+
+
+def _triangulate_task_worker(
+    task_index: int,
+    task_count: int,
+    file_path: str,
+    layer_name: str | None,
+    source_type: str,
+    num_workers: int,
+    rows_per_chunk: int,
+    progress_every_chunks: int,
+    min_triangle_area: float,
+    min_triangle_height: float,
+    enable_log: bool,
+) -> dict[str, Any]:
+    """Triangulate one input task with task-serial and chunk-internal parallelism.
+
+    Args:
+        task_index: 0-based index of current task.
+        task_count: Total number of tasks.
+        file_path: Source vector path.
+        layer_name: Optional layer name for gdb task.
+        source_type: Input source type token (`shp` / `geojs` / `gdb`).
+        num_workers: Requested worker count for intra-task chunk parallelism.
+        rows_per_chunk: Row count per chunk.
+        progress_every_chunks: Print summary every N merged chunks (`<=0` disables).
+        min_triangle_area: Minimum area threshold in normalized space.
+        min_triangle_height: Minimum altitude threshold in normalized space.
+        enable_log: Whether to collect detailed degenerate-sample records.
+
+    Returns:
+        Task-level triangulation result payload (same schema as legacy file worker).
+    """
     try:
         if layer_name is None:
             gdf = gpd.read_file(file_path)
@@ -436,122 +1012,159 @@ def _triangulate_file_worker(
             gdf = gpd.read_file(file_path, layer=layer_name)
     except Exception as exc:
         return {
-            "index": file_index,
+            "index": int(task_index),
             "file_path": file_path,
             "layer_name": layer_name,
             "source_type": source_type,
             "ok": False,
             "error": str(exc),
             "source_geometry_count": 0,
-            "skipped_count": 0,
-            "triangles": [],
-            "total_samples": 0,
-            "multi_sample_count": 0,
-            "donut_sample_count": 0,
-            "triangulated_raw_sample_count": 0,
-            "normal_sample_count": 0,
-            "degenerate_sample_count": 0,
-            "dropped_sample_count": 0,
-            "degenerate_records": [],
+            **_init_result_counters(),
         }
 
     source_geometry_count = int(len(gdf.geometry))
-
+    row_payloads: list[tuple[int, int, Any]] = []
+    sample_cursor = 0
     for row_idx, geom in enumerate(gdf.geometry):
-        polygon_parts = _expand_geometry_to_polygons(geom)
-        if not polygon_parts:
-            skipped_count += 1
-            continue
+        row_payloads.append((int(row_idx), int(sample_cursor), geom))
+        sample_cursor += _count_geometry_samples(geom)
 
-        for part_idx, (poly_raw, from_multi) in enumerate(polygon_parts):
-            total_samples += 1
-            local_sample_index = total_samples - 1
-            if from_multi:
-                multi_sample_count += 1
+    chunk_size = max(1, int(rows_per_chunk))
+    chunks = [row_payloads[i : i + chunk_size] for i in range(0, len(row_payloads), chunk_size)]
+    chunk_worker_count = _resolve_intra_workers(num_workers=num_workers, unit_count=len(chunks))
 
-            poly_fixed = poly_raw.buffer(0)
-            if poly_fixed.is_empty:
-                skipped_count += 1
-                dropped_sample_count += 1
-                continue
+    layer_suffix = f" (layer={layer_name})" if layer_name is not None else ""
+    print(f"[INFO] Task {task_index + 1}/{task_count}: {file_path}{layer_suffix}")
+    print(
+        f"[INFO]   Task rows/chunks/workers : {source_geometry_count}/{len(chunks)}/{chunk_worker_count}"
+    )
 
-            if poly_fixed.geom_type != "Polygon":
-                # Non-polygon after repair is treated as dropped sample.
-                skipped_count += 1
-                dropped_sample_count += 1
-                continue
+    task_out = _init_result_counters()
+    task_error_count = 0
 
-            is_donut = len(poly_fixed.interiors) > 0
-            if is_donut:
-                donut_sample_count += 1
+    if not chunks:
+        return {
+            "index": int(task_index),
+            "file_path": file_path,
+            "layer_name": layer_name,
+            "source_type": source_type,
+            "ok": True,
+            "error": "",
+            "source_geometry_count": source_geometry_count,
+            **task_out,
+        }
 
-            poly_norm = _normalize_polygon_to_unit_box(poly_fixed)
-            if poly_norm is None:
-                skipped_count += 1
-                dropped_sample_count += 1
-                continue
+    merged_chunks = 0
+    with tqdm(total=source_geometry_count, desc=f"Task {task_index + 1}/{task_count} rows", unit="row", leave=False) as row_pbar:
+        if chunk_worker_count <= 1:
+            for chunk_index, chunk_payload in enumerate(chunks):
+                chunk_result = _triangulate_chunk_worker(
+                    chunk_index=chunk_index,
+                    row_payloads=chunk_payload,
+                    file_path=file_path,
+                    layer_name=layer_name,
+                    source_type=source_type,
+                    min_triangle_area=min_triangle_area,
+                    min_triangle_height=min_triangle_height,
+                    enable_log=enable_log,
+                )
+                row_pbar.update(int(chunk_result.get("row_count", len(chunk_payload))))
 
-            tris_raw = _triangulate_polygon_with_holes(poly_norm)
-            if tris_raw.shape[0] == 0:
-                skipped_count += 1
-                dropped_sample_count += 1
-                continue
-
-            triangulated_raw_sample_count += 1
-
-            tris_kept, filter_stats = _filter_degenerate_triangles(
-                tris_raw,
-                min_triangle_area=min_triangle_area,
-                min_triangle_height=min_triangle_height,
-            )
-
-            filtered_total = int(filter_stats["filtered_total"])
-            if filtered_total > 0:
-                degenerate_sample_count += 1
-                if enable_log:
-                    degenerate_records.append(
-                        {
-                            "local_sample_index": int(local_sample_index),
-                            "file_path": str(file_path),
-                            "layer_name": layer_name,
-                            "source_type": source_type,
-                            "row_idx": int(row_idx),
-                            "part_idx": int(part_idx),
-                            "from_multipolygon": bool(from_multi),
-                            "is_donut": bool(is_donut),
-                            "filtered_triangle_count": filtered_total,
-                            "filtered_by_area_small": int(filter_stats["filtered_by_area_small"]),
-                            "filtered_by_near_collinear": int(filter_stats["filtered_by_near_collinear"]),
-                            "kept_triangle_count": int(filter_stats["kept_count"]),
-                        }
+                if not bool(chunk_result.get("ok", False)):
+                    task_error_count += 1
+                    tqdm.write(
+                        f"[WARN] Chunk failed in {file_path}{layer_suffix}: {chunk_result.get('error', 'unknown error')}"
                     )
+                    task_out["skipped_count"] += int(chunk_result.get("row_count", 0))
+                    task_out["total_samples"] += int(chunk_result.get("row_sample_count", 0))
+                    task_out["dropped_sample_count"] += int(chunk_result.get("row_sample_count", 0))
+                else:
+                    _merge_result_counters(task_out, chunk_result)
 
-            if tris_kept.shape[0] > 0:
-                out_triangles.append(tris_kept.astype(np.float32))
-                if filtered_total == 0:
-                    normal_sample_count += 1
-            else:
-                skipped_count += 1
-                dropped_sample_count += 1
+                merged_chunks += 1
+                if progress_every_chunks > 0 and merged_chunks % int(progress_every_chunks) == 0:
+                    tqdm.write(
+                        "[INFO]   Chunk merge progress: "
+                        f"{merged_chunks}/{len(chunks)}, "
+                        f"triangulated_outputs={len(task_out['triangles'])}, "
+                        f"dropped={task_out['dropped_sample_count']}, "
+                        f"degenerate={task_out['degenerate_sample_count']}"
+                    )
+        else:
+            mp_context = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=chunk_worker_count, mp_context=mp_context) as executor:
+                future_to_meta = {
+                    executor.submit(
+                        _triangulate_chunk_worker,
+                        chunk_index,
+                        chunk_payload,
+                        file_path,
+                        layer_name,
+                        source_type,
+                        float(min_triangle_area),
+                        float(min_triangle_height),
+                        bool(enable_log),
+                    ): (chunk_index, int(len(chunk_payload)), int(sum(_count_geometry_samples(p[2]) for p in chunk_payload)))
+                    for chunk_index, chunk_payload in enumerate(chunks)
+                }
+
+                pending_results: dict[int, dict[str, Any]] = {}
+                next_chunk_index = 0
+
+                for future in as_completed(future_to_meta):
+                    chunk_index, row_count, row_sample_count = future_to_meta[future]
+                    try:
+                        chunk_result = future.result()
+                    except Exception as exc:
+                        chunk_result = {
+                            "index": int(chunk_index),
+                            "ok": False,
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "row_count": int(row_count),
+                            "row_sample_count": int(row_sample_count),
+                            **_init_result_counters(),
+                        }
+
+                    row_pbar.update(int(chunk_result.get("row_count", row_count)))
+                    pending_results[int(chunk_result["index"])] = chunk_result
+
+                    while next_chunk_index in pending_results:
+                        ordered_chunk = pending_results.pop(next_chunk_index)
+                        if not bool(ordered_chunk.get("ok", False)):
+                            task_error_count += 1
+                            tqdm.write(
+                                f"[WARN] Chunk failed in {file_path}{layer_suffix}: "
+                                f"{ordered_chunk.get('error', 'unknown error')}"
+                            )
+                            task_out["skipped_count"] += int(ordered_chunk.get("row_count", 0))
+                            task_out["total_samples"] += int(ordered_chunk.get("row_sample_count", 0))
+                            task_out["dropped_sample_count"] += int(ordered_chunk.get("row_sample_count", 0))
+                        else:
+                            _merge_result_counters(task_out, ordered_chunk)
+
+                        merged_chunks += 1
+                        if progress_every_chunks > 0 and merged_chunks % int(progress_every_chunks) == 0:
+                            tqdm.write(
+                                "[INFO]   Chunk merge progress: "
+                                f"{merged_chunks}/{len(chunks)}, "
+                                f"triangulated_outputs={len(task_out['triangles'])}, "
+                                f"dropped={task_out['dropped_sample_count']}, "
+                                f"degenerate={task_out['degenerate_sample_count']}"
+                            )
+                        next_chunk_index += 1
+
+    if task_error_count > 0:
+        print(f"[WARN] Task {task_index + 1}/{task_count} chunk failures: {task_error_count}")
 
     return {
-        "index": file_index,
+        "index": int(task_index),
         "file_path": file_path,
         "layer_name": layer_name,
         "source_type": source_type,
         "ok": True,
         "error": "",
         "source_geometry_count": source_geometry_count,
-        "skipped_count": skipped_count,
-        "triangles": out_triangles,
-        "total_samples": int(total_samples),
-        "multi_sample_count": int(multi_sample_count),
-        "donut_sample_count": int(donut_sample_count),
-        "triangulated_raw_sample_count": int(triangulated_raw_sample_count),
-        "normal_sample_count": int(normal_sample_count),
-        "degenerate_sample_count": int(degenerate_sample_count),
-        "dropped_sample_count": int(dropped_sample_count),
-        "degenerate_records": degenerate_records,
+        **task_out,
     }
 
 
@@ -562,9 +1175,12 @@ def _estimate_triangle_sample_bytes(tris: np.ndarray) -> int:
         tris: Triangle array `[T,3,2]`.
 
     Returns:
-        Estimated serialized bytes.
+        Estimated serialized bytes for torch-save oriented sharding.
     """
-    return int(tris.nbytes) + _PER_SAMPLE_OVERHEAD_BYTES
+    tri_np = np.asarray(tris, dtype=np.float32)
+    # Heuristic calibrated for list[np.ndarray] serialized by torch.save.
+    # It keeps shard sizes close to target without per-sample torch serialization overhead.
+    return int(tri_np.nbytes) + 640
 
 
 def _build_shard_path(base_output_path: Path, part_index: int) -> Path:
@@ -578,7 +1194,7 @@ def _build_shard_path(base_output_path: Path, part_index: int) -> Path:
         Shard file path.
     """
     suffix = base_output_path.suffix if base_output_path.suffix else ".pt"
-    return base_output_path.with_name(f"{base_output_path.stem}.part{part_index:04d}{suffix}")
+    return base_output_path.with_name(f"{base_output_path.stem}_part_{part_index:04d}{suffix}")
 
 
 def _default_log_path(output_path: Path) -> Path:
@@ -639,7 +1255,7 @@ class _ShardWriter:
             output_file = self.output_path
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self._buffer, output_file)
+        _save_samples_torch(self._buffer, output_file)
 
         self.shard_paths.append(output_file)
         self.shard_sample_counts.append(len(self._buffer))
@@ -664,6 +1280,7 @@ class _ShardWriter:
         manifest_path = self.output_path.with_name(f"{self.output_path.stem}.manifest.json")
         manifest = {
             "base_output_path": str(self.output_path),
+            "serialization": "torch_save_numpy_list",
             "shard_size_mb": self.shard_size_bytes / (1024.0 * 1024.0),
             "num_shards": len(self.shard_paths),
             "total_samples": int(sum(self.shard_sample_counts)),
@@ -682,25 +1299,25 @@ class _ShardWriter:
         return self.shard_paths, manifest_path
 
 
-def _resolve_num_workers(num_workers: int, file_count: int) -> int:
-    """Resolve effective process count for file-level parallelism.
+def _resolve_intra_workers(num_workers: int, unit_count: int) -> int:
+    """Resolve effective process count for task-internal parallelism.
 
     Args:
         num_workers: Requested worker count. `<=0` means auto.
-        file_count: Number of source files.
+        unit_count: Number of executable units (for example, chunk count).
 
     Returns:
-        Effective worker count in `[1, file_count]`.
+        Effective worker count in `[1, unit_count]` when `unit_count>0`.
     """
-    if file_count <= 1:
-        return 1
-
     if int(num_workers) <= 0:
         cpu_count = os.cpu_count() or 1
-        auto_workers = max(1, cpu_count - 1)
-        return max(1, min(auto_workers, file_count))
+        resolved = max(1, cpu_count - 1)
+    else:
+        resolved = max(1, int(num_workers))
 
-    return max(1, min(int(num_workers), file_count))
+    if unit_count <= 0:
+        return resolved
+    return max(1, min(resolved, int(unit_count)))
 
 
 def _consume_worker_result(result: dict[str, Any], writer: _ShardWriter) -> dict[str, Any]:
@@ -752,6 +1369,8 @@ def process_and_save(
     file_type: str = "shp",
     layer: str = "all",
     num_workers: int = 0,
+    rows_per_chunk: int = 2000,
+    progress_every_chunks: int = 10,
     shard_size_mb: float = 0.0,
     min_triangle_area: float = 1e-8,
     min_triangle_height: float = 1e-5,
@@ -764,7 +1383,9 @@ def process_and_save(
         output_path: Output `.pt` base path.
         file_type: Input vector source type (`shp`, `gdb`, `geojs`).
         layer: Layer selector when `file_type='gdb'`. Use `'all'` for all layers.
-        num_workers: File-level process count. `<=0` means auto.
+        num_workers: Task-internal process count. `<=0` means auto.
+        rows_per_chunk: Number of source rows in one intra-task chunk.
+        progress_every_chunks: Print summary every N merged chunks (`<=0` disables).
         shard_size_mb: Target shard size in MB. `<=0` means single `.pt` output.
         min_triangle_area: Minimum triangle area threshold in normalized space.
         min_triangle_height: Minimum altitude threshold in normalized space.
@@ -784,14 +1405,22 @@ def process_and_save(
             print("[WARN] No .shp files found under given input_dirs.")
         return
 
-    worker_count = _resolve_num_workers(num_workers=num_workers, file_count=len(task_list))
+    suggested_intra_workers = _resolve_intra_workers(num_workers=num_workers, unit_count=0)
+    rows_per_chunk = max(1, int(rows_per_chunk))
     shard_size_mb = float(shard_size_mb)
+    progress_every_chunks = int(progress_every_chunks)
 
     print(f"[INFO] Input file_type         : {canonical_file_type}")
     if canonical_file_type == "gdb":
         print(f"[INFO] Input layer selector    : {layer}")
     print(f"[INFO] Discovered input tasks : {len(task_list)}")
-    print(f"[INFO] File-level workers: {worker_count}")
+    print("[INFO] Parallel strategy      : task-serial + intra-task parallel")
+    print(f"[INFO] Intra-task workers    : {suggested_intra_workers}")
+    print(f"[INFO] Rows per chunk         : {rows_per_chunk}")
+    if progress_every_chunks > 0:
+        print(f"[INFO] Chunk summary interval : every {progress_every_chunks} chunks")
+    else:
+        print("[INFO] Chunk summary interval : disabled")
     print(f"[INFO] Degenerate filter: min_triangle_area={min_triangle_area:.3e}, min_triangle_height={min_triangle_height:.3e}")
     if shard_size_mb > 0:
         print(f"[INFO] Sharding enabled: target {shard_size_mb:.2f} MB per output .pt")
@@ -856,73 +1485,23 @@ def process_and_save(
 
         global_sample_cursor += local_sample_count
 
-    if worker_count <= 1:
-        with tqdm(total=len(task_list), desc="Triangulating tasks", unit="task") as pbar:
-            for file_index, task in enumerate(task_list):
-                result = _triangulate_file_worker(
-                    file_index=file_index,
-                    file_path=str(task["path"]),
-                    layer_name=task.get("layer"),
-                    source_type=str(task.get("source_type", canonical_file_type)),
-                    min_triangle_area=min_triangle_area,
-                    min_triangle_height=min_triangle_height,
-                    enable_log=bool(log),
-                )
-                consume_and_merge(result)
-                pbar.update(1)
-    else:
-        mp_context = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=worker_count, mp_context=mp_context) as executor:
-            future_to_meta = {
-                executor.submit(
-                    _triangulate_file_worker,
-                    file_index,
-                    str(task["path"]),
-                    task.get("layer"),
-                    str(task.get("source_type", canonical_file_type)),
-                    float(min_triangle_area),
-                    float(min_triangle_height),
-                    bool(log),
-                ): (file_index, task)
-                for file_index, task in enumerate(task_list)
-            }
-
-            pending_results: dict[int, dict[str, Any]] = {}
-            next_index = 0
-
-            with tqdm(total=len(task_list), desc="Triangulating tasks", unit="task") as pbar:
-                for future in as_completed(future_to_meta):
-                    file_index, task = future_to_meta[future]
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        result = {
-                            "index": file_index,
-                            "file_path": str(task.get("path")),
-                            "layer_name": task.get("layer"),
-                            "source_type": str(task.get("source_type", canonical_file_type)),
-                            "ok": False,
-                            "error": f"{type(exc).__name__}: {exc}",
-                            "source_geometry_count": 0,
-                            "skipped_count": 0,
-                            "triangles": [],
-                            "total_samples": 0,
-                            "multi_sample_count": 0,
-                            "donut_sample_count": 0,
-                            "triangulated_raw_sample_count": 0,
-                            "normal_sample_count": 0,
-                            "degenerate_sample_count": 0,
-                            "dropped_sample_count": 0,
-                            "degenerate_records": [],
-                        }
-
-                    pending_results[int(result["index"])] = result
-                    pbar.update(1)
-
-                    while next_index in pending_results:
-                        ordered_result = pending_results.pop(next_index)
-                        consume_and_merge(ordered_result)
-                        next_index += 1
+    with tqdm(total=len(task_list), desc="Triangulating tasks", unit="task") as pbar:
+        for task_index, task in enumerate(task_list):
+            result = _triangulate_task_worker(
+                task_index=task_index,
+                task_count=len(task_list),
+                file_path=str(task["path"]),
+                layer_name=task.get("layer"),
+                source_type=str(task.get("source_type", canonical_file_type)),
+                num_workers=int(num_workers),
+                rows_per_chunk=int(rows_per_chunk),
+                progress_every_chunks=int(progress_every_chunks),
+                min_triangle_area=float(min_triangle_area),
+                min_triangle_height=float(min_triangle_height),
+                enable_log=bool(log),
+            )
+            consume_and_merge(result)
+            pbar.update(1)
 
     if triangulated_total == 0:
         print("[WARN] No valid polygons were triangulated. Nothing to save.")
