@@ -304,7 +304,7 @@ def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx
         decoder_num_heads=args.dec_num_heads,
     ).to(device)
 
-    if dist_ctx.enabled:
+    if dist_ctx.enabled and dist_ctx.world_size > 1:
         if device.type == "cuda":
             model = DDP(model, device_ids=[dist_ctx.local_rank])
         else:
@@ -432,7 +432,9 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
     """
     persistent_workers = bool(args.num_workers > 0 and args.load_mode == "lazy")
 
-    if dist_ctx.enabled:
+    use_distributed_sampler = dist_ctx.enabled and dist_ctx.world_size > 1
+
+    if use_distributed_sampler:
         train_sampler = DistributedSampler(train_dataset)
         val_sampler = DistributedSampler(val_dataset, shuffle=False)
 

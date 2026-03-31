@@ -64,6 +64,28 @@ def _build_cli_args_from_config(config_dict: dict) -> list[str]:
     return cli_args
 
 
+def _resolve_project_relative_config_paths(config_dict: dict, project_root: Path) -> dict:
+    """Resolve path-like config entries relative to project root.
+
+    Args:
+        config_dict: Parsed YAML config dictionary.
+        project_root: `mae_pretrain` project root.
+
+    Returns:
+        Config copy with normalized path-like values.
+    """
+    resolved = dict(config_dict)
+    for key in ("data_dir", "data_path", "save_dir", "export_dir"):
+        value = resolved.get(key)
+        if value is None:
+            continue
+
+        path_value = Path(str(value)).expanduser()
+        if not path_value.is_absolute():
+            resolved[key] = str((project_root / path_value).resolve())
+    return resolved
+
+
 def _split_gpu_list(gpu_value: str) -> list[str]:
     """Split comma-separated GPU string into normalized ID list.
 
@@ -100,6 +122,47 @@ def _is_cuda_available() -> bool:
         return bool(torch.cuda.is_available())
     except Exception:
         return False
+
+
+def _get_visible_cuda_device_count() -> int:
+    """Query the number of CUDA devices visible to current process.
+
+    Returns:
+        Visible CUDA device count, or `0` when unavailable.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return 0
+        return int(torch.cuda.device_count())
+    except Exception:
+        return 0
+
+
+def _normalize_requested_gpu_list(gpu_list: list[str], visible_device_count: int) -> list[str]:
+    """Trim requested GPU ids to a subset that fits current machine visibility.
+
+    This keeps current behavior for valid multi-GPU requests while protecting
+    single-GPU hosts from accidentally spawning ranks for non-existent devices.
+
+    Args:
+        gpu_list: Requested GPU id list from config/CLI.
+        visible_device_count: CUDA device count visible to current process.
+
+    Returns:
+        Effective GPU list safe for current runtime.
+    """
+    if not gpu_list:
+        return ["0"]
+
+    if visible_device_count <= 0:
+        return gpu_list
+
+    if len(gpu_list) <= visible_device_count:
+        return gpu_list
+
+    return gpu_list[:visible_device_count]
 
 
 def _terminate_process_group(proc: subprocess.Popen, timeout_sec: float = 8.0) -> int | None:
@@ -223,7 +286,10 @@ def main() -> None:
     pre_parser.add_argument("--no_auto_spawn", action="store_true")
     pre_args, remaining = pre_parser.parse_known_args()
 
-    config = load_yaml_config(pre_args.config)
+    config = _resolve_project_relative_config_paths(
+        load_yaml_config(pre_args.config),
+        project_root=project_root,
+    )
 
     # Apply early GPU override so DDP process-count follows CLI user intent.
     if pre_args.gpu is not None:
@@ -232,8 +298,17 @@ def main() -> None:
         config["viz_every"] = int(pre_args.viz_every)
 
     gpu_from_config = str(config.get("gpu", "0"))
-    gpu_list = _split_gpu_list(gpu_from_config)
+    requested_gpu_list = _split_gpu_list(gpu_from_config)
     cuda_available = _is_cuda_available()
+    visible_device_count = _get_visible_cuda_device_count() if cuda_available else 0
+    gpu_list = _normalize_requested_gpu_list(requested_gpu_list, visible_device_count)
+    if gpu_list != requested_gpu_list:
+        print(
+            "[WARN] Requested GPUs exceed visible CUDA devices; "
+            f"using {gpu_list} instead of {requested_gpu_list}.",
+            file=sys.stderr,
+        )
+        config["gpu"] = _normalize_gpu_csv(gpu_list)
 
     if len(gpu_list) > 1 and "LOCAL_RANK" not in os.environ and not pre_args.no_auto_spawn and cuda_available:
         visible_gpu_csv = _normalize_gpu_csv(gpu_list)
