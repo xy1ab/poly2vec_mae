@@ -330,8 +330,8 @@ class PolyFourierConverter(nn.Module):
 
         ft_real_total = torch.zeros((batch_size, h, w), dtype=torch.float32, device=self.device)
         ft_imag_total = torch.zeros((batch_size, h, w), dtype=torch.float32, device=self.device)
-        batch_triangles = batch_triangles.to(self.device)
-        lengths = lengths.to(self.device)
+        batch_triangles = batch_triangles.to(self.device, non_blocking=True)
+        lengths = lengths.to(self.device, non_blocking=True)
 
         valid_mask = torch.arange(max_triangles, device=self.device).unsqueeze(0) < lengths.unsqueeze(1)
         valid_tris = batch_triangles[valid_mask]
