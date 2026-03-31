@@ -541,6 +541,8 @@ def train_main(args) -> None:
 
     scaler = build_grad_scaler(device=device, precision=args.precision)
     args.viz_every = max(1, int(args.viz_every))
+    max_train_steps = max(0, int(getattr(args, "max_train_steps", 0)))
+    max_val_steps = max(0, int(getattr(args, "max_val_steps", 0)))
 
     if is_main_process(dist_ctx):
         run_dir, run_timestamp = make_timestamped_dir(args.save_dir)
@@ -554,6 +556,12 @@ def train_main(args) -> None:
             f"rank={dist_ctx.rank}, local_rank={dist_ctx.local_rank}, device={device}, "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
         )
+        if max_train_steps > 0 or max_val_steps > 0:
+            print(
+                "[INFO] Debug limits   : "
+                f"max_train_steps={max_train_steps or 'full'}, "
+                f"max_val_steps={max_val_steps or 'full'}"
+            )
         print("[INFO] ========================================================\n")
     else:
         run_dir = Path(args.save_dir)
@@ -638,6 +646,7 @@ def train_main(args) -> None:
 
             model.train()
             train_total, train_mag, train_phase = 0.0, 0.0, 0.0
+            train_steps = 0
             start_time = time.time()
 
             if is_main_process(dist_ctx):
@@ -678,19 +687,24 @@ def train_main(args) -> None:
                 train_total += loss.item()
                 train_mag += loss_mag.item()
                 train_phase += loss_phase.item()
+                train_steps += 1
 
                 if is_main_process(dist_ctx) and step % args.log_interval == 0:
                     print(f"  -> Step [{step}/{len(train_loader)}], Train Loss: {loss.item():.4f}")
 
-            avg_train_loss = torch.tensor(train_total / max(1, len(train_loader)), device=device)
-            avg_train_mag = torch.tensor(train_mag / max(1, len(train_loader)), device=device)
-            avg_train_phase = torch.tensor(train_phase / max(1, len(train_loader)), device=device)
+                if max_train_steps > 0 and train_steps >= max_train_steps:
+                    break
+
+            avg_train_loss = torch.tensor(train_total / max(1, train_steps), device=device)
+            avg_train_mag = torch.tensor(train_mag / max(1, train_steps), device=device)
+            avg_train_phase = torch.tensor(train_phase / max(1, train_steps), device=device)
 
             model.eval()
             val_total, val_mag, val_phase = 0.0, 0.0, 0.0
+            val_steps = 0
 
             with torch.no_grad():
-                for val_batch_tris, val_lengths in val_loader:
+                for val_step, (val_batch_tris, val_lengths) in enumerate(val_loader):
                     mag_v, phase_v = codec.cft_batch(val_batch_tris, val_lengths)
                     imgs_v = torch.cat([mag_v, torch.cos(phase_v), torch.sin(phase_v)], dim=1)
 
@@ -714,10 +728,14 @@ def train_main(args) -> None:
                     val_total += loss_total_v.item()
                     val_mag += loss_mag_v.item()
                     val_phase += loss_phase_v.item()
+                    val_steps += 1
 
-            avg_val_loss = torch.tensor(val_total / max(1, len(val_loader)), device=device)
-            avg_val_mag = torch.tensor(val_mag / max(1, len(val_loader)), device=device)
-            avg_val_phase = torch.tensor(val_phase / max(1, len(val_loader)), device=device)
+                    if max_val_steps > 0 and val_steps >= max_val_steps:
+                        break
+
+            avg_val_loss = torch.tensor(val_total / max(1, val_steps), device=device)
+            avg_val_mag = torch.tensor(val_mag / max(1, val_steps), device=device)
+            avg_val_phase = torch.tensor(val_phase / max(1, val_steps), device=device)
 
             avg_train_loss = all_reduce_mean(avg_train_loss, dist_ctx)
             avg_train_mag = all_reduce_mean(avg_train_mag, dist_ctx)
@@ -878,6 +896,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_every", type=int, default=20)
     parser.add_argument("--viz_every", type=int, default=1)
     parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--max_train_steps", type=int, default=0)
+    parser.add_argument("--max_val_steps", type=int, default=0)
 
     return parser
 
