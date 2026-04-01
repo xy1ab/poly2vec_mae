@@ -1,0 +1,12 @@
+单卡
+# 例：用第2张卡，GPU:1运行
+# /home/xz/miniconda3/envs/适应性修改
+CUDA_VISIBLE_DEVICES=1 nohup /home/xz/miniconda3/envs/tabnet_geo/bin/python /home/xz/myq/NRE2/trainer.py > train.log 2>&1 &
+
+多卡
+# 例：用 4 张显卡跑
+# /home/xz/miniconda3/envs/适应性修改
+nohup /home/xz/miniconda3/envs/tabnet_geo/bin/torchrun --nproc_per_node=4 /home/xz/myq/NRE2/trainer.py > train.log 2>&1 &
+
+
+ 
