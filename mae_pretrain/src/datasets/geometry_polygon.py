@@ -19,6 +19,8 @@ import triangle as tr
 
 from .geometry_codec_base import GeometryCodec
 
+_FOURIER_SINGULAR_EPS = 1e-6
+
 
 def complex_mul(a_real: torch.Tensor, a_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Multiply complex tensors represented by real/imag parts.
@@ -168,6 +170,15 @@ class PolyFourierConverter(nn.Module):
         self.device = torch.device(device)
         self.patch_size = patch_size
 
+        if self.pos_freqs < 1:
+            raise ValueError(f"`pos_freqs` must be >= 1, got {self.pos_freqs}")
+        if self.patch_size < 1:
+            raise ValueError(f"`patch_size` must be >= 1, got {self.patch_size}")
+        if self.w_max < self.w_min:
+            raise ValueError(f"`w_max` must be >= `w_min`, got w_min={self.w_min}, w_max={self.w_max}")
+        if self.freq_type == "geometric" and self.w_min <= 0:
+            raise ValueError(f"`w_min` must be > 0 for geometric frequency grids, got {self.w_min}")
+
         self.U, self.V, self.pad_h, self.pad_w = self._build_meshgrid()
 
     def _build_meshgrid(self):
@@ -248,10 +259,11 @@ class PolyFourierConverter(nn.Module):
         shift_real = torch.cos(theta_shift)
         shift_imag = -torch.sin(theta_shift)
 
-        zero_mask = (u_ == 0) & (v_ == 0)
-        uv_mask = (u_ + v_ == 0) & ~zero_mask
-        u_mask = (u_ == 0) & ~zero_mask
-        v_mask = (v_ == 0) & ~zero_mask
+        eps = _FOURIER_SINGULAR_EPS
+        zero_mask = (u_.abs() <= eps) & (v_.abs() <= eps)
+        uv_mask = ((u_ + v_).abs() <= eps) & ~zero_mask
+        u_mask = (u_.abs() <= eps) & ~(zero_mask | uv_mask)
+        v_mask = (v_.abs() <= eps) & ~(zero_mask | uv_mask | u_mask)
         normal_mask = ~(uv_mask | zero_mask | u_mask | v_mask)
 
         theta_u = 2 * pi * u_
@@ -345,7 +357,7 @@ class PolyFourierConverter(nn.Module):
             ft_real_total.index_add_(0, b_idx_chunk, ft_chunk_real)
             ft_imag_total.index_add_(0, b_idx_chunk, ft_chunk_imag)
 
-        mag = torch.log1p(torch.sqrt(ft_real_total**2 + ft_imag_total**2)).unsqueeze(1)
+        mag = torch.log1p(torch.hypot(ft_real_total, ft_imag_total)).unsqueeze(1)
         phase = torch.atan2(ft_imag_total, ft_real_total).unsqueeze(1)
         return mag, phase
 

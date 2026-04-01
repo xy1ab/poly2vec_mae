@@ -143,7 +143,7 @@ def compute_freq_span_patches(converter, patch_size: int, device: torch.device) 
     freq_span_map = torch.zeros((h, w), device=device)
     freq_span_map[:valid_h, :valid_w] = d_u * d_v
 
-    freq_span_map = torch.sqrt(freq_span_map)
+    freq_span_map = torch.sqrt(freq_span_map.clamp_min(0.0))
     freq_span_map = freq_span_map / (freq_span_map.mean() + 1e-8)
 
     return patchify(freq_span_map.unsqueeze(0).unsqueeze(0), patch_size)
@@ -337,6 +337,28 @@ def _build_scheduler(args, optimizer):
         T_max=args.epochs,
         eta_min=args.min_lr,
     )
+
+
+def _validate_training_args(args) -> None:
+    """Validate numeric hyperparameters before building the training pipeline."""
+    if args.lr <= 0:
+        raise ValueError(f"`lr` must be > 0, got {args.lr}")
+    if args.min_lr < 0:
+        raise ValueError(f"`min_lr` must be >= 0, got {args.min_lr}")
+    if args.batch_size <= 0:
+        raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
+    if args.patch_size <= 0:
+        raise ValueError(f"`patch_size` must be > 0, got {args.patch_size}")
+    if not (0.0 <= args.mask_ratio < 1.0):
+        raise ValueError(f"`mask_ratio` must be in [0, 1), got {args.mask_ratio}")
+    if args.warmup_epochs < 0:
+        raise ValueError(f"`warmup_epochs` must be >= 0, got {args.warmup_epochs}")
+    if args.log_interval <= 0:
+        raise ValueError(f"`log_interval` must be > 0, got {args.log_interval}")
+    if args.freq_type == "geometric" and args.w_min <= 0:
+        raise ValueError(f"`w_min` must be > 0 for geometric freq grids, got {args.w_min}")
+    if args.w_max < args.w_min:
+        raise ValueError(f"`w_max` must be >= `w_min`, got w_min={args.w_min}, w_max={args.w_max}")
 
 
 def _advance_scheduler(scheduler, completed_epochs: int) -> None:
@@ -595,12 +617,107 @@ def count_parameters(model):
     print(f"Encoder 占比: {(encoder_params / total_params) * 100:.2f}%")
 
 
+def _unwrap_model(model):
+    """Return the underlying module for plain or DDP-wrapped models."""
+    return model.module if hasattr(model, "module") else model
+
+
+def _describe_tensor_finiteness(name: str, tensor: torch.Tensor) -> str:
+    """Build a concise finiteness summary for one tensor."""
+    detached = tensor.detach().float()
+    finite_mask = torch.isfinite(detached)
+    total_count = int(detached.numel())
+    finite_count = int(finite_mask.sum().item())
+    nonfinite_count = total_count - finite_count
+    if finite_count > 0:
+        finite_values = detached[finite_mask]
+        min_value = float(finite_values.min().item())
+        max_value = float(finite_values.max().item())
+        mean_value = float(finite_values.mean().item())
+        return (
+            f"{name}: shape={tuple(detached.shape)}, "
+            f"nonfinite={nonfinite_count}/{total_count}, "
+            f"min={min_value:.4e}, max={max_value:.4e}, mean={mean_value:.4e}"
+        )
+    return f"{name}: shape={tuple(detached.shape)}, nonfinite={nonfinite_count}/{total_count}, no finite values"
+
+
+def _raise_nonfinite_training_error(stage: str, epoch: int, step: int, tensors: dict[str, torch.Tensor]) -> None:
+    """Raise a detailed runtime error once non-finite tensors are observed."""
+    summaries = [
+        _describe_tensor_finiteness(name, tensor)
+        for name, tensor in tensors.items()
+    ]
+    raise RuntimeError(
+        f"Non-finite tensor detected during {stage} at epoch={epoch + 1}, step={step}: "
+        + " | ".join(summaries)
+    )
+
+
+def _collect_grad_stats(model) -> dict[str, float | int | str | None]:
+    """Summarize gradient health for the current optimization step."""
+    module = _unwrap_model(model)
+    total_sq = 0.0
+    max_abs = 0.0
+    grad_param_count = 0
+    nonfinite_grad_param_count = 0
+    max_abs_param_name = None
+    first_nonfinite_param_name = None
+
+    for name, param in module.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        grad_param_count += 1
+        grad_float = grad.detach().float()
+        finite_mask = torch.isfinite(grad_float)
+        if not bool(finite_mask.all().item()):
+            nonfinite_grad_param_count += 1
+            if first_nonfinite_param_name is None:
+                first_nonfinite_param_name = name
+        if bool(finite_mask.any().item()):
+            finite_grad = grad_float[finite_mask]
+            total_sq += float(torch.sum(finite_grad * finite_grad).item())
+            candidate_abs = float(finite_grad.abs().max().item())
+            if candidate_abs >= max_abs:
+                max_abs = candidate_abs
+                max_abs_param_name = name
+
+    return {
+        "grad_norm": total_sq ** 0.5,
+        "grad_abs_max": max_abs,
+        "grad_param_count": grad_param_count,
+        "nonfinite_grad_param_count": nonfinite_grad_param_count,
+        "max_abs_param_name": max_abs_param_name,
+        "first_nonfinite_param_name": first_nonfinite_param_name,
+    }
+
+
+def _format_grad_monitor_line(grad_stats: dict[str, float | int | str | None], scaler) -> str:
+    """Format one human-readable gradient monitor suffix for step logs."""
+    grad_norm = float(grad_stats["grad_norm"])
+    grad_abs_max = float(grad_stats["grad_abs_max"])
+    nonfinite_count = int(grad_stats["nonfinite_grad_param_count"])
+    max_abs_param_name = grad_stats.get("max_abs_param_name")
+    pieces = [
+        f"GradNorm: {grad_norm:.4e}",
+        f"GradAbsMax: {grad_abs_max:.4e}",
+        f"NonFiniteGradParams: {nonfinite_count}",
+    ]
+    if max_abs_param_name:
+        pieces.append(f"GradMaxParam: {max_abs_param_name}")
+    if scaler.is_enabled():
+        pieces.append(f"GradScale: {float(scaler.get_scale()):.1f}")
+    return " | ".join(pieces)
+
+
 def train_main(args) -> None:
     """Main training entrypoint."""
     register_numpy_safe_globals()
     args.load_mode = str(args.load_mode).lower()
     args.resume_dir = str(Path(args.resume_dir).expanduser().resolve()) if args.resume_dir else None
     args.eval_every = max(1, int(args.eval_every))
+    _validate_training_args(args)
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 
@@ -792,14 +909,40 @@ def train_main(args) -> None:
                     weight_mag_hf=args.weight_mag_hf,
                 )
                 loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
+                if not bool(torch.isfinite(loss).item()):
+                    _raise_nonfinite_training_error(
+                        stage="train_loss",
+                        epoch=epoch,
+                        step=step,
+                        tensors={
+                            "imgs": imgs,
+                            "pred": pred,
+                            "target_patches": target_patches,
+                            "mask": mask,
+                            "loss_mag": loss_mag,
+                            "loss_phase": loss_phase,
+                            "loss_total": loss,
+                        },
+                    )
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    grad_stats = _collect_grad_stats(model)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
+                    grad_stats = _collect_grad_stats(model)
                     optimizer.step()
+
+                if is_main_process(dist_ctx) and int(grad_stats["nonfinite_grad_param_count"]) > 0:
+                    print(
+                        "[WARN] Non-finite gradients detected | "
+                        f"epoch={epoch + 1}, step={step}, "
+                        f"first_bad_param={grad_stats['first_nonfinite_param_name']}, "
+                        f"{_format_grad_monitor_line(grad_stats, scaler)}"
+                    )
 
                 train_total += loss.item()
                 train_mag += loss_mag.item()
@@ -807,7 +950,10 @@ def train_main(args) -> None:
                 train_steps += 1
 
                 if is_main_process(dist_ctx) and step % args.log_interval == 0:
-                    print(f"  -> Step [{step}/{len(train_loader)}], Train Loss: {loss.item():.4f}")
+                    print(
+                        f"  -> Step [{step}/{len(train_loader)}], Train Loss: {loss.item():.4f} | "
+                        f"{_format_grad_monitor_line(grad_stats, scaler)}"
+                    )
 
                 if max_train_steps > 0 and train_steps >= max_train_steps:
                     break
@@ -855,6 +1001,21 @@ def train_main(args) -> None:
                         )
 
                         loss_total_v = args.weight_mag * loss_mag_v + args.weight_phase * loss_phase_v
+                        if not bool(torch.isfinite(loss_total_v).item()):
+                            _raise_nonfinite_training_error(
+                                stage="val_loss",
+                                epoch=epoch,
+                                step=val_steps,
+                                tensors={
+                                    "imgs_val": imgs_v,
+                                    "pred_val": pred_v,
+                                    "target_patches_val": target_patches_v,
+                                    "mask_val": mask_v,
+                                    "loss_mag_val": loss_mag_v,
+                                    "loss_phase_val": loss_phase_v,
+                                    "loss_total_val": loss_total_v,
+                                },
+                            )
                         val_total += loss_total_v.item()
                         val_mag += loss_mag_v.item()
                         val_phase += loss_phase_v.item()

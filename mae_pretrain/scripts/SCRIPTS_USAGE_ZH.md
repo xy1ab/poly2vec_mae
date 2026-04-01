@@ -102,7 +102,7 @@ python scripts/run_export.py \
 
 - 入口脚本：`scripts/run_build_dataset.py`
   
-- 具体功能：扫描输入目录中的矢量数据，按任务顺序逐个处理（`shp/geojs` 为每文件任务，`gdb` 为每图层任务）；每个任务内部按行分块并行进行 polygon 三角剖分（支持 MultiPolygon 与 donut），并对退化三角形进行过滤（面积过小/近共线）；结果保存为单个 `.pt` 或多个分块 `.pt` 文件。入口脚本已避免通过 `datasets` 包导入链触发额外模块加载；输出文件采用 `torch.save` 序列化（与训练侧 `torch.load` 直接兼容）。
+- 具体功能：扫描输入目录中的矢量数据，按任务顺序逐个处理（`shp/geojs` 为每文件任务，`gdb` 为每图层任务）；每个任务内部按行分块并行进行 polygon 三角剖分（支持 MultiPolygon 与 donut），并对退化三角形进行过滤（面积过小/近共线）；结果保存为单个 `.pt` 或多个分块 `.pt` 文件。入口脚本已避免通过 `datasets` 包导入链触发额外模块加载；输出文件采用 `torch.save` 序列化（与训练侧 `torch.load` 直接兼容）。如果处理过程中反复出现 `BrokenProcessPool` 之类的原生崩溃信号，可先改用下方的 `run_polygon_diagnosis.py` 对问题样本做定位。
   
 - 配置说明：不依赖 YAML，仅使用 CLI 参数；必须传 `--input_dirs`。  
   常用可选参数：`--file_type`（输入类型：`shp/gdb/geojs`，默认 `shp`）、`--layer`（仅 `gdb` 生效，默认 `all`，可指定单层名）、`--output_dir`（输出目录）、`--num_workers`（任务内并行进程数，`<=0` 自动，也兼容 `--num_worker`）、`--rows_per_chunk`（任务内每个分块处理的行数，默认 `2000`）、`--progress_every_chunks`（每合并 N 个分块打印一次摘要，默认 `10`，`<=0` 关闭）、`--shard_size_mb`（分块大小，`<=0` 不分块）、`--min_triangle_area`（最小三角面积阈值，默认 `1e-8`）、`--min_triangle_height`（最小高阈值，默认 `1e-5`）、`--log`（输出三角剖分日志）。  
@@ -144,7 +144,97 @@ python scripts/run_build_dataset.py \
   --log
 ```
 
-### 5 批量编码产物生成
+### 5 图斑原生三角剖分崩溃诊断
+
+- 入口脚本：`scripts/run_polygon_diagnosis.py`
+  
+- 具体功能：默认采用纯静态检查，不直接执行 `triangle.triangulate(...)`，而是复用当前 `build_dataset_triangle.py` 的修复、归一化与 triangle input 构造路径，评估每个 polygon 样本的潜在原生崩溃风险，并输出风险等级与原因标签（如 `invalid_geometry`、`shell_hole_touching`、`repair_changed_topology`、`triangle_vertices_too_many`）。如果确实需要慢速实探，也可以显式指定 `--mode probe`，按单样本隔离子进程执行真实三角剖分。
+  
+- 配置说明：不依赖 YAML；必须传 `--input_dirs`。这里可以传入 1 个或多个目录，每个目录都应包含同名 `.shp/.shx/.dbf` 等 shapefile 组件，并且目录下必须只有一个 `.shp` 文件。常用可选参数有 `--mode`（默认 `static`，仅做静态风险检查；`probe` 为慢速真实探测）、`--output_dir`（输出目录，默认 `./outputs/polygon_diagnosis`）、`--timeout_sec`（单样本探测超时，仅 `probe` 模式生效，默认 `20` 秒）、`--num_workers`（仅 `static` 模式生效的并行 worker 数，`<=0` 自动）、`--rows_per_chunk`（仅 `static` 模式生效的目标分块行数，默认 `2000`；如果分块太大导致单个 `.shp` 无法充分并行，脚本仍会自动再切细以利用多个 worker）、`--row_start` / `--row_end`（只诊断部分行，`row_end` 为开区间）。脚本会为每个输入目录各自输出到 `<output_dir>/<任务名>/`，主要包含 `summary.json`、`risk_samples.jsonl` 以及 1 张三联饼图总览：
+  索引语义：
+
+  `row_idx`：原始 `.shp` 的行号，也就是 `GeoDataFrame` 中的 geometry 序号；一个 `MultiPolygon` 行仍然只算 1 个 row。
+
+  `sample_index`：将 `MultiPolygon` 按 part 展开之后的样本序号；如果某一行拆成多个 polygon part，它们会共享同一个 `row_idx`，但拥有不同的 `sample_index`。
+  
+  `summary.json`：汇总扫描范围、状态计数、图斑类型计数、风险标签计数，以及饼图涉及的数值统计。其中：
+  `node_count_bucket_counts` 按 sample 统计 `max_triangle_vertices` 的 5 档分布；
+  `min_edge_bucket_counts` 按 sample 统计归一化后 `min_normalized_edge_length` 的 5 档分布；
+  `connectivity_bucket_counts` 按原始 polygon 行统计 5 类连通性分布；
+  `risk_row_polygon_type_counts` 按“至少产出 1 条风险样本的原始行”统计。
+  
+  `risk_samples.jsonl`：`static` 模式下所有 `medium/high/critical` 风险样本；`probe` 模式下所有 `probe_status != ok` 的样本。每条记录都会附带 `polygon_type` 字段，类型定义为：
+  
+  `simple`：单 Polygon 且无孔洞。
+  
+  `multi`：MultiPolygon 且所有 part 都无孔洞。
+  
+  `donut`：单 Polygon 且只有一个孔洞。
+  
+  `porous`：单 Polygon 且孔洞数大于 1。
+  
+  `complex`：不属于前 4 类的复杂 polygon 图斑，主要指带孔洞的 MultiPolygon。
+
+  `pie_overview.png`：单个 PNG，总共 3 个饼图横向排列，分别对应节点数分桶、归一化后最小边长分桶、连通性分桶；每个饼图的 legend 独立放在该饼图下方，并同时显示数量与百分比。
+  
+- 调取示例：
+
+```bash
+python scripts/run_polygon_diagnosis.py \
+  --input_dirs /data/raw/testlook \
+  --output_dir ./outputs/polygon_diagnosis \
+  --mode static \
+  --num_workers 8 \
+  --rows_per_chunk 1000
+```
+
+```bash
+python scripts/run_polygon_diagnosis.py \
+  --input_dirs /data/raw/testlook /data/raw/hangzhou \
+  --output_dir ./outputs/polygon_diagnosis \
+  --mode static \
+  --num_workers 16 \
+  --rows_per_chunk 2000
+```
+
+```bash
+python scripts/run_polygon_diagnosis.py \
+  --input_dirs /data/raw/testlook \
+  --output_dir ./outputs/polygon_diagnosis \
+  --mode probe \
+  --row_start 1000 \
+  --row_end 1500 \
+  --timeout_sec 30
+```
+
+### 6 单图斑可视化诊断
+
+- 入口脚本：`scripts/run_viz_polygon.py`
+  
+- 具体功能：从单个 `.shp` 中提取一个指定的原始行或展开后的单样本图斑，输出可视化 PNG，并附带一个 JSON 元数据文件。PNG 会同时展示原始 geometry、展开后的 part、`buffer(0)` 修复结果、`_prepare_polygon_candidates()` 的候选图斑，以及归一化后的 candidate，便于直观看到 holes、超长边界、修复分裂等病态性。
+  
+- 配置说明：必须传 `--input_dir`，并且在 `--row_idx` 与 `--sample_index` 之间二选一。  
+  `--row_idx` 适合看原始 shp 第几行；若该行是 `MultiPolygon`，PNG 中会把多个 part 一起画出来。  
+  `--sample_index` 适合和 `run_polygon_diagnosis.py` 的输出对齐，直接复核某个高风险样本。  
+  可选参数有 `--output_dir`（默认 `./outputs/polygon_viz`）和 `--dpi`。
+  
+- 调取示例：
+
+```bash
+python scripts/run_viz_polygon.py \
+  --input_dir /data/raw/testlook \
+  --sample_index 6485 \
+  --output_dir ./outputs/polygon_viz
+```
+
+```bash
+python scripts/run_viz_polygon.py \
+  --input_dir /data/raw/testlook \
+  --row_idx 6358 \
+  --output_dir ./outputs/polygon_viz
+```
+
+### 7 批量编码产物生成
 
 - 入口脚本：`scripts/run_encode_batch.py`
   
@@ -181,7 +271,7 @@ python scripts/run_encode_batch.py \
   --output_path ./data/emb/encoded_samples.pt
 ```
 
-### 6 运行时库引导
+### 8 运行时库引导
 
 - 入口脚本：`scripts/runtime_bootstrap.py`
   

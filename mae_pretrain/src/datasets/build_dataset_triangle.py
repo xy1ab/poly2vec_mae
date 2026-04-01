@@ -744,6 +744,7 @@ def _init_result_counters() -> dict[str, Any]:
     return {
         "skipped_count": 0,
         "triangles": [],
+        "triangulated_output_count": 0,
         "total_samples": 0,
         "multi_sample_count": 0,
         "donut_sample_count": 0,
@@ -764,6 +765,7 @@ def _merge_result_counters(target: dict[str, Any], partial: dict[str, Any]) -> N
     """
     target["skipped_count"] += int(partial.get("skipped_count", 0))
     target["triangles"].extend(list(partial.get("triangles", [])))
+    target["triangulated_output_count"] += int(partial.get("triangulated_output_count", 0))
     target["total_samples"] += int(partial.get("total_samples", 0))
     target["multi_sample_count"] += int(partial.get("multi_sample_count", 0))
     target["donut_sample_count"] += int(partial.get("donut_sample_count", 0))
@@ -904,6 +906,7 @@ def _triangulate_row_geometry(
 
         if tris_kept.shape[0] > 0:
             row_out["triangles"].append(tris_kept.astype(np.float32))
+            row_out["triangulated_output_count"] += 1
             if filtered_total == 0:
                 row_out["normal_sample_count"] += 1
         else:
@@ -986,6 +989,7 @@ def _triangulate_task_worker(
     min_triangle_area: float,
     min_triangle_height: float,
     enable_log: bool,
+    writer: "_ShardWriter | None" = None,
 ) -> dict[str, Any]:
     """Triangulate one input task with task-serial and chunk-internal parallelism.
 
@@ -1001,6 +1005,9 @@ def _triangulate_task_worker(
         min_triangle_area: Minimum area threshold in normalized space.
         min_triangle_height: Minimum altitude threshold in normalized space.
         enable_log: Whether to collect detailed degenerate-sample records.
+        writer: Optional shard writer. When provided, chunk triangles are
+            streamed into the writer during ordered merge instead of being kept
+            in task-level memory until the whole source file finishes.
 
     Returns:
         Task-level triangulation result payload (same schema as legacy file worker).
@@ -1041,6 +1048,7 @@ def _triangulate_task_worker(
 
     task_out = _init_result_counters()
     task_error_count = 0
+    task_output_sample_count = 0
 
     if not chunks:
         return {
@@ -1079,6 +1087,12 @@ def _triangulate_task_worker(
                     task_out["total_samples"] += int(chunk_result.get("row_sample_count", 0))
                     task_out["dropped_sample_count"] += int(chunk_result.get("row_sample_count", 0))
                 else:
+                    chunk_triangles = list(chunk_result.get("triangles", []))
+                    if writer is not None and chunk_triangles:
+                        writer.add_many(chunk_triangles)
+                        chunk_result = dict(chunk_result)
+                        chunk_result["triangles"] = []
+                    task_output_sample_count += int(len(chunk_triangles))
                     _merge_result_counters(task_out, chunk_result)
 
                 merged_chunks += 1
@@ -1086,7 +1100,7 @@ def _triangulate_task_worker(
                     tqdm.write(
                         "[INFO]   Chunk merge progress: "
                         f"{merged_chunks}/{len(chunks)}, "
-                        f"triangulated_outputs={len(task_out['triangles'])}, "
+                        f"triangulated_outputs={task_output_sample_count}, "
                         f"dropped={task_out['dropped_sample_count']}, "
                         f"degenerate={task_out['degenerate_sample_count']}"
                     )
@@ -1140,6 +1154,12 @@ def _triangulate_task_worker(
                             task_out["total_samples"] += int(ordered_chunk.get("row_sample_count", 0))
                             task_out["dropped_sample_count"] += int(ordered_chunk.get("row_sample_count", 0))
                         else:
+                            chunk_triangles = list(ordered_chunk.get("triangles", []))
+                            if writer is not None and chunk_triangles:
+                                writer.add_many(chunk_triangles)
+                                ordered_chunk = dict(ordered_chunk)
+                                ordered_chunk["triangles"] = []
+                            task_output_sample_count += int(len(chunk_triangles))
                             _merge_result_counters(task_out, ordered_chunk)
 
                         merged_chunks += 1
@@ -1147,7 +1167,7 @@ def _triangulate_task_worker(
                             tqdm.write(
                                 "[INFO]   Chunk merge progress: "
                                 f"{merged_chunks}/{len(chunks)}, "
-                                f"triangulated_outputs={len(task_out['triangles'])}, "
+                                f"triangulated_outputs={task_output_sample_count}, "
                                 f"dropped={task_out['dropped_sample_count']}, "
                                 f"degenerate={task_out['degenerate_sample_count']}"
                             )
@@ -1336,7 +1356,7 @@ def _consume_worker_result(result: dict[str, Any], writer: _ShardWriter) -> dict
         "ok": ok,
         "source_geometry_count": int(result.get("source_geometry_count", 0)),
         "skipped_count": int(result.get("skipped_count", 0)),
-        "triangulated_count": 0,
+        "triangulated_count": int(result.get("triangulated_output_count", len(result.get("triangles", [])))),
         "total_samples": int(result.get("total_samples", 0)),
         "multi_sample_count": int(result.get("multi_sample_count", 0)),
         "donut_sample_count": int(result.get("donut_sample_count", 0)),
@@ -1358,7 +1378,6 @@ def _consume_worker_result(result: dict[str, Any], writer: _ShardWriter) -> dict
         return stats
 
     triangles = result.get("triangles", [])
-    stats["triangulated_count"] = int(len(triangles))
     writer.add_many(triangles)
     return stats
 
@@ -1425,7 +1444,7 @@ def process_and_save(
     if shard_size_mb > 0:
         print(f"[INFO] Sharding enabled: target {shard_size_mb:.2f} MB per output .pt")
     else:
-        print("[INFO] Sharding disabled: single output .pt")
+        print("[WARN] Sharding disabled: single output .pt keeps all triangulated samples buffered until finalize().")
 
     writer = _ShardWriter(output_path=output_path, shard_size_mb=shard_size_mb)
 
@@ -1499,6 +1518,7 @@ def process_and_save(
                 min_triangle_area=float(min_triangle_area),
                 min_triangle_height=float(min_triangle_height),
                 enable_log=bool(log),
+                writer=writer,
             )
             consume_and_merge(result)
             pbar.update(1)

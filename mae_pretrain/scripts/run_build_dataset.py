@@ -105,7 +105,7 @@ def main() -> None:
         "--shard_size_mb",
         type=float,
         default=0.0,
-        help="Target shard size in MB. <=0 means single .pt output.",
+        help="Target shard size in MB. >0 enables incremental shard flush; <=0 means single .pt output buffered until finalize.",
     )
     parser.add_argument(
         "--min_triangle_area",
