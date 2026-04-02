@@ -39,7 +39,10 @@ except Exception:  # pragma: no cover - compatibility fallback
     _shapely_make_valid = None
 
 
-_NORMALIZATION_EPS = 1e-6
+# Keep this threshold tiny because source coordinates may be geodetic and very
+# small polygons can differ only in deep decimal places. We therefore keep
+# float64 through de-centering/normalization and reject only near-zero extents.
+_NORMALIZATION_EPS = 1e-12
 _TRIANGLE_SUBPROC_TIMEOUT_SEC = 20.0
 
 
@@ -173,7 +176,7 @@ def _clean_ring_coords(coords: np.ndarray, eps: float = 1e-12) -> np.ndarray | N
         eps: Duplicate-point tolerance.
 
     Returns:
-        Cleaned ring coordinates shaped `[M,2]`, or None if invalid.
+        Cleaned ring coordinates shaped `[M,2]` in float64, or None if invalid.
     """
     arr = np.asarray(coords, dtype=np.float64)
     if arr.ndim != 2 or arr.shape[1] < 2:
@@ -197,7 +200,7 @@ def _clean_ring_coords(coords: np.ndarray, eps: float = 1e-12) -> np.ndarray | N
     if arr.shape[0] < 3:
         return None
 
-    return arr.astype(np.float32)
+    return arr
 
 
 def _normalize_polygon_to_unit_box(poly: Polygon, eps: float = _NORMALIZATION_EPS) -> Polygon | None:
@@ -221,6 +224,7 @@ def _normalize_polygon_to_unit_box(poly: Polygon, eps: float = _NORMALIZATION_EP
     if half_side < eps:
         return None
 
+    center = np.array([cx, cy], dtype=np.float64)
     ext = _clean_ring_coords(np.asarray(poly.exterior.coords))
     if ext is None:
         return None
@@ -230,11 +234,11 @@ def _normalize_polygon_to_unit_box(poly: Polygon, eps: float = _NORMALIZATION_EP
         hole = _clean_ring_coords(np.asarray(interior.coords))
         if hole is None:
             continue
-        hole_norm = (hole - np.array([cx, cy], dtype=np.float32)) / float(half_side)
+        hole_norm = (hole - center) / float(half_side)
         if hole_norm.shape[0] >= 3:
-            holes_norm.append(hole_norm.astype(np.float32))
+            holes_norm.append(hole_norm.astype(np.float64, copy=False))
 
-    ext_norm = (ext - np.array([cx, cy], dtype=np.float32)) / float(half_side)
+    ext_norm = (ext - center) / float(half_side)
 
     try:
         poly_norm = Polygon(ext_norm, holes_norm)

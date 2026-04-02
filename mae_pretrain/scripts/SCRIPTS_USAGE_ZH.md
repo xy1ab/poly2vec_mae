@@ -207,30 +207,25 @@ python scripts/run_polygon_diagnosis.py \
   --timeout_sec 30
 ```
 
-### 6 单图斑可视化诊断
+### 6 单图斑与三角剖分可视化诊断
 
-- 入口脚本：`scripts/run_viz_polygon.py`
+- 入口脚本：`scripts/run_viz_polygon_triangulation.py`
   
-- 具体功能：从单个 `.shp` 中提取一个指定的原始行或展开后的单样本图斑，输出可视化 PNG，并附带一个 JSON 元数据文件。PNG 会同时展示原始 geometry、展开后的 part、`buffer(0)` 修复结果、`_prepare_polygon_candidates()` 的候选图斑，以及归一化后的 candidate，便于直观看到 holes、超长边界、修复分裂等病态性。
+- 具体功能：从单个 `.shp` 中提取指定原始行里的一个 polygon part，输出可视化 PNG，并附带一个 JSON 元数据文件。PNG 会同时展示原始 geometry、选中的 part、`buffer(0)` 修复结果、`_prepare_polygon_candidates()` 的候选图斑、归一化后的 candidate，以及“原始三角剖分结果 / 退化过滤后的三角剖分结果”两张图，便于直观看到 holes、超长边界、修复分裂、剖分失败与退化过滤。
   
-- 配置说明：必须传 `--input_dir`，并且在 `--row_idx` 与 `--sample_index` 之间二选一。  
-  `--row_idx` 适合看原始 shp 第几行；若该行是 `MultiPolygon`，PNG 中会把多个 part 一起画出来。  
-  `--sample_index` 适合和 `run_polygon_diagnosis.py` 的输出对齐，直接复核某个高风险样本。  
+- 配置说明：必须传 `--input_dir` 和 `--row_index`。  
+  `--part_index` 表示该行中的第几个 part，按 1 开始计数，默认是 `1`；如果超过 part 总数，脚本会自动取最后一个 part。  
+  `--timeout` 表示三角剖分阶段的超时时间（秒）；超过该时间会被判定为剖分失败并写入 PNG/JSON。  
   可选参数有 `--output_dir`（默认 `./outputs/polygon_viz`）和 `--dpi`。
   
 - 调取示例：
 
 ```bash
-python scripts/run_viz_polygon.py \
+python scripts/run_viz_polygon_triangulation.py \
   --input_dir /data/raw/testlook \
-  --sample_index 6485 \
-  --output_dir ./outputs/polygon_viz
-```
-
-```bash
-python scripts/run_viz_polygon.py \
-  --input_dir /data/raw/testlook \
-  --row_idx 6358 \
+  --row_index 6358 \
+  --part_index 2 \
+  --timeout 20 \
   --output_dir ./outputs/polygon_viz
 ```
 
