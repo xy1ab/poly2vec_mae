@@ -871,18 +871,12 @@ def train_main(args) -> None:
     freq_span_patches = compute_freq_span_patches(converter, args.patch_size, device=device)
     
     model = _build_model(args, img_size=img_size, device=device, dist_ctx=dist_ctx)
-<<<<<<< HEAD
-    if is_main_process(dist_ctx):
-        count_parameters(model)
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-=======
     model_to_save = model.module if isinstance(model, DDP) else model
 
     if resume_state is not None:
         model_to_save.load_state_dict(resume_state["model_state"], strict=True)
 
     count_parameters(model)
->>>>>>> large
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if resume_state is not None:
