@@ -13,3 +13,7 @@ tensorboard==2.16.2
 h5py==3.11.0             
 matplotlib==3.8.4
 seaborn==0.13.2
+timm==1.0.26
+scikit-image==0.24.0
+segmentation_models_pytorch==0.5.0
+triangle==20250106
