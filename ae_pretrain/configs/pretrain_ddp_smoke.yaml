@@ -1,0 +1,61 @@
+# DDP smoke 配置：用于单机多卡功能验证，不用于正式训练。
+# 目标：快速验证 DDP 进程拉起、训练循环、best/ckpt 输出与续训断点正常。
+
+train_type: ae
+geom_type: polygon
+
+data_path: ./data/processed/polygon_triangles_smoke.pt
+save_dir: ./outputs/ckpt
+
+# 仅用 2 卡进行 DDP 验证，减少对线上资源影响。
+gpu: "0,1"
+num_workers: 0
+
+seed: 42
+split_seed: 42
+deterministic: false
+
+weight_mag: 1.0
+weight_mag_hf: 1.0
+weight_phase: 1.0
+
+val_ratio: 0.5
+warmup_epochs: 0
+min_lr: 1.0e-6
+
+pos_freqs: 31
+w_min: 0.1
+w_max: 200.0
+freq_type: geometric
+
+# 缩小模型规模以降低显存占用（仅 smoke）
+patch_size: 2
+stem_channels: "32,64"
+stem_strides: "2,2"
+embed_dim: 128
+depth: 4
+num_heads: 4
+mlp_ratio: 4.0
+drop_rate: 0.0
+drop_path_rate: 0.0
+decoder_stage_channels: "128,96"
+decoder_attention_type: window
+decoder_attention_heads: "4,4"
+decoder_attention_depths: "1,0"
+decoder_conv_depths: "2,2"
+decoder_window_size: 4
+decoder_upsample_mode: bilinear
+decoder_mlp_ratio: 4.0
+decoder_drop_rate: 0.0
+
+epochs: 1
+batch_size: 1
+lr: 1.0e-3
+weight_decay: 0.05
+augment_times: 1
+
+precision: bf16
+checkpoint_dtype: bf16
+
+eval_every: 1
+log_interval: 1

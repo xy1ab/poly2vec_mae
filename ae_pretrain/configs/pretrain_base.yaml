@@ -1,11 +1,11 @@
-# MAE 预训练默认配置（polygon 版本）。
+# AE 预训练默认配置（polygon 版本）。
 # 该文件中的字段会直接映射到 `src/engine/trainer.py` 参数。
 
 # =========================
 # 任务与几何类型
 # =========================
 # 训练类型标识，仅用于运行目录命名和日志区分。
-train_type: mae
+train_type: ae
 # 几何类型。当前实现为 polygon，后续可扩展 point/line。
 geom_type: polygon
 
@@ -74,23 +74,44 @@ cft_triangle_chunk_size: 256
 icft_spatial_chunk_size: 256
 
 # =========================
-# 模型结构（ViT-MAE）
+# 模型结构（Conv + ViT Encoder, Multi-stage Decoder）
 # =========================
-# patch 边长，需与频域网格尺寸匹配。
-patch_size: 16
-# 编码器 token 维度。
-embed_dim: 256
-# 编码器层数。
-depth: 8
-# 编码器注意力头数。
-num_heads: 4
+patch_size: 32
+# 卷积 stem 通道配置；长度同时决定 encoder 下采样阶段数。
+stem_channels: "64,128,256"
+# 卷积 stem 每阶段 stride；总乘积会隐式决定 latent stride。
+stem_strides: "2,2,2"
+# 编码器 latent token 维度。
+embed_dim: 32
+# 编码器 ViT neck 层数。
+depth: 12
+# 编码器 ViT neck 注意力头数。
+num_heads: 1
+# 编码器 ViT neck MLP expansion ratio。
+mlp_ratio: 4.0
+# 编码器 token dropout。
+drop_rate: 0.0
+# 编码器 stochastic depth 概率。
+drop_path_rate: 0.0
 
-# 解码器 token 维度。
-dec_embed_dim: 512
-# 解码器层数。
-dec_depth: 16
-# 解码器注意力头数。
-dec_num_heads: 8
+# 解码器每个 stage 的通道数，长度需与 stem 阶段数一致。
+decoder_stage_channels: "256,192,128"
+# 解码器注意力类型：none / window / global。
+decoder_attention_type: window
+# 每个 stage 的注意力头数。
+decoder_attention_heads: "8,4,4"
+# 每个 stage 的 attention block 数；设为 0 可退化为 conv-only。
+decoder_attention_depths: "1,1,0"
+# 每个 stage 的 conv refine block 数。
+decoder_conv_depths: "2,2,2"
+# window attention 的窗口大小。
+decoder_window_size: 8
+# 解码器上采样模式。
+decoder_upsample_mode: bilinear
+# 解码器 attention block 的 MLP expansion ratio。
+decoder_mlp_ratio: 4.0
+# 解码器 dropout。
+decoder_drop_rate: 0.0
 
 # =========================
 # 训练超参数
@@ -98,17 +119,13 @@ dec_num_heads: 8
 # 总训练轮数。
 epochs: 200
 # batch size（按单进程计算，DDP 下为每进程 batch）。
-batch_size: 256
+batch_size: 2048
 # 初始学习率。
-lr: 1.5e-4
+lr: 12e-4
 # AdamW 权重衰减。
 weight_decay: 0.05
-# MAE mask 比例。
-mask_ratio: 0.1
-# 损失模式：`full` 为全图重构损失，`mask` 为原 MAE 的 masked-only 损失。
-loss_mode: full
 # 数据增强重复次数（仅训练集）。
-augment_times: 1
+augment_times: 10
 
 # =========================
 # 精度策略

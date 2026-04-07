@@ -1,0 +1,16 @@
+# Encoder 导出默认配置。
+# 对应 `scripts/run_export.py` 参数。
+
+# 示例：
+# ae_ckpt_path: ./outputs/ckpt/20260407_1200/best/ae_best.pth
+# config_path: ./outputs/ckpt/20260407_1200/best/poly_ae_config.json
+# output_path: ./outputs/ckpt/20260325_0830/poly_encoder_exported.pth
+
+# AE 训练检查点路径（必填，可通过 CLI 覆盖）。
+ae_ckpt_path: ""
+# 模型结构配置路径（通常是训练目录中的 `poly_ae_config.json` 或 `config.yaml`）。
+config_path: ""
+# 导出的 encoder-only 权重输出路径。
+output_path: ""
+# 导出时加载与保存精度：支持 fp32 / bf16 / fp16。
+precision: bf16
