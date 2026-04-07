@@ -2,7 +2,9 @@
 # CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_unet.py
 
 import os
+import sys
 import time
+from pathlib import Path
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
@@ -17,7 +19,17 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from loaders.loader import V2Dataset
+if __package__ in {None, ""}:
+    _CURRENT_DIR = Path(__file__).resolve().parent
+    _REPO_ROOT = _CURRENT_DIR.parent
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+
+    import importlib
+
+    V2Dataset = importlib.import_module("downstream_unet.loaders.loader").V2Dataset
+else:
+    from .loaders.loader import V2Dataset
 
 # ==========================================
 # 📐 评价指标与自定义 Loss 函数

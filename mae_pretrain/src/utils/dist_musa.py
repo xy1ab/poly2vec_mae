@@ -81,6 +81,22 @@ def cleanup_distributed(ctx: DistContext) -> None:
         dist.destroy_process_group()
 
 
+def distributed_barrier(ctx: DistContext) -> None:
+    """Synchronize distributed ranks with an explicit runtime device when needed.
+
+    Args:
+        ctx: Distributed runtime context.
+    """
+    if not ctx.enabled or not dist.is_initialized():
+        return
+
+    if ctx.device.type == "musa":
+        dist.barrier(device_ids=[int(ctx.local_rank)])
+        return
+
+    dist.barrier()
+
+
 def all_reduce_mean(value: torch.Tensor, ctx: DistContext) -> torch.Tensor:
     """All-reduce a scalar tensor and return world-size mean.
 

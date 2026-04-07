@@ -22,8 +22,8 @@ import torch
 from torch.utils.data import Dataset
 
 from .pt_manifest import PtShardManifest
+from .shard_io import load_triangle_shard
 from .transforms import augment_triangles
-from ..utils.safe_load import register_numpy_safe_globals
 
 
 def _ensure_numpy_float32(sample) -> np.ndarray:
@@ -51,13 +51,9 @@ def load_all_samples_from_manifest(manifest: PtShardManifest) -> list[np.ndarray
     Returns:
         Concatenated sample list in manifest-global order.
     """
-    register_numpy_safe_globals()
-
     all_samples: list[np.ndarray] = []
     for shard_info in manifest.shards:
-        shard_data = torch.load(shard_info.path, map_location="cpu", weights_only=False)
-        if not isinstance(shard_data, list):
-            raise TypeError(f"Shard file must store a Python list: {shard_info.path}")
+        shard_data = load_triangle_shard(shard_info.path)
         all_samples.extend(_ensure_numpy_float32(sample) for sample in shard_data)
     return all_samples
 
@@ -77,9 +73,32 @@ class _BaseIndexedPolyDataset(Dataset):
         if not self.sample_indices:
             raise ValueError("Dataset split must contain at least one sample.")
 
-        self.augment_times = int(max(1, augment_times))
+        self.augment_times = self._validate_augment_times(augment_times)
         self.base_len = len(self.sample_indices)
         self.total_len = self.base_len * self.augment_times
+
+    @staticmethod
+    def _validate_augment_times(augment_times: int) -> int:
+        """Validate dataset virtual-repeat factor.
+
+        Args:
+            augment_times: Requested repeat count.
+
+        Returns:
+            Validated integer repeat count.
+        """
+        try:
+            augment_float = float(augment_times)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"`augment_times` must be an integer >= 1, got {augment_times!r}") from exc
+
+        if not augment_float.is_integer():
+            raise ValueError(f"`augment_times` must be an integer >= 1, got {augment_times!r}")
+
+        augment_value = int(augment_float)
+        if augment_value < 1:
+            raise ValueError(f"`augment_times` must be >= 1, got {augment_value}")
+        return augment_value
 
     def __len__(self) -> int:
         """Return virtual dataset length after augmentation expansion."""
@@ -191,12 +210,8 @@ class LazyShardedPolyDataset(_BaseIndexedPolyDataset):
             self._shard_cache.move_to_end(shard_id)
             return cached
 
-        register_numpy_safe_globals()
         shard_info = self.manifest.shards[shard_id]
-        shard_data = torch.load(shard_info.path, map_location="cpu", weights_only=False)
-        if not isinstance(shard_data, list):
-            raise TypeError(f"Shard file must store a Python list: {shard_info.path}")
-
+        shard_data = load_triangle_shard(shard_info.path)
         normalized_shard = [_ensure_numpy_float32(sample) for sample in shard_data]
         self._shard_cache[shard_id] = normalized_shard
         self._shard_cache.move_to_end(shard_id)

@@ -1,7 +1,8 @@
-"""Evaluation engine for polygon CFT/ICFT visualization.
+"""Legacy evaluation engine for polygon CFT/ICFT visualization.
 
-This module provides an evaluation CLI that visualizes original raster, CFT
-channels, ICFT reconstruction, and absolute difference for sanity checking.
+This module is kept only for backward compatibility with the old single-file
+triangle-shard workflow. New MAE reconstruction visualization should prefer
+`scripts/run_eval.py`.
 """
 
 from __future__ import annotations
@@ -15,9 +16,8 @@ import torch
 from matplotlib.path import Path as MplPath
 
 from ..datasets.registry import get_geometry_codec
-from ..utils.config import load_yaml_config
+from ..datasets.shard_io import load_triangle_shard
 from ..utils.filesystem import ensure_dir
-from ..utils.safe_load import register_numpy_safe_globals
 
 
 def rasterize_triangles(tris: np.ndarray, spatial_size: int = 256) -> np.ndarray:
@@ -44,12 +44,18 @@ def rasterize_triangles(tris: np.ndarray, spatial_size: int = 256) -> np.ndarray
 
 
 def eval_main(args) -> None:
-    """Run CFT/ICFT visualization evaluation.
+    """Run the legacy single-file CFT/ICFT visualization evaluation.
 
     Args:
         args: Parsed evaluator args.
     """
-    register_numpy_safe_globals()
+    print("[WARN] `src.engine.evaluator` is legacy. Prefer `scripts/run_eval.py` for MAE reconstruction visualization.")
+
+    all_polys = load_triangle_shard(args.data_path)
+    if args.index < 0:
+        raise IndexError(f"Index {args.index} out of range. Total samples: {len(all_polys)}")
+    if args.index >= len(all_polys):
+        raise IndexError(f"Index {args.index} out of range. Total samples: {len(all_polys)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = {
@@ -61,10 +67,6 @@ def eval_main(args) -> None:
         "patch_size": args.patch_size,
     }
     codec = get_geometry_codec("polygon", config, device=str(device))
-
-    all_polys = torch.load(args.data_path, weights_only=False)
-    if args.index >= len(all_polys):
-        raise IndexError(f"Index {args.index} out of range. Total samples: {len(all_polys)}")
 
     tris = all_polys[args.index]
     orig_raster = rasterize_triangles(tris, spatial_size=args.spatial_size)
@@ -127,12 +129,12 @@ def eval_main(args) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build evaluator CLI argument parser.
+    """Build the legacy evaluator CLI argument parser.
 
     Returns:
         Configured argument parser.
     """
-    parser = argparse.ArgumentParser(description="CFT and ICFT visualization evaluator")
+    parser = argparse.ArgumentParser(description="Legacy CFT and ICFT visualization evaluator")
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--data_path", type=str, default="./data/processed/polygon_triangles_normalized.pt")
     parser.add_argument("--save_dir", type=str, default="./outputs/ckpt/eval")

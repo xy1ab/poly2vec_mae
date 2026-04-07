@@ -14,7 +14,7 @@ cd /home/xiaoyang/workspace/poly2vec_mae/mae_pretrain
   
 - 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`；训练输出统一写入 `<save_dir>/<run_timestamp>/best` 与 `ckpt`；支持用 `--resume_dir` 从既有 run 目录续训。
   
-- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--eval_every` 控制评测频率；只有评测 epoch 才会输出 val loss、PNG、并更新 `best/` 与 `ckpt/`。
+- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--eval_every` 控制评测频率；只有评测 epoch 才会输出 val loss、PNG、并更新 `best/` 与 `ckpt/`。当前关键参数会严格校验：`--mask_ratio` 必须在 `[0,1)`，`--val_ratio` 必须在 `(0,1)`，`--augment_times` 必须 `>= 1`；不再对非法值做静默钳制。
   
 - 调取示例：
   
@@ -54,7 +54,7 @@ python scripts/run_pretrain.py \
   
 - 具体功能：加载 `exports` 下的 `encoder_decoder.pth`（enc+dec），对样本做“CFT -> 掩码编码解码 -> 频域重建 -> ICFT可视化”，并输出训练同款布局 PNG。
   
-- 配置说明：默认读取 `configs/eval_default.yaml`；关键参数包括 `model_dir`、`mask_ratio`、`precision`、`save_dir`；默认输出目录 `./outputs/viz`；命令行同名参数覆盖 YAML。
+- 配置说明：不再依赖 YAML。脚本会直接从 `--model_dir` 中自动寻找模型配置和名称中包含 `mae` 或 `encoder_decoder` 的 `.pth` 文件；从 `--data_dir` 中寻找三角剖分 shard。样本定位使用 `--row_index`，语义是“跨 shard 的全局样本序号”。数据目录中若存在且仅存在一个合法 `.manifest.json`，则优先按 manifest 中声明的 shard 顺序取样；若 manifest 缺失、非法或存在多个，则会打印 warning 并退回到当前目录下按文件名排序的 `*.pt`。当前只支持 `torch.save` 生成的 `.pt` shard；旧 pickle shard 不再兼容。`--mask_ratio` 必须在 `[0,1)`。
   
 - 调取示例：
   
@@ -62,11 +62,11 @@ python scripts/run_pretrain.py \
 ```bash
 python scripts/run_eval.py \
 
-  --config configs/eval_default.yaml \
-
   --model_dir ./outputs/exports/mae_20260325_1724 \
 
-  --index 0 \
+  --data_dir ./data/processed/hangzhou \
+
+  --row_index 0 \
 
   --mask_ratio 0.75 \
 
@@ -102,12 +102,22 @@ python scripts/run_export.py \
 
 - 入口脚本：`scripts/run_build_dataset.py`
   
-- 具体功能：扫描输入目录中的矢量数据，按任务顺序逐个处理（`shp/geojs` 为每文件任务，`gdb` 为每图层任务）；每个任务内部按行分块并行进行 polygon 三角剖分（支持 MultiPolygon 与 donut），并对退化三角形进行过滤（面积过小/近共线）；结果保存为单个 `.pt` 或多个分块 `.pt` 文件。入口脚本已避免通过 `datasets` 包导入链触发额外模块加载；输出文件采用 `torch.save` 序列化（与训练侧 `torch.load` 直接兼容）。如果处理过程中反复出现 `BrokenProcessPool` 之类的原生崩溃信号，可先改用下方的 `run_polygon_diagnosis.py` 对问题样本做定位。
+- 具体功能：扫描输入目录中的矢量数据，按任务顺序逐个处理（`shp/geojs` 为每文件任务，`gdb` 为每图层任务）；每个任务内部按行分块并行执行新的 row 级三角剖分流程。当前语义下，`1 个 shp-row` 严格对应 `1 个输出样本`：如果这一行是 `MultiPolygon`，会先整体去中心化并按整行 bbox 保长宽比归一化，再对各个 part 做严格过滤与逐 part 三角剖分，最后将所有保留 part 的三角形合并为同一条训练样本；不会再把一个 `MultiPolygon` 拆成多条训练样本。处理流程为：`读入 -> 整体去中心化+归一化 -> part 过滤 -> 判断是否进入隔离子进程 -> 逐 part 三角剖分后合并 -> 退化过滤 -> 增量写 shard`。入口脚本已避免通过 `datasets` 包导入链触发额外模块加载；输出文件采用 `torch.save` 序列化（与训练侧 `torch.load` 直接兼容）。如果处理过程中需要定位被过滤或被 dropped 的 row，可配合下方的 `run_polygon_diagnosis.py` 与 `run_viz_polygon_triangulation.py`。
   
 - 配置说明：不依赖 YAML，仅使用 CLI 参数；必须传 `--input_dirs`。  
-  常用可选参数：`--file_type`（输入类型：`shp/gdb/geojs`，默认 `shp`）、`--layer`（仅 `gdb` 生效，默认 `all`，可指定单层名）、`--output_dir`（输出目录）、`--num_workers`（任务内并行进程数，`<=0` 自动，也兼容 `--num_worker`）、`--rows_per_chunk`（任务内每个分块处理的行数，默认 `2000`）、`--progress_every_chunks`（每合并 N 个分块打印一次摘要，默认 `10`，`<=0` 关闭）、`--shard_size_mb`（分块大小，`<=0` 不分块）、`--min_triangle_area`（最小三角面积阈值，默认 `1e-8`）、`--min_triangle_height`（最小高阈值，默认 `1e-5`）、`--log`（输出三角剖分日志）。  
-  当 `file_type=shp` 时，分块命名为 `<shpfilename>_tri_part_<xxxx>.pt`（例如 `hangzhou_tri_part_0001.pt`）。  
-  当使用 `--log` 时，日志默认保存到同一目录，命名为 `<shpfilename>_tri.triangulation_log.json`。
+  常用可选参数：`--file_type`（输入类型：`shp/gdb/geojs`，默认 `shp`）、`--layer`（仅 `gdb` 生效，默认 `all`，可指定单层名）、`--output_dir`（输出目录）、`--num_workers`（任务内并行进程数，`<=0` 自动，也兼容 `--num_worker`）、`--rows_per_chunk`（任务内每个分块处理的行数，默认 `2000`）、`--progress_every_chunks`（每合并 N 个分块打印一次摘要，默认 `10`，`<=0` 关闭）、`--shard_size_mb`（分块大小，`>0` 时达到阈值就立即 flush 一个 `_part_xxxx.pt`，避免把全部结果长期堆在内存里）、`--norm_max`（归一化后的最大绝对坐标值，默认 `1.0`，即区间 `[-1,1]`；若设为 `0.8`，则区间为 `[-0.8,0.8]`）、`--min_triangle_area`（最小三角面积阈值，默认 `1e-8`）、`--min_triangle_height`（最小高阈值，默认 `1e-5`）、`--safe_mode`（`all | risky | off`，控制是否将整行处理链放入隔离子进程）、`--part_safe / --node_safe / --hole_safe / --edge_safe / --timeout_safe`（`safe_mode=risky` 时触发隔离的阈值与超时控制）、`--log`（输出 row 级三角剖分日志）。  
+  当前 row 级严格过滤标准为：某个 part 只要 `part.is_valid == False` 或存在 `shell-hole-touching`，就会被直接过滤；不会再尝试 `buffer(0)`、`make_valid`、`split/shrink touching holes` 等修补。若某一行过滤后没有任何可用 part，或某个保留 part 三角剖分失败/超时/退化过滤后为空，则整行记为 `dropped`。  
+  当 `file_type=shp` 时，分块命名为 `<shpfilename>_tri_part_<xxxx>.pt`（例如 `hangzhou_tri_part_0001.pt`）。当 `--shard_size_mb > 0` 时，会在同目录额外写出 `<shpfilename>_tri.manifest.json`，供训练和评估脚本优先按声明顺序读取 shard。
+  当使用 `--log` 时，日志默认保存到同一目录，命名为 `<shpfilename>_tri.triangulation_log.json`。若存在 row 级异常或 chunk 级失败，还会额外写出 `<shpfilename>_tri.row_failures.json`，用于定位失败行。
+  运行摘要中的 `triangulated / dropped / degenerated` 现在都按 `row` 统计：`triangulated + dropped = 总行数`，而 `degenerated` 是 `triangulated` 的子集，表示该行在处理过程中发生过 part 过滤或三角形过滤，但最终仍成功输出。  
+  同时，终端摘要还会额外打印两组 row 画像统计：  
+  `MultiPolygon rows`：`total / triangulated / dropped`；  
+  `Hole rows`：`total / triangulated / dropped`。  
+  对应的 JSON 日志里也会增加这些字段：`multipolygon_rows`、`triangulated_multipolygon_rows`、`dropped_multipolygon_rows`、`hole_rows`、`triangulated_hole_rows`、`dropped_hole_rows`。  
+  此外，日志 JSON 里还会新增两组明细记录：  
+  `multipolygon_row_records`：所有 `MultiPolygon` row 的记录；  
+  `hole_row_records`：所有带孔 row 的记录。  
+  每条记录会包含 `row_idx`、`geom_type`、`is_multipolygon`、`raw_part_count`、`has_holes`、`parts_with_holes`、`total_hole_count`、`max_part_hole_count`、`safe_mode`、`isolated`、`status`、`drop_reason`、`degenerated`、`filtered_part_count`、`filtered_triangle_count`、`kept_triangle_count`，便于后续针对多部件图斑和带孔图斑做定向排查。
   
 - 调取示例：
   
@@ -126,6 +136,20 @@ python scripts/run_build_dataset.py \
   --progress_every_chunks 10 \
 
   --shard_size_mb 500 \
+
+  --safe_mode risky \
+
+  --part_safe 1 \
+
+  --node_safe 2048 \
+
+  --hole_safe 1 \
+
+  --edge_safe 1e-5 \
+
+  --timeout_safe 20 \
+
+  --norm_max 1.0 \
 
   --min_triangle_area 1e-8 \
 
@@ -148,22 +172,20 @@ python scripts/run_build_dataset.py \
 
 - 入口脚本：`scripts/run_polygon_diagnosis.py`
   
-- 具体功能：默认采用纯静态检查，不直接执行 `triangle.triangulate(...)`，而是复用当前 `build_dataset_triangle.py` 的修复、归一化与 triangle input 构造路径，评估每个 polygon 样本的潜在原生崩溃风险，并输出风险等级与原因标签（如 `invalid_geometry`、`shell_hole_touching`、`repair_changed_topology`、`triangle_vertices_too_many`）。如果确实需要慢速实探，也可以显式指定 `--mode probe`，按单样本隔离子进程执行真实三角剖分。
+- 具体功能：对一个或多个 shapefile 目录执行 row 级静态诊断，完全对齐当前 `run_build_dataset.py` 的处理语义，但不直接执行批量构建写盘。脚本会按 `shp-row` 进行整体去中心化+归一化、part 严格过滤，并依据 `safe_mode + *_safe` 阈值判断这一整行是否会进入隔离子进程，再在同一套 row 级规则下尝试判定该行最终会成功输出、发生退化过滤，还是会被 dropped。该脚本的目标不是给出抽象风险等级，而是帮助定位“哪些 row 会在当前构建规则下被丢弃，以及原因是什么”。
   
-- 配置说明：不依赖 YAML；必须传 `--input_dirs`。这里可以传入 1 个或多个目录，每个目录都应包含同名 `.shp/.shx/.dbf` 等 shapefile 组件，并且目录下必须只有一个 `.shp` 文件。常用可选参数有 `--mode`（默认 `static`，仅做静态风险检查；`probe` 为慢速真实探测）、`--output_dir`（输出目录，默认 `./outputs/polygon_diagnosis`）、`--timeout_sec`（单样本探测超时，仅 `probe` 模式生效，默认 `20` 秒）、`--num_workers`（仅 `static` 模式生效的并行 worker 数，`<=0` 自动）、`--rows_per_chunk`（仅 `static` 模式生效的目标分块行数，默认 `2000`；如果分块太大导致单个 `.shp` 无法充分并行，脚本仍会自动再切细以利用多个 worker）、`--row_start` / `--row_end`（只诊断部分行，`row_end` 为开区间）。脚本会为每个输入目录各自输出到 `<output_dir>/<任务名>/`，主要包含 `summary.json`、`risk_samples.jsonl` 以及 1 张三联饼图总览：
-  索引语义：
-
-  `row_idx`：原始 `.shp` 的行号，也就是 `GeoDataFrame` 中的 geometry 序号；一个 `MultiPolygon` 行仍然只算 1 个 row。
-
-  `sample_index`：将 `MultiPolygon` 按 part 展开之后的样本序号；如果某一行拆成多个 polygon part，它们会共享同一个 `row_idx`，但拥有不同的 `sample_index`。
+- 配置说明：不依赖 YAML；必须传 `--input_dirs`。这里可以传入 1 个或多个目录，每个目录都应包含同名 `.shp/.shx/.dbf` 等 shapefile 组件，并且目录下必须只有一个 `.shp` 文件。常用可选参数有 `--output_dir`（输出目录，默认 `./outputs/polygon_diagnosis`）、`--num_workers`（诊断并行 worker 数，`<=0` 自动）、`--rows_per_chunk`（诊断分块行数，默认 `2000`）、`--row_start` / `--row_end`（只诊断部分行，`row_end` 为开区间）、`--safe_mode`、`--part_safe`、`--node_safe`、`--hole_safe`、`--edge_safe`、`--timeout_safe`、`--norm_max`、`--min_triangle_area`、`--min_triangle_height`。脚本会为每个输入目录各自输出到 `<output_dir>/<任务名>/`，主要包含 `summary.json`、`risk_samples.jsonl` 以及 1 张三联饼图总览。  
+  索引语义：  
+  `row_idx`：原始 `.shp` 的行号，也就是 `GeoDataFrame` 中的 geometry 序号；当前诊断和构建都严格按 row 统计，不再有训练样本级的 `sample_index` 语义。
   
   `summary.json`：汇总扫描范围、状态计数、图斑类型计数、风险标签计数，以及饼图涉及的数值统计。其中：
-  `node_count_bucket_counts` 按 sample 统计 `max_triangle_vertices` 的 5 档分布；
-  `min_edge_bucket_counts` 按 sample 统计归一化后 `min_normalized_edge_length` 的 5 档分布；
+  `node_count_bucket_counts` 按 row 统计总节点数的 5 档分布；
+  `min_edge_bucket_counts` 按 row 统计归一化后最小边长的 5 档分布；
   `connectivity_bucket_counts` 按原始 polygon 行统计 5 类连通性分布；
-  `risk_row_polygon_type_counts` 按“至少产出 1 条风险样本的原始行”统计。
+  `risk_row_polygon_type_counts` 按“最终被 dropped 的原始行”统计。  
+  同时会记录 row 级状态计数，例如 `triangulated_rows`、`dropped_rows`、`degenerated_rows`、`isolated_rows`。
   
-  `risk_samples.jsonl`：`static` 模式下所有 `medium/high/critical` 风险样本；`probe` 模式下所有 `probe_status != ok` 的样本。每条记录都会附带 `polygon_type` 字段，类型定义为：
+  `risk_samples.jsonl`：只记录最终被 `dropped` 的 row；每条记录都会附带 `polygon_type`、过滤统计、是否会进入隔离子进程、drop 原因等字段。`polygon_type` 定义为：
   
   `simple`：单 Polygon 且无孔洞。
   
@@ -183,7 +205,15 @@ python scripts/run_build_dataset.py \
 python scripts/run_polygon_diagnosis.py \
   --input_dirs /data/raw/testlook \
   --output_dir ./outputs/polygon_diagnosis \
-  --mode static \
+  --safe_mode risky \
+  --part_safe 1 \
+  --node_safe 2048 \
+  --hole_safe 1 \
+  --edge_safe 1e-5 \
+  --timeout_safe 20 \
+  --norm_max 1.0 \
+  --min_triangle_area 1e-8 \
+  --min_triangle_height 1e-5 \
   --num_workers 8 \
   --rows_per_chunk 1000
 ```
@@ -192,7 +222,7 @@ python scripts/run_polygon_diagnosis.py \
 python scripts/run_polygon_diagnosis.py \
   --input_dirs /data/raw/testlook /data/raw/hangzhou \
   --output_dir ./outputs/polygon_diagnosis \
-  --mode static \
+  --safe_mode all \
   --num_workers 16 \
   --rows_per_chunk 2000
 ```
@@ -201,22 +231,23 @@ python scripts/run_polygon_diagnosis.py \
 python scripts/run_polygon_diagnosis.py \
   --input_dirs /data/raw/testlook \
   --output_dir ./outputs/polygon_diagnosis \
-  --mode probe \
   --row_start 1000 \
   --row_end 1500 \
-  --timeout_sec 30
+  --safe_mode off \
+  --norm_max 0.8
 ```
 
 ### 6 单图斑与三角剖分可视化诊断
 
 - 入口脚本：`scripts/run_viz_polygon_triangulation.py`
   
-- 具体功能：从单个 `.shp` 中提取指定原始行里的一个 polygon part，输出可视化 PNG，并附带一个 JSON 元数据文件。PNG 会同时展示原始 geometry、选中的 part、`buffer(0)` 修复结果、`_prepare_polygon_candidates()` 的候选图斑、归一化后的 candidate，以及“原始三角剖分结果 / 退化过滤后的三角剖分结果”两张图，便于直观看到 holes、超长边界、修复分裂、剖分失败与退化过滤。
+- 具体功能：从单个 `.shp` 中提取指定原始行，并在新的 row 级处理语义下输出可视化 PNG 与 JSON 元数据文件。脚本主视角是“整行如何被处理”，但仍保留 `--part_index`，用于高亮这一行中的某个原始 part。PNG 会同时展示：原始整行 geometry、选中的 raw part、整行归一化后的 parts、过滤后的 parts，以及“原始三角剖分结果 / 退化过滤后的三角剖分结果”两张图；失败时也仍会输出 PNG 和 JSON，便于直观看到 part 过滤、整行隔离判定、逐 part 剖分、超时与退化过滤的结果。
   
 - 配置说明：必须传 `--input_dir` 和 `--row_index`。  
   `--part_index` 表示该行中的第几个 part，按 1 开始计数，默认是 `1`；如果超过 part 总数，脚本会自动取最后一个 part。  
-  `--timeout` 表示三角剖分阶段的超时时间（秒）；超过该时间会被判定为剖分失败并写入 PNG/JSON。  
-  可选参数有 `--output_dir`（默认 `./outputs/polygon_viz`）和 `--dpi`。
+  `--timeout` 是 `--timeout_safe` 的别名，表示可视化阶段对单个保留 part 的受控三角剖分最长等待时间（秒）；超过该时间会被判定为失败并写入 PNG/JSON。  
+  其他常用参数与构建脚本保持一致：`--safe_mode`、`--part_safe`、`--node_safe`、`--hole_safe`、`--edge_safe`、`--norm_max`、`--min_triangle_area`、`--min_triangle_height`。  
+  当前 PNG 默认包含 8 个区域：`Raw Row Geometry`、`Selected Raw Part`、`Row-Normalized Parts`、`Filtered Parts`、`Raw Triangulation`、`Filtered Triangulation`、`Part Summary`、`Metadata`。被过滤的 part 会在过滤面板中以灰/红样式显示；最终剖分面板只展示保留下来的 part。
   
 - 调取示例：
 
@@ -225,7 +256,15 @@ python scripts/run_viz_polygon_triangulation.py \
   --input_dir /data/raw/testlook \
   --row_index 6358 \
   --part_index 2 \
+  --safe_mode risky \
+  --part_safe 1 \
+  --node_safe 2048 \
+  --hole_safe 1 \
+  --edge_safe 1e-5 \
   --timeout 20 \
+  --norm_max 1.0 \
+  --min_triangle_area 1e-8 \
+  --min_triangle_height 1e-5 \
   --output_dir ./outputs/polygon_viz
 ```
 

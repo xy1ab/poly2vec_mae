@@ -3,10 +3,17 @@ import sys
 import subprocess
 import argparse
 import time
+from pathlib import Path
 import torch
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
+
+if __package__ in {None, ""}:
+    _CURRENT_DIR = Path(__file__).resolve().parent
+    _REPO_ROOT = _CURRENT_DIR.parent
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
 
 # ---------------------------------------------------------
 # 解决 PyTorch 2.6+ 默认 weights_only=True 导致加载 numpy 数据集报错的问题
@@ -52,9 +59,22 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from loaders.dataloader_mae import PolyMAEDataset, mae_collate_fn
-from mae_pretrain.src.datasets.geometry_polygon import PolyFourierConverter
-from models.vit_poly import MaskedAutoencoderViTPoly
+if __package__ in {None, ""}:
+    import importlib
+
+    _loader_module = importlib.import_module("downstream_unet.loaders.dataloader_mae")
+    PolyMAEDataset = _loader_module.PolyMAEDataset
+    mae_collate_fn = _loader_module.mae_collate_fn
+    PolyFourierConverter = importlib.import_module(
+        "mae_pretrain.src.datasets.geometry_polygon"
+    ).PolyFourierConverter
+    MaskedAutoencoderViTPoly = importlib.import_module(
+        "downstream_unet.models.vit_poly"
+    ).MaskedAutoencoderViTPoly
+else:
+    from .loaders.dataloader_mae import PolyMAEDataset, mae_collate_fn
+    from mae_pretrain.src.datasets.geometry_polygon import PolyFourierConverter
+    from .models.vit_poly import MaskedAutoencoderViTPoly
 from tqdm import tqdm
 
 def plot_reconstruction(imgs, pred, mask, patch_size, epoch, save_dir):

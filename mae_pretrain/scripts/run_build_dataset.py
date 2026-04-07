@@ -111,13 +111,56 @@ def main() -> None:
         "--min_triangle_area",
         type=float,
         default=1e-8,
-        help="Minimum triangle area in normalized [-1,1] space.",
+        help="Minimum triangle area in row-normalized space.",
     )
     parser.add_argument(
         "--min_triangle_height",
         type=float,
         default=1e-5,
-        help="Minimum triangle altitude proxy in normalized [-1,1] space.",
+        help="Minimum triangle altitude proxy in row-normalized space.",
+    )
+    parser.add_argument(
+        "--safe_mode",
+        type=str,
+        default="risky",
+        choices=["all", "risky", "off"],
+        help="Row isolation trigger mode for safer triangulation.",
+    )
+    parser.add_argument(
+        "--part_safe",
+        type=int,
+        default=1,
+        help="Enter safe subprocess when filtered part count is greater than this value.",
+    )
+    parser.add_argument(
+        "--node_safe",
+        type=int,
+        default=2048,
+        help="Enter safe subprocess when any filtered part node count is greater than this value.",
+    )
+    parser.add_argument(
+        "--hole_safe",
+        type=int,
+        default=1,
+        help="Enter safe subprocess when any filtered part hole count is greater than this value.",
+    )
+    parser.add_argument(
+        "--edge_safe",
+        type=float,
+        default=1e-5,
+        help="Enter safe subprocess when any filtered part min edge is smaller than this value after row normalization.",
+    )
+    parser.add_argument(
+        "--timeout_safe",
+        type=float,
+        default=20.0,
+        help="Maximum seconds to wait for one row in safe subprocess mode.",
+    )
+    parser.add_argument(
+        "--norm_max",
+        type=float,
+        default=1.0,
+        help="Maximum absolute normalized coordinate. 1.0 means [-1,1], 0.8 means [-0.8,0.8].",
     )
     parser.add_argument(
         "--log",
@@ -161,6 +204,13 @@ def main() -> None:
         shard_size_mb=args.shard_size_mb,
         min_triangle_area=args.min_triangle_area,
         min_triangle_height=args.min_triangle_height,
+        safe_mode=args.safe_mode,
+        part_safe=args.part_safe,
+        node_safe=args.node_safe,
+        hole_safe=args.hole_safe,
+        edge_safe=args.edge_safe,
+        timeout_safe=args.timeout_safe,
+        norm_max=args.norm_max,
         log=args.log,
     )
 

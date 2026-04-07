@@ -18,10 +18,9 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 import os
+from typing import Callable
 
-import torch
-
-from ..utils.safe_load import register_numpy_safe_globals
+from .shard_io import load_triangle_shard, resolve_triangle_shard_paths
 
 
 @dataclass(frozen=True)
@@ -96,16 +95,14 @@ class PtShardManifest:
         """Build a manifest from an explicit shard-file list.
 
         Args:
-            pt_files: Input `.pt` paths. The list will be normalized and sorted.
+            pt_files: Input `.pt` paths. The provided order is preserved.
 
         Returns:
             Manifest instance with global offsets for each non-empty shard.
         """
-        normalized_paths = sorted(Path(path).expanduser().resolve() for path in pt_files)
+        normalized_paths = [Path(path).expanduser().resolve() for path in pt_files]
         if not normalized_paths:
             raise FileNotFoundError("No .pt files were provided for manifest construction.")
-
-        register_numpy_safe_globals()
 
         shard_infos: list[PtShardInfo] = []
         global_start = 0
@@ -113,10 +110,7 @@ class PtShardManifest:
             if not path.is_file():
                 raise FileNotFoundError(f"Shard file does not exist: {path}")
 
-            shard_data = torch.load(path, map_location="cpu", weights_only=False)
-            if not isinstance(shard_data, list):
-                raise TypeError(f"Shard file must store a Python list: {path}")
-
+            shard_data = load_triangle_shard(path)
             num_samples = len(shard_data)
             if num_samples <= 0:
                 continue
@@ -137,23 +131,21 @@ class PtShardManifest:
         return cls(shard_infos)
 
     @classmethod
-    def from_data_dir(cls, data_dir: str | Path) -> "PtShardManifest":
+    def from_data_dir(
+        cls,
+        data_dir: str | Path,
+        warn_fn: Callable[[str], None] | None = None,
+    ) -> "PtShardManifest":
         """Discover `.pt` shards from one data directory.
 
         Args:
             data_dir: Directory that contains one or more shard `.pt` files.
+            warn_fn: Optional warning sink used during manifest fallback.
 
         Returns:
             Manifest instance over all discovered shard files.
         """
-        data_dir = Path(data_dir).expanduser().resolve()
-        if not data_dir.is_dir():
-            raise NotADirectoryError(f"Training data directory does not exist: {data_dir}")
-
-        pt_files = [path for path in data_dir.glob("*.pt") if path.is_file()]
-        if not pt_files:
-            raise FileNotFoundError(f"No .pt files found under data directory: {data_dir}")
-
+        pt_files = resolve_triangle_shard_paths(data_dir, warn_fn=warn_fn)
         return cls.from_pt_files(pt_files)
 
     def locate_sample(self, global_index: int) -> tuple[int, int]:

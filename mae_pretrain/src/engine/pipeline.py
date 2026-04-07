@@ -231,6 +231,7 @@ class PolyMaeReconstructionPipeline:
         Returns:
             Tuple `(real_part, imag_part)` with shape `[B,valid_h,valid_w]`.
         """
+        mask_ratio = self.model._validate_mask_ratio(mask_ratio)
         tri_list = []
         for geom in geometries:
             geom_np = ensure_polygon_array(geom)
@@ -239,7 +240,7 @@ class PolyMaeReconstructionPipeline:
         imgs = self.triangles_to_images(tri_list)
 
         with autocast_context(self.device, self.precision):
-            _, pred, mask_seq, _, _ = self.model(imgs, mask_ratio=mask_ratio)
+            pred, mask_seq = self.model(imgs, mask_ratio=mask_ratio)
 
         pred = pred.float()
         mask_seq = mask_seq.float()

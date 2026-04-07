@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 import warnings
@@ -30,6 +31,7 @@ from torch.utils.data.distributed import DistributedSampler
 from ..datasets.collate import mae_collate_fn
 from ..datasets.pt_manifest import PtShardManifest
 from ..datasets.registry import get_geometry_codec
+from ..datasets.shard_io import resolve_triangle_shard_paths
 from ..datasets.sharded_pt_dataset import (
     EagerShardedPolyDataset,
     LazyShardedPolyDataset,
@@ -43,7 +45,14 @@ from ..utils.checkpoint import (
     save_latest_training_state_pair,
 )
 from ..utils.config import dump_yaml_config
-from ..utils.dist_musa import DistContext, all_reduce_mean, cleanup_distributed, init_distributed_musa, is_main_process
+from ..utils.dist_musa import (
+    DistContext,
+    all_reduce_mean,
+    cleanup_distributed,
+    distributed_barrier,
+    init_distributed_musa,
+    is_main_process,
+)
 from ..utils.filesystem import ensure_dir, make_timestamped_dir
 from ..utils.logger import attach_tee_stdout
 from ..utils.precision_musa import autocast_context, build_grad_scaler, normalize_precision
@@ -316,20 +325,32 @@ def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx
 def _build_scheduler(args, optimizer):
     """Construct the epoch scheduler from runtime arguments."""
     if args.warmup_epochs > 0:
-        warmup_scheduler = optim.lr_scheduler.LinearLR(
+        min_factor = float(args.min_lr) / float(args.lr)
+        cosine_epochs = max(1, int(args.epochs) - int(args.warmup_epochs))
+
+        class _WarmupThenCosineLambda:
+            def __init__(self, warmup_epochs: int, cosine_epochs: int, min_factor: float) -> None:
+                self.warmup_epochs = int(warmup_epochs)
+                self.cosine_epochs = int(cosine_epochs)
+                self.min_factor = float(min_factor)
+
+            def __call__(self, epoch: int) -> float:
+                current_epoch = max(0, int(epoch))
+                if current_epoch <= self.warmup_epochs:
+                    warmup_progress = current_epoch / float(self.warmup_epochs)
+                    return self.min_factor + (1.0 - self.min_factor) * warmup_progress
+
+                cosine_progress = min(current_epoch - self.warmup_epochs, self.cosine_epochs)
+                cosine_factor = 0.5 * (1.0 + math.cos(math.pi * cosine_progress / self.cosine_epochs))
+                return self.min_factor + (1.0 - self.min_factor) * cosine_factor
+
+        return optim.lr_scheduler.LambdaLR(
             optimizer,
-            start_factor=args.min_lr / args.lr,
-            total_iters=args.warmup_epochs,
-        )
-        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(1, args.epochs - args.warmup_epochs),
-            eta_min=args.min_lr,
-        )
-        return optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[args.warmup_epochs],
+            lr_lambda=_WarmupThenCosineLambda(
+                warmup_epochs=args.warmup_epochs,
+                cosine_epochs=cosine_epochs,
+                min_factor=min_factor,
+            ),
         )
 
     return optim.lr_scheduler.CosineAnnealingLR(
@@ -341,6 +362,11 @@ def _build_scheduler(args, optimizer):
 
 def _validate_training_args(args) -> None:
     """Validate numeric hyperparameters before building the training pipeline."""
+    try:
+        augment_float = float(args.augment_times)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"`augment_times` must be an integer >= 1, got {args.augment_times!r}") from exc
+
     if args.lr <= 0:
         raise ValueError(f"`lr` must be > 0, got {args.lr}")
     if args.min_lr < 0:
@@ -349,8 +375,13 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
     if args.patch_size <= 0:
         raise ValueError(f"`patch_size` must be > 0, got {args.patch_size}")
-    if not (0.0 <= args.mask_ratio < 1.0):
-        raise ValueError(f"`mask_ratio` must be in [0, 1), got {args.mask_ratio}")
+    MaskedAutoencoderViTPoly._validate_mask_ratio(args.mask_ratio)
+    if not (0.0 < float(args.val_ratio) < 1.0):
+        raise ValueError(f"`val_ratio` must be in (0, 1), got {args.val_ratio}")
+    if not augment_float.is_integer():
+        raise ValueError(f"`augment_times` must be an integer >= 1, got {args.augment_times!r}")
+    if int(augment_float) < 1:
+        raise ValueError(f"`augment_times` must be >= 1, got {args.augment_times}")
     if args.warmup_epochs < 0:
         raise ValueError(f"`warmup_epochs` must be >= 0, got {args.warmup_epochs}")
     if args.log_interval <= 0:
@@ -445,17 +476,12 @@ def _sync_run_metadata(best_dir: Path, ckpt_dir: Path, run_config: dict, model_c
     _write_json(ckpt_dir / "poly_mae_config.json", model_config)
 
 
-def _resolve_training_pt_files(args) -> list[Path]:
-    """Resolve training shard files from directory input or compatibility path."""
+def _resolve_training_pt_files(args, warn_fn=None) -> list[Path]:
+    """Resolve ordered training shard files from directory input or compatibility path."""
     data_dir = getattr(args, "data_dir", None)
     if data_dir:
         data_dir = Path(str(data_dir)).expanduser().resolve()
-        if not data_dir.is_dir():
-            raise NotADirectoryError(f"Training data directory does not exist: {data_dir}")
-        pt_files = sorted(path for path in data_dir.glob("*.pt") if path.is_file())
-        if not pt_files:
-            raise FileNotFoundError(f"No .pt files found under training data directory: {data_dir}")
-        return pt_files
+        return resolve_triangle_shard_paths(data_dir, warn_fn=warn_fn)
 
     data_path = getattr(args, "data_path", None)
     if data_path:
@@ -463,9 +489,7 @@ def _resolve_training_pt_files(args) -> list[Path]:
         if resolved.is_file():
             return [resolved]
         if resolved.is_dir():
-            pt_files = sorted(path for path in resolved.glob("*.pt") if path.is_file())
-            if pt_files:
-                return pt_files
+            return resolve_triangle_shard_paths(resolved, warn_fn=warn_fn)
 
     raise ValueError("Training data source is missing. Please provide --data_dir.")
 
@@ -617,11 +641,6 @@ def count_parameters(model):
     print(f"Encoder 占比: {(encoder_params / total_params) * 100:.2f}%")
 
 
-def _unwrap_model(model):
-    """Return the underlying module for plain or DDP-wrapped models."""
-    return model.module if hasattr(model, "module") else model
-
-
 def _describe_tensor_finiteness(name: str, tensor: torch.Tensor) -> str:
     """Build a concise finiteness summary for one tensor."""
     detached = tensor.detach().float()
@@ -652,65 +671,6 @@ def _raise_nonfinite_training_error(stage: str, epoch: int, step: int, tensors: 
         f"Non-finite tensor detected during {stage} at epoch={epoch + 1}, step={step}: "
         + " | ".join(summaries)
     )
-
-
-def _collect_grad_stats(model) -> dict[str, float | int | str | None]:
-    """Summarize gradient health for the current optimization step."""
-    module = _unwrap_model(model)
-    total_sq = 0.0
-    max_abs = 0.0
-    grad_param_count = 0
-    nonfinite_grad_param_count = 0
-    max_abs_param_name = None
-    first_nonfinite_param_name = None
-
-    for name, param in module.named_parameters():
-        grad = param.grad
-        if grad is None:
-            continue
-        grad_param_count += 1
-        grad_float = grad.detach().float()
-        finite_mask = torch.isfinite(grad_float)
-        if not bool(finite_mask.all().item()):
-            nonfinite_grad_param_count += 1
-            if first_nonfinite_param_name is None:
-                first_nonfinite_param_name = name
-        if bool(finite_mask.any().item()):
-            finite_grad = grad_float[finite_mask]
-            total_sq += float(torch.sum(finite_grad * finite_grad).item())
-            candidate_abs = float(finite_grad.abs().max().item())
-            if candidate_abs >= max_abs:
-                max_abs = candidate_abs
-                max_abs_param_name = name
-
-    return {
-        "grad_norm": total_sq ** 0.5,
-        "grad_abs_max": max_abs,
-        "grad_param_count": grad_param_count,
-        "nonfinite_grad_param_count": nonfinite_grad_param_count,
-        "max_abs_param_name": max_abs_param_name,
-        "first_nonfinite_param_name": first_nonfinite_param_name,
-    }
-
-
-def _format_grad_monitor_line(grad_stats: dict[str, float | int | str | None], scaler) -> str:
-    """Format one human-readable gradient monitor suffix for step logs."""
-    grad_norm = float(grad_stats["grad_norm"])
-    grad_abs_max = float(grad_stats["grad_abs_max"])
-    nonfinite_count = int(grad_stats["nonfinite_grad_param_count"])
-    max_abs_param_name = grad_stats.get("max_abs_param_name")
-    pieces = [
-        f"GradNorm: {grad_norm:.4e}",
-        f"GradAbsMax: {grad_abs_max:.4e}",
-        f"NonFiniteGradParams: {nonfinite_count}",
-    ]
-    if max_abs_param_name:
-        pieces.append(f"GradMaxParam: {max_abs_param_name}")
-    if scaler.is_enabled():
-        pieces.append(f"GradScale: {float(scaler.get_scale()):.1f}")
-    return " | ".join(pieces)
-
-
 def train_main(args) -> None:
     """Main training entrypoint."""
     register_numpy_safe_globals()
@@ -803,7 +763,8 @@ def train_main(args) -> None:
     if resume_state is not None:
         model_to_save.load_state_dict(resume_state["model_state"], strict=True)
 
-    count_parameters(model)
+    if is_main_process(dist_ctx):
+        count_parameters(model)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if resume_state is not None:
@@ -821,7 +782,10 @@ def train_main(args) -> None:
         if scaler_state and scaler.is_enabled() and saved_precision == args.precision:
             scaler.load_state_dict(scaler_state)
 
-    pt_files = _resolve_training_pt_files(args)
+    pt_files = _resolve_training_pt_files(
+        args,
+        warn_fn=(lambda message: print(message)) if is_main_process(dist_ctx) else None,
+    )
     manifest = PtShardManifest.from_pt_files(pt_files)
 
     if resume_state is not None:
@@ -894,7 +858,7 @@ def train_main(args) -> None:
                     imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
 
                 with autocast_context(device, args.precision):
-                    _, _, _, pred, mask = model(imgs, mask_ratio=args.mask_ratio)
+                    pred, mask = model(imgs, mask_ratio=args.mask_ratio)
 
                 pred = pred.float()
                 mask = mask.float()
@@ -928,21 +892,11 @@ def train_main(args) -> None:
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    grad_stats = _collect_grad_stats(model)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
-                    grad_stats = _collect_grad_stats(model)
                     optimizer.step()
-
-                if is_main_process(dist_ctx) and int(grad_stats["nonfinite_grad_param_count"]) > 0:
-                    print(
-                        "[WARN] Non-finite gradients detected | "
-                        f"epoch={epoch + 1}, step={step}, "
-                        f"first_bad_param={grad_stats['first_nonfinite_param_name']}, "
-                        f"{_format_grad_monitor_line(grad_stats, scaler)}"
-                    )
 
                 train_total += loss.item()
                 train_mag += loss_mag.item()
@@ -950,10 +904,7 @@ def train_main(args) -> None:
                 train_steps += 1
 
                 if is_main_process(dist_ctx) and step % args.log_interval == 0:
-                    print(
-                        f"  -> Step [{step}/{len(train_loader)}], Train Loss: {loss.item():.4f} | "
-                        f"{_format_grad_monitor_line(grad_stats, scaler)}"
-                    )
+                    print(f"  -> Step [{step}/{len(train_loader)}], Train Loss: {loss.item():.4f}")
 
                 if max_train_steps > 0 and train_steps >= max_train_steps:
                     break
@@ -985,7 +936,7 @@ def train_main(args) -> None:
                         imgs_v = torch.cat([mag_v, torch.cos(phase_v), torch.sin(phase_v)], dim=1)
 
                         with autocast_context(device, args.precision):
-                            _, _, _, pred_v, mask_v = model(imgs_v, mask_ratio=args.mask_ratio)
+                            pred_v, mask_v = model(imgs_v, mask_ratio=args.mask_ratio)
 
                         pred_v = pred_v.float()
                         mask_v = mask_v.float()
@@ -1057,7 +1008,7 @@ def train_main(args) -> None:
                     imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
 
                     with autocast_context(device, args.precision):
-                        _, _, _, pred_fix, mask_fix = model(imgs_fix, mask_ratio=args.mask_ratio)
+                        pred_fix, mask_fix = model(imgs_fix, mask_ratio=args.mask_ratio)
 
                     pred_fix = pred_fix.float()
                     mask_fix = mask_fix.float()
@@ -1136,8 +1087,7 @@ def train_main(args) -> None:
                 save_latest_training_state_pair(ckpt_dir=ckpt_dir, state=train_state)
                 print(f"  [Ckpt] Updated latest resume checkpoint at epoch {epoch + 1}")
 
-            if dist_ctx.enabled:
-                torch.distributed.barrier()
+            distributed_barrier(dist_ctx)
 
             scheduler.step()
     except KeyboardInterrupt:

@@ -102,6 +102,14 @@ class MaskedAutoencoderViTPoly(nn.Module):
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
 
+    @staticmethod
+    def _validate_mask_ratio(mask_ratio: float) -> float:
+        """Validate MAE mask ratio and return it as float."""
+        mask_ratio = float(mask_ratio)
+        if not (0.0 <= mask_ratio < 1.0):
+            raise ValueError(f"`mask_ratio` must be in [0, 1), got {mask_ratio}")
+        return mask_ratio
+
     def random_masking_ids(self, batch_size: int, token_count: int, device: torch.device, mask_ratio: float):
         """Generate random MAE masking indices.
 
@@ -137,6 +145,7 @@ class MaskedAutoencoderViTPoly(nn.Module):
         Returns:
             Tuple `(latent, mask, ids_restore)`.
         """
+        mask_ratio = self._validate_mask_ratio(mask_ratio)
         batch_size = x.shape[0]
         token_count = self.encoder.patch_embed.num_patches
         ids_keep, mask, ids_restore = self.random_masking_ids(batch_size, token_count, x.device, mask_ratio)
@@ -178,10 +187,9 @@ class MaskedAutoencoderViTPoly(nn.Module):
             mask_ratio: Fraction of patch tokens to mask.
 
         Returns:
-            Tuple `(loss_placeholder, pred, mask, pred_alias, mask_alias)`
-            to preserve backward compatibility with existing callers.
+            Tuple `(pred, mask)`.
         """
+        mask_ratio = self._validate_mask_ratio(mask_ratio)
         latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
         pred = self.forward_decoder(latent, ids_restore)
-        loss_placeholder = torch.tensor(0.0, device=imgs.device)
-        return loss_placeholder, pred, mask, pred, mask
+        return pred, mask
