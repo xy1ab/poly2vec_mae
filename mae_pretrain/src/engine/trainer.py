@@ -63,6 +63,7 @@ _RESUME_LOCKED_KEYS = {
     "geom_type",
     "data_dir",
     "data_path",
+    "loss_mode",
     "patch_size",
     "embed_dim",
     "depth",
@@ -296,6 +297,7 @@ def _build_model_config(args, img_size: tuple[int, int]) -> dict:
     """
     return {
         "geom_type": args.geom_type,
+        "loss_mode": args.loss_mode,
         "img_size": img_size,
         "patch_size": args.patch_size,
         "in_chans": 3,
@@ -397,6 +399,8 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
     if args.patch_size <= 0:
         raise ValueError(f"`patch_size` must be > 0, got {args.patch_size}")
+    if args.loss_mode not in {"mask", "full"}:
+        raise ValueError(f"`loss_mode` must be 'mask' or 'full', got {args.loss_mode!r}")
     MaskedAutoencoderViTPoly._validate_mask_ratio(args.mask_ratio)
     if not (0.0 < float(args.val_ratio) < 1.0):
         raise ValueError(f"`val_ratio` must be in (0, 1), got {args.val_ratio}")
@@ -803,6 +807,7 @@ def train_main(args) -> None:
             f"rank={dist_ctx.rank}, local_rank={dist_ctx.local_rank}, device={device}, "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
         )
+        print(f"[INFO] Loss mode      : {args.loss_mode}")
         print(f"[INFO] Eval frequency  : every {args.eval_every} epoch(s)")
         if args.resume_dir:
             print(f"[INFO] Resume mode    : dir={args.resume_dir}, checkpoint={resume_path}")
@@ -947,6 +952,7 @@ def train_main(args) -> None:
                     patch_size=args.patch_size,
                     freq_span_patches=freq_span_patches,
                     weight_mag_hf=args.weight_mag_hf,
+                    loss_mode=args.loss_mode,
                 )
                 loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
                 if not bool(torch.isfinite(loss).item()):
@@ -1025,6 +1031,7 @@ def train_main(args) -> None:
                             patch_size=args.patch_size,
                             freq_span_patches=freq_span_patches,
                             weight_mag_hf=args.weight_mag_hf,
+                            loss_mode=args.loss_mode,
                         )
 
                         loss_total_v = args.weight_mag * loss_mag_v + args.weight_phase * loss_phase_v
@@ -1227,6 +1234,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--mask_ratio", type=float, default=0.75)
+    parser.add_argument("--loss_mode", type=str, default="full", choices=("mask", "full"))
     parser.add_argument("--augment_times", type=int, default=10)
 
     parser.add_argument("--precision", type=str, default="bf16")
