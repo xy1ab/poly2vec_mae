@@ -6,3 +6,4 @@ torch==2.7.1
 triangle==20250106
 scikit-image==0.24.0
 segmentation_models_pytorch==0.5.0
+faiss_gpu==1.7.2
