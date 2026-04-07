@@ -31,3 +31,13 @@ downstream_ocf/checkpoints
 # Optional: logs/temp
 *.log
 *.tmp
+
+# 模型缓存与原始数据 (绝对不能提交)
+raw_data/
+cache_*.pt
+
+
+# 训练日志与图表
+*.png
+train_history.json
+global_vocab_auto.json

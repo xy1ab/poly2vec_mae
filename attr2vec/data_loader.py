@@ -4,77 +4,159 @@ import numpy as np
 import pyogrio
 import torch
 import os
+import json
 import warnings
+import glob
+
 warnings.filterwarnings('ignore')
-from lincao_dict import FIELD_METADATA, LINCAO_CODE_DICT
 
-def load_and_preprocess_gdb(gdb_path, layer_name, cache_path="data_cache.pt"):
-    # 🌟 护甲机制 1：缓存自愈与健康度核验
-    # if os.path.exists(cache_path):
-    #     print(f"⚡ 检测到数据缓存，正在核验数据健康度...")
-    #     try:
-    #         data_dict = torch.load(cache_path)
-    #         if np.isnan(data_dict['raw_64']).any() or np.isnan(data_dict['cont_norm']).any():
-    #             print("⚠️ 警告：检测到旧版缓存中残留 NaN 毒数据！正在自动销毁并重建...")
-    #             os.remove(cache_path)
-    #         else:
-    #             print("✅ 缓存健康 (0 NaN)，瞬间载入成功！")
-    #             return data_dict
-    #     except Exception as e:
-    #         print(f"⚠️ 缓存读取异常 ({e})，正在重建...")
-    #         os.remove(cache_path)
-
-    print(f"\n🚀 [之江实验室] 正在解析 GDB 并执行全要素强制脱毒与无损压缩...")
-    gdf = gpd.read_file(gdb_path, engine="pyogrio")
-    df = pd.DataFrame(gdf).drop(columns=['geometry'], errors='ignore')
-    
-    # 暴力清除所有空白字符
-    df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
-    
-    upper_meta = {k.upper(): k for k in FIELD_METADATA.keys()}
-    valid_cols = [col for col in df.columns if col.upper() in upper_meta]
-    df = df[valid_cols]
-
-    continuous_cols, categorical_cols = [], []
-    for col in valid_cols:
-        if FIELD_METADATA[upper_meta[col.upper()]]['decimals'] > 0:
-            continuous_cols.append(col)
+class NRE_DataPump:
+    def __init__(self, vocab_path='global_vocab_auto.json', max_seq_len=64):
+        self.vocab_path = vocab_path
+        self.max_seq_len = max_seq_len
+        self.vocab = {}
+        self.shared_chars = {}
+        
+        if os.path.exists(vocab_path):
+            with open(vocab_path, 'r', encoding='utf-8') as f:
+                self.vocab = json.load(f)
+            self.shared_chars = self.vocab.get("__SHARED_CHARS__", {})
         else:
-            categorical_cols.append(col)
+            print(f"⚠️ 警告：未找到字典 {vocab_path}！")
 
-    # 🌟 护甲机制 2：连续字段多重脱毒与【稠密伪装压缩】
-    for col in continuous_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+    def _route_columns(self, df):
+        cont_cols, word_cols, char_cols = [], [], []
+        FORCE_CHAR_KEYWORDS = ['NAME', 'NAME_CH', 'MC', 'BZ', 'REMARK', 'NOTE', 'DESC', 'ADDR', 'SM', 'MS']
+
+        for col in df.columns:
+            col_lower = col.lower()
+            if col_lower in ['geometry', 'shape'] or col_lower.endswith('id') or col_lower.endswith('uuid'):
+                continue
+            if any(key in col.upper() for key in FORCE_CHAR_KEYWORDS):
+                char_cols.append(col)
+                continue
+            if col in self.vocab and col != "__SHARED_CHARS__":
+                word_cols.append(col)
+                continue
+            if pd.api.types.is_numeric_dtype(df[col]):
+                cont_cols.append(col)
+            else:
+                char_cols.append(col)
+        return cont_cols, word_cols, char_cols
+
+    def _process_single_dataframe(self, df):
+        df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
+        cont_cols, word_cols, char_cols = self._route_columns(df)
+
+        if cont_cols:
+            df[cont_cols] = df[cont_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+            raw_64 = df[cont_cols].values.astype(np.float64)
+            raw_64 = np.nan_to_num(raw_64, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            cont_mantissa, cont_exponent = np.frexp(raw_64)
+            
+            cont_int = cont_exponent.astype(np.float32)
+            cont_frac_hi = cont_mantissa.astype(np.float32)
+            cont_frac_lo = (cont_mantissa - cont_frac_hi.astype(np.float64)).astype(np.float32)
+            
+            std = np.std(raw_64, axis=0)
+            std[std == 0] = 1.0
+            cont_norm = ((raw_64 - np.mean(raw_64, axis=0)) / std).astype(np.float32)
+            cont_norm = np.nan_to_num(cont_norm, nan=0.0)
+        else:
+            cont_int = cont_frac_hi = cont_frac_lo = cont_norm = np.zeros((len(df), 0), dtype=np.float32)
+
+        word_list = []
+        for col in word_cols:
+            col_vocab = self.vocab.get(col, {})
+            encoded = df[col].astype(str).map(lambda x: col_vocab.get(x, 0)).fillna(0).values
+            word_list.append(encoded)
+        word_data = (np.stack(word_list, axis=1).astype(np.float32) / 16384.0) if word_list else np.zeros((len(df), 0), dtype=np.float32)
+
+        char_tensors = []
+        for col in char_cols:
+            col_chars = []
+            for text in df[col].astype(str).fillna(""):
+                text = text.strip() 
+                if text.lower() == 'nan': text = ""
+                char_ids = [self.shared_chars.get(c, 0) for c in list(text)]
+                if len(char_ids) < self.max_seq_len:
+                    char_ids.extend([0] * (self.max_seq_len - len(char_ids)))
+                else:
+                    char_ids = char_ids[:self.max_seq_len]
+                col_chars.append(char_ids)
+            char_tensors.append(col_chars)
+        char_data = (np.array(char_tensors).transpose(1, 0, 2).astype(np.float32) / 16384.0) if char_tensors else np.zeros((len(df), 0, self.max_seq_len), dtype=np.float32)
+
+        return {
+            'cont_int': cont_int, 'cont_frac_hi': cont_frac_hi, 'cont_frac_lo': cont_frac_lo, 'cont_norm': cont_norm,
+            'word_data': word_data, 'char_data': char_data,
+            'meta': {'cont_cols': cont_cols, 'word_cols': word_cols, 'char_cols': char_cols, 'max_seq_len': self.max_seq_len, 'total_samples': len(df)}
+        }
+
+    def build_cache(self, file_path, cache_path="data_cache.pt"):
+        print(f"🚀 正在解析 {file_path} 并执行张量化...")
+        all_layers_data = {}
         
-    raw_64 = df[continuous_cols].values.astype(np.float64)
-    raw_64 = np.nan_to_num(raw_64, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # 将大数值除以 1,000,000，伪装成大模型喜欢的 [0, 1] 稠密区间
-    cont_int = (np.trunc(raw_64) / 1_000_000.0).astype(np.float32)
-    cont_frac = (raw_64 - np.trunc(raw_64)).astype(np.float32)
-    
-    std = np.std(raw_64, axis=0)
-    std[std == 0] = 1.0
-    cont_norm = ((raw_64 - np.mean(raw_64, axis=0)) / std).astype(np.float32)
-    cont_norm = np.nan_to_num(cont_norm, nan=0.0)
+        ext = os.path.splitext(file_path)[-1].lower()
+        tabular_exts = ['.csv', '.txt', '.xlsx', '.xls', '.parquet']
 
-    # 🌟 护甲机制 3：离散字段绝对映射与【百级压缩】
-    cat_list = []
-    for col in categorical_cols:
-        mapping = LINCAO_CODE_DICT.get(col.upper(), {})
-        encoded, _ = pd.factorize(df[col].astype(str).map(mapping).fillna(df[col].astype(str)))
-        cat_list.append(encoded)
+        if ext in tabular_exts:
+            print(f"📄 识别为无空间属性表格文件 ({ext})，开始提取属性...")
+            if ext in ['.csv', '.txt']:
+                df = pd.read_csv(file_path, low_memory=False)
+            elif ext in ['.xlsx', '.xls']:
+                df = pd.read_excel(file_path)
+            elif ext == '.parquet':
+                df = pd.read_parquet(file_path)
+            all_layers_data["TABULAR_DEFAULT"] = self._process_single_dataframe(df)
+            
+        else:
+            try:
+                layers = pyogrio.list_layers(file_path)
+                print(f"🌍 识别为空间矢量文件，探测到 {len(layers)} 个图层...")
+                for layer_name, geom_type in layers:
+                    print(f"   -> 正在抽取图层: [{layer_name}]")
+                    try:
+                        gdf = gpd.read_file(file_path, layer=layer_name, engine="pyogrio")
+                        df = pd.DataFrame(gdf).drop(columns=['geometry'], errors='ignore')
+                        if len(df) == 0:
+                            print(f"   ⚠️ 图层 [{layer_name}] 为空或无有效台账，跳过。")
+                            continue
+                        all_layers_data[layer_name] = self._process_single_dataframe(df)
+                    except Exception as e:
+                        print(f"   ❌ 解析图层 [{layer_name}] 失败，跳过该层。错误: {e}")
+            except Exception as e:
+                raise ValueError(f"❌ 严重错误：无法解析文件 {file_path}。核心报错: {e}")
+                    
+        torch.save(all_layers_data, cache_path)
+        print(f"✅ 编译完成！共收录 {len(all_layers_data)} 个有效图层，张量缓存已保存至 {cache_path}")
+        return all_layers_data
+
+if __name__ == "__main__":
+    print("=== data_loader.py 全自动张量化流水线启动 ===")
+    pump = NRE_DataPump()
+    
+    RAW_DATA_DIR = "./raw_data"
+    if not os.path.exists(RAW_DATA_DIR):
+        os.makedirs(RAW_DATA_DIR)
         
-    # 分类 ID 除以 100.0，进一步平滑 512 维特征空间
-    cat_data = (np.stack(cat_list, axis=1) / 100.0).astype(np.float32)
-
-    data_dict = {
-        'cont_norm': cont_norm, 'cont_int': cont_int, 'cont_frac': cont_frac,
-        'cat_data': cat_data, 'raw_64': raw_64,
-        'cat_cardinalities': [len(np.unique(c)) for c in cat_list],
-        'cont_names': continuous_cols, 'cat_names': categorical_cols
-    }
+    DATA_SOURCES = []
+    for file_path in glob.glob(os.path.join(RAW_DATA_DIR, "*")):
+        if file_path.endswith('.csv') or file_path.endswith('.gdb'):
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            cache_name = f"cache_{base_name}.pt"
+            DATA_SOURCES.append({"file": file_path, "cache": cache_name})
+            
+    print(f"📦 共规划了 {len(DATA_SOURCES)} 个数据源的缓存生成任务。")
     
-    torch.save(data_dict, cache_path)
-    print(f"✅ 脱毒与压缩预编译完成，全新健康缓存已保存至 {cache_path}")
-    return data_dict
+    for source in DATA_SOURCES:
+        file_path = source["file"]
+        cache_path = source["cache"]
+        
+        if os.path.exists(cache_path):
+            print(f"⏩ 发现现有缓存 [{cache_path}]，为节省时间已跳过。如需重构请先删除原缓存。")
+            continue
+            
+        print(f"\n📂 正在切入数据源: [{file_path}]")
+        pump.build_cache(file_path, cache_path)
