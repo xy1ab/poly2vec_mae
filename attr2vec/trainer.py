@@ -35,9 +35,9 @@ def load_all_caches(cache_files, is_master):
 def train():
     local_rank = setup_ddp(); is_master = (dist.get_rank() == 0)
     
-    # 🌟 修复梯度震荡：1000轮 / 2048批次 / 安全学习率 1.2e-4 / 50轮热身
+    # 🌟 核心防震荡与防OOM参数
     config = {'vocab_size': 20000}
-    batch_size, epochs, base_lr, warmup_epochs = 2048, 1000, 1.2e-4, 50
+    batch_size, epochs, base_lr, warmup_epochs = 1024, 1000, 1.2e-4, 50
     
     model = DDP(NaturalResourceFoundationModel(config).cuda(local_rank), device_ids=[local_rank], find_unused_parameters=False)
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05)
@@ -81,7 +81,9 @@ def train():
                 save_visuals(history)
                 with open("train_history.json", "w") as f: json.dump(history, f)
             if avg_loss < best_loss:
-                best_loss = avg_loss; torch.save(model.module.state_dict(), "best_model_v1_01b.pth")
+                best_loss = avg_loss; 
+                # 🌟 统一保存名，与流水线无缝衔接
+                torch.save(model.module.state_dict(), "best_model.pth")
             print(f"📈 Ep {epoch+1:04d}/1000 | Loss: {avg_loss:.6f} | LR: {curr_lr:.2e} | T: {time.time()-start_time:.1f}s")
 
     dist.destroy_process_group()

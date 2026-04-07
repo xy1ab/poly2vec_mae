@@ -13,7 +13,7 @@ class SimpleCouplingLayer(nn.Module):
         else: return torch.cat([x1, x2 - self.t(x1)], dim=1)
 
 class InvertibleNetwork(nn.Module):
-    def __init__(self, dim=256, num_layers=6):
+    def __init__(self, dim=256, num_layers=12): 
         super().__init__()
         self.layers = nn.ModuleList([SimpleCouplingLayer(dim) for _ in range(num_layers)])
     def forward(self, x, reverse=False):
@@ -22,7 +22,7 @@ class InvertibleNetwork(nn.Module):
         return x
 
 class PhysicalTokenizer(nn.Module):
-    def __init__(self, embed_dim=64):
+    def __init__(self, embed_dim=768):
         super().__init__()
         self.proj = nn.Linear(1, embed_dim)
     def forward(self, x): return self.proj(x.unsqueeze(-1))
@@ -31,96 +31,57 @@ class NaturalResourceFoundationModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.truth_dim, self.semantic_dim = config.get('truth_dim', 256), config.get('semantic_dim', 256)
-        self.embed_dim, self.mask_ratio = config.get('embed_dim', 64), config.get('mask_ratio', 0.20)
-        self.vocab_size = config.get('vocab_size', 20000) # 🌟 扩容词表至 20000
+        self.truth_dim, self.semantic_dim = 256, 256
+        self.embed_dim = 768 
+        self.vocab_size = config.get('vocab_size', 20000)
+        self.mask_ratio = 0.20
         
-        self.inn_core = InvertibleNetwork(dim=self.truth_dim, num_layers=6)
+        self.inn_core = InvertibleNetwork(dim=self.truth_dim, num_layers=12)
         self.phys_tokenizer = PhysicalTokenizer(self.embed_dim)
         self.sem_embedding = nn.Embedding(self.vocab_size, self.embed_dim, padding_idx=0)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         nn.init.normal_(self.mask_token, std=0.02)
         
-        encoder_layer = nn.TransformerEncoderLayer(d_model=self.embed_dim, nhead=4, batch_first=True, activation='gelu')
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.embed_dim, nhead=12, batch_first=True, activation='gelu')
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=12)
         self.to_semantic = nn.Sequential(nn.Linear(self.embed_dim, self.semantic_dim), nn.LayerNorm(self.semantic_dim), nn.Tanh())
         
         self.head_cont = nn.Linear(self.embed_dim, 1)
         self.head_word = nn.Linear(self.embed_dim, self.vocab_size)
 
-    def forward(self, cont_int, cont_f_hi, cont_f_lo, cont_norm, word_data, char_data):
-        device = cont_int.device
-        B = cont_int.shape[0] if cont_int.shape[1] > 0 else (word_data.shape[0] if word_data.shape[1] > 0 else char_data.shape[0])
-        
+    def forward(self, cont_int, cont_frac_hi, cont_frac_lo, cont_norm, word_data, char_data):
+        device = cont_int.device; B = cont_int.shape[0]
         char_flat = char_data.reshape(B, -1) if char_data.shape[1] > 0 else torch.zeros(B, 0, device=device)
-        x_real = torch.cat([cont_int, cont_f_hi, cont_f_lo, word_data.float(), char_flat.float()], dim=1)
+        x_real = torch.cat([cont_int, cont_frac_hi, cont_frac_lo, word_data.float(), char_flat.float()], dim=1)
         x_padded = F.pad(x_real, (0, self.truth_dim - x_real.shape[1]), "constant", 0)
         v_attr = self.inn_core(x_padded)
 
-        tokens_to_mask, all_tokens = [], []
-        L_cont, L_word = 0, 0
-        
+        # 🌟 核心防爆盾：强制限制解码 ID 范围
+        def safe_idx(x):
+            return torch.clamp(torch.round(x * 16384.0).long(), 0, self.vocab_size - 1)
+
+        tokens_to_mask = []; L_cont, L_word = 0, 0
         if cont_norm.shape[1] > 0:
-            t = self.phys_tokenizer(cont_norm)
-            tokens_to_mask.append(t)
-            L_cont = t.shape[1]
-            
+            t = self.phys_tokenizer(cont_norm); tokens_to_mask.append(t); L_cont = t.shape[1]
         if word_data.shape[1] > 0:
-            w = self.sem_embedding(torch.round(word_data * 16384.0).long())
-            tokens_to_mask.append(w)
-            L_word = w.shape[1]
+            w = self.sem_embedding(safe_idx(word_data)); tokens_to_mask.append(w); L_word = w.shape[1]
         
         x_maskable = torch.cat(tokens_to_mask, dim=1) if tokens_to_mask else None
         mae_loss = sum(p.sum() * 0 for p in self.parameters())
-        mask = None
-        
-        if x_maskable is not None and self.training and self.mask_ratio > 0:
-            L_maskable = x_maskable.shape[1]
-            mask = (torch.rand(B, L_maskable, device=device) < self.mask_ratio).bool()
-            x_masked = x_maskable.clone()
-            x_masked[mask] = self.mask_token.expand(B, L_maskable, -1)[mask]
-        else: 
-            x_masked = x_maskable
-            
-        if x_masked is not None: all_tokens.append(x_masked)
-        if char_data.shape[1] > 0:
-            all_tokens.append(self.sem_embedding(torch.round(char_data * 16384.0).long()).mean(dim=2))
-        
-        x_final = torch.cat(all_tokens, dim=1) if all_tokens else torch.zeros(B, 0, self.embed_dim, device=device)
-        
-        if x_final.shape[1] > 0:
-            h = self.transformer(x_final)
-            v_semantic = self.to_semantic(h.mean(dim=1))
-            if mask is not None:
-                start = 0
-                if L_cont > 0:
-                    m = mask[:, :L_cont]
-                    if m.any():
-                        # 🌟 显存拯救：仅提取有掩码的部分送入投影头
-                        h_cont_masked = h[:, :L_cont][m]
-                        preds = self.head_cont(h_cont_masked).squeeze(-1)
-                        targets = cont_norm[m] 
-                        mae_loss += F.mse_loss(preds, targets)
-                    start = L_cont
-                if L_word > 0:
-                    m = mask[:, start:start+L_word]
-                    if m.any():
-                        # 🌟 显存拯救：仅过滤出被遮挡的词去算 20000 维分类，暴省 80% 显存
-                        h_word_masked = h[:, start:start+L_word][m]
-                        preds = self.head_word(h_word_masked)
-                        targets = torch.round(word_data * 16384.0).long()[m]
-                        mae_loss += F.cross_entropy(preds, targets)
+        if x_maskable is not None and self.training:
+            L_m = x_maskable.shape[1]; mask = (torch.rand(B, L_m, device=device) < self.mask_ratio).bool()
+            x_masked = x_maskable.clone(); x_masked[mask] = self.mask_token.expand(B, L_m, -1)[mask]
+            all_tokens = [x_masked]
+            if char_data.shape[1] > 0: all_tokens.append(self.sem_embedding(safe_idx(char_data)).mean(dim=2))
+            h = self.transformer(torch.cat(all_tokens, dim=1)); v_semantic = self.to_semantic(h.mean(dim=1))
+            m_cont = mask[:, :L_cont]
+            if m_cont.any(): mae_loss += F.mse_loss(self.head_cont(h[:, :L_cont][m_cont]).squeeze(-1), cont_norm[m_cont])
+            m_word = mask[:, L_cont:L_cont+L_word]
+            if m_word.any(): mae_loss += F.cross_entropy(self.head_word(h[:, L_cont:L_cont+L_word][m_word]), safe_idx(word_data)[m_word])
         else: v_semantic = torch.zeros(B, self.semantic_dim, device=device)
             
         return torch.cat([v_attr, v_semantic], dim=1), mae_loss
 
-    # 🌟 解封长度限制：要求必须传入 max_seq_len，不再默认截断
-    def decode_physical(self, v_attr, num_cont, num_word, num_char, max_seq_len):
-        dec = self.inn_core(v_attr, reverse=True)
-        c_exp = dec[:, :num_cont]; c_hi = dec[:, num_cont:2*num_cont]; c_lo = dec[:, 2*num_cont:3*num_cont]
-        w_sc = dec[:, 3*num_cont:3*num_cont+num_word]
-        ch_sc = dec[:, 3*num_cont+num_word:3*num_cont+num_word+num_char*max_seq_len]
-        dec_cont = torch.ldexp(c_hi.double() + c_lo.double(), torch.round(c_exp).int())
-        dec_word = torch.round(w_sc * 16384.0).long()
-        dec_char = torch.round(ch_sc * 16384.0).long().reshape(-1, num_char, max_seq_len) if num_char > 0 else torch.zeros((v_attr.shape[0], 0, max_seq_len), dtype=torch.long, device=v_attr.device)
-        return dec_cont, dec_word, dec_char
+    def decode_physical(self, v_attr):
+        """物理保真轨道：全量无损逆向解码"""
+        return self.inn_core(v_attr, reverse=True)
