@@ -72,7 +72,7 @@ def main():
     print("🤖 模型加载完毕，开始进行数据分析...\n" + "="*50)
 
     # 4. 随机抽取测试样本
-    num_samples = 4
+    num_samples = 128
     sample_indices = random.sample(range(len(test_set)), num_samples)
     
     fig, axes = plt.subplots(num_samples, 4, figsize=(22, 6 * num_samples))
@@ -90,9 +90,11 @@ def main():
             x, y = test_set[idx]
             
             # 推理
+            t_s = time.time()
             with torch.no_grad():
                 pred = model(x.unsqueeze(0).to(device))
-                
+            t_d = time.time()
+            print("128 time", t_d - t_s)   
             # 转换为 numpy
             img_blur = x[0].numpy()  # 通道 1: 空间模糊图
             img_mag = x[1].numpy()   # 通道 2: 频率幅值
