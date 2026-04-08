@@ -40,6 +40,7 @@ def _build_training_args(**overrides):
         "vq_dead_code_threshold": 1.0,
         "vq_init_max_vectors": 1024,
         "vq_kmeans_iters": 3,
+        "vq_restart_pool_size_per_rank": 128,
     }
     payload.update(overrides)
     return SimpleNamespace(**payload)

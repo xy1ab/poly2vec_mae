@@ -62,6 +62,17 @@ class VqAeForwardContractTest(unittest.TestCase):
         self.assertTrue(torch.allclose(phase_norm, torch.ones_like(phase_norm), atol=1e-5, rtol=1e-5))
         self.assertTrue(outputs.using_vq)
 
+    def test_tokenize_matches_forward_indices_without_running_decoder_logic(self) -> None:
+        """Tokenizer API should emit the same discrete grid as the VQ forward path."""
+        model = _build_small_model()
+        imgs = torch.randn(2, 3, 8, 8)
+
+        token_grid = model.tokenize(imgs)
+        outputs = model(imgs, use_vq=True)
+
+        self.assertEqual(token_grid.shape, (2, 4, 4))
+        self.assertTrue(torch.equal(token_grid, outputs.indices))
+
     def test_decode_indices_restores_full_resolution_images(self) -> None:
         """Decoding indices should return one reconstructed image per sample."""
         model = _build_small_model()

@@ -1,21 +1,15 @@
 """EMA vector-quantization modules for polygon VQAE pretraining.
 
-This file intentionally keeps the implementation self-contained and explicit.
-The quantizer is used after the encoder latent grid projection:
+This module intentionally keeps model-side quantization logic pure-local:
 
 1. Flatten one `[B, C, H, W]` latent grid into `[N, C]`.
 2. Find the nearest codebook vector for each latent vector with fp32 distance.
 3. Use a straight-through estimator for the quantized output.
-4. Update the codebook with EMA statistics.
+4. Return local usage statistics needed by the trainer.
 
-The codebook initialization follows an engineering-oriented mini-batch K-means:
-1. Randomly sample vectors from the continuous warmup latent pool.
-2. Run a small number of chunked assignment/update iterations on GPU.
-3. Use the resulting cluster centers as the initial codebook.
-
-This is intentionally lighter than a full exact K-means over the entire
-training set, while still providing a much better initialization than pure
-random codebook vectors.
+Distributed synchronization, EMA aggregation, and dead-code restart broadcast
+are handled by the trainer so rank-local inference and visualization paths can
+never accidentally trigger hidden collectives.
 """
 
 from __future__ import annotations
@@ -24,7 +18,6 @@ from dataclasses import dataclass
 import math
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -38,6 +31,9 @@ class QuantizerOutput:
     vq_loss: torch.Tensor
     perplexity: torch.Tensor
     active_codes: torch.Tensor
+    usage_counts: torch.Tensor | None = None
+    embed_sum: torch.Tensor | None = None
+    restart_candidates: torch.Tensor | None = None
 
 
 class EMAVectorQuantizer(nn.Module):
@@ -95,37 +91,6 @@ class EMAVectorQuantizer(nn.Module):
         """Whether the codebook has been initialized from latent data."""
         return bool(self.initialized.item())
 
-    @staticmethod
-    def _dist_enabled() -> bool:
-        """Whether distributed collectives are currently available."""
-        return dist.is_available() and dist.is_initialized()
-
-    @classmethod
-    def _is_main_rank(cls) -> bool:
-        """Whether current process is rank 0 under distributed execution."""
-        return not cls._dist_enabled() or dist.get_rank() == 0
-
-    @classmethod
-    def _all_reduce_in_place(cls, tensor: torch.Tensor) -> torch.Tensor:
-        """All-reduce one tensor in place when distributed execution is enabled."""
-        if cls._dist_enabled():
-            dist.all_reduce(tensor)
-        return tensor
-
-    @classmethod
-    def _broadcast_in_place(cls, tensor: torch.Tensor) -> torch.Tensor:
-        """Broadcast one tensor from rank 0 when distributed execution is enabled."""
-        if cls._dist_enabled():
-            dist.broadcast(tensor, src=0)
-        return tensor
-
-    def _broadcast_state_from_rank0(self) -> None:
-        """Synchronize EMA buffers after one rank-only dead-code restart."""
-        self._broadcast_in_place(self.codebook)
-        self._broadcast_in_place(self.cluster_size)
-        self._broadcast_in_place(self.embed_avg)
-        self._broadcast_in_place(self.initialized)
-
     def _flatten(self, z: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
         """Flatten `[B,C,H,W]` latent grids into `[N,C]` vectors."""
         if z.ndim != 4:
@@ -157,26 +122,52 @@ class EMAVectorQuantizer(nn.Module):
             index_chunks.append(torch.argmin(distances, dim=1))
         return torch.cat(index_chunks, dim=0)
 
-    @torch.no_grad()
-    def _restart_dead_codes(self, vectors: torch.Tensor) -> bool:
-        """Restart dead codes from current batch latent vectors.
+    @staticmethod
+    def compute_usage_metrics(usage_counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute perplexity and active-code count from one usage histogram."""
+        usage_counts = usage_counts.float()
+        usage_probs = usage_counts / usage_counts.sum().clamp_min(1.0)
+        perplexity = torch.exp(-(usage_probs * torch.log(usage_probs.clamp_min(1.0e-10))).sum())
+        active_codes = (usage_counts > 0).sum().float()
+        return perplexity, active_codes
 
-        Returns:
-            Whether any dead-code restart was actually performed.
-        """
+    @torch.no_grad()
+    def _build_embed_sum(self, vectors: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """Build one local embedding-sum tensor indexed by chosen code ids."""
+        embed_sum = torch.zeros_like(self.embed_avg)
+        embed_sum.index_add_(0, indices, vectors.float())
+        return embed_sum
+
+    @torch.no_grad()
+    def sample_restart_candidates(self, vectors: torch.Tensor, max_vectors: int) -> torch.Tensor:
+        """Sample one bounded local candidate pool for dead-code restart."""
+        max_vectors = max(0, int(max_vectors))
+        if max_vectors == 0 or vectors.numel() == 0:
+            return vectors.new_zeros((0, self.embedding_dim), dtype=torch.float32)
+
+        sample_count = min(max_vectors, int(vectors.shape[0]))
+        perm = torch.randperm(vectors.shape[0], device=vectors.device)[:sample_count]
+        return vectors[perm].float()
+
+    @torch.no_grad()
+    def restart_dead_codes(self, replacement_vectors: torch.Tensor) -> bool:
+        """Restart dead codes from one already-aggregated replacement pool."""
         if self.dead_code_threshold <= 0:
             return False
 
         dead_mask = self.cluster_size < self.dead_code_threshold
         dead_count = int(dead_mask.sum().item())
-        if dead_count == 0 or vectors.numel() == 0:
+        if dead_count == 0 or replacement_vectors.numel() == 0:
             return False
 
-        sample_count = min(dead_count, vectors.shape[0])
-        perm = torch.randperm(vectors.shape[0], device=vectors.device)[:sample_count]
-        replacements = vectors[perm].float()
+        sample_count = min(dead_count, int(replacement_vectors.shape[0]))
+        if sample_count <= 0:
+            return False
+
+        perm = torch.randperm(replacement_vectors.shape[0], device=replacement_vectors.device)[:sample_count]
+        replacements = replacement_vectors[perm].float()
         if sample_count < dead_count:
-            extra_perm = torch.randint(0, sample_count, (dead_count - sample_count,), device=vectors.device)
+            extra_perm = torch.randint(0, sample_count, (dead_count - sample_count,), device=replacement_vectors.device)
             replacements = torch.cat([replacements, replacements[extra_perm]], dim=0)
 
         dead_indices = torch.nonzero(dead_mask, as_tuple=False).flatten()
@@ -184,6 +175,35 @@ class EMAVectorQuantizer(nn.Module):
         self.embed_avg[dead_indices] = replacements
         self.cluster_size[dead_indices] = 1.0
         return True
+
+    @torch.no_grad()
+    def apply_ema_update(self, usage_counts: torch.Tensor, embed_sum: torch.Tensor) -> None:
+        """Apply one EMA codebook update from already-aggregated global stats."""
+        if usage_counts.shape != self.cluster_size.shape:
+            raise ValueError(
+                "Global usage-count shape mismatch: "
+                f"expected {tuple(self.cluster_size.shape)}, got {tuple(usage_counts.shape)}"
+            )
+        if embed_sum.shape != self.embed_avg.shape:
+            raise ValueError(
+                "Global embed-sum shape mismatch: "
+                f"expected {tuple(self.embed_avg.shape)}, got {tuple(embed_sum.shape)}"
+            )
+
+        usage_counts = usage_counts.float()
+        embed_sum = embed_sum.float()
+
+        self.cluster_size.mul_(self.decay).add_(usage_counts, alpha=1.0 - self.decay)
+        self.embed_avg.mul_(self.decay).add_(embed_sum, alpha=1.0 - self.decay)
+
+        total_count = self.cluster_size.sum()
+        normalized_cluster_size = (
+            (self.cluster_size + self.eps)
+            / (total_count + self.num_embeddings * self.eps)
+            * total_count.clamp_min(1.0)
+        )
+        self.codebook.copy_(self.embed_avg / normalized_cluster_size.unsqueeze(1))
+        self.initialized.fill_(True)
 
     @torch.no_grad()
     def initialize_codebook(self, vectors: torch.Tensor, num_iters: int = 10) -> None:
@@ -246,6 +266,15 @@ class EMAVectorQuantizer(nn.Module):
         self.initialized.fill_(True)
 
     @torch.no_grad()
+    def encode_indices(self, z: torch.Tensor) -> torch.Tensor:
+        """Encode one latent grid `[B,C,H,W]` into discrete code indices `[B,H,W]`."""
+        vectors, (batch, _channels, height, width) = self._flatten(z)
+        if not self.is_initialized:
+            self.initialize_codebook(vectors, num_iters=1)
+        indices = self._nearest_indices(vectors)
+        return indices.reshape(batch, height, width)
+
+    @torch.no_grad()
     def lookup_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Map code indices `[B,H,W]` back to quantized code vectors `[B,C,H,W]`."""
         if indices.ndim != 3:
@@ -255,8 +284,8 @@ class EMAVectorQuantizer(nn.Module):
         quantized = self.codebook.index_select(0, flat_indices)
         return quantized.reshape(batch, height, width, self.embedding_dim).permute(0, 3, 1, 2).contiguous()
 
-    def forward(self, z: torch.Tensor) -> QuantizerOutput:
-        """Quantize one latent grid and update the EMA codebook during training."""
+    def forward(self, z: torch.Tensor, restart_pool_size: int = 0) -> QuantizerOutput:
+        """Quantize one latent grid and emit local stats for trainer-side sync."""
         vectors, (batch, channels, height, width) = self._flatten(z)
         if not self.is_initialized:
             self.initialize_codebook(vectors, num_iters=1)
@@ -270,37 +299,14 @@ class EMAVectorQuantizer(nn.Module):
 
         with torch.no_grad():
             usage_counts = torch.bincount(indices, minlength=self.num_embeddings).float()
-            self._all_reduce_in_place(usage_counts)
-            usage_probs = usage_counts / usage_counts.sum().clamp_min(1.0)
-            perplexity = torch.exp(-(usage_probs * torch.log(usage_probs.clamp_min(1.0e-10))).sum())
-            active_codes = (usage_counts > 0).sum().float()
+            perplexity, active_codes = self.compute_usage_metrics(usage_counts)
 
+            embed_sum = None
+            restart_candidates = None
             if self.training:
-                embed_sum = torch.zeros_like(self.embed_avg)
-                embed_sum.index_add_(0, indices, vectors.float())
-                self._all_reduce_in_place(embed_sum)
-
-                self.cluster_size.mul_(self.decay).add_(usage_counts, alpha=1.0 - self.decay)
-                self.embed_avg.mul_(self.decay).add_(embed_sum, alpha=1.0 - self.decay)
-
-                total_count = self.cluster_size.sum()
-                normalized_cluster_size = (
-                    (self.cluster_size + self.eps)
-                    / (total_count + self.num_embeddings * self.eps)
-                    * total_count.clamp_min(1.0)
-                )
-                self.codebook.copy_(self.embed_avg / normalized_cluster_size.unsqueeze(1))
-                restarted_dead_codes = False
-                if self._is_main_rank():
-                    restarted_dead_codes = self._restart_dead_codes(vectors)
-                restart_flag = torch.tensor(
-                    int(restarted_dead_codes),
-                    device=vectors.device,
-                    dtype=torch.int32,
-                )
-                self._broadcast_in_place(restart_flag)
-                if bool(restart_flag.item()):
-                    self._broadcast_state_from_rank0()
+                embed_sum = self._build_embed_sum(vectors, indices)
+                if self.dead_code_threshold > 0 and int(restart_pool_size) > 0:
+                    restart_candidates = self.sample_restart_candidates(vectors, max_vectors=restart_pool_size)
 
         return QuantizerOutput(
             quantized=quantized_st,
@@ -308,4 +314,7 @@ class EMAVectorQuantizer(nn.Module):
             vq_loss=vq_loss,
             perplexity=perplexity,
             active_codes=active_codes,
+            usage_counts=usage_counts,
+            embed_sum=embed_sum,
+            restart_candidates=restart_candidates,
         )
