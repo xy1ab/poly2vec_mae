@@ -43,7 +43,7 @@ deterministic: false
 # 损失项权重
 # =========================
 # 幅值主损失的权重。增大会让模型更优先拟合 magnitude。
-weight_mag: 1.0
+weight_mag: 5.0
 # 幅值高频加权项的强度。增大通常有助于恢复高频细节，但也更容易放大量化噪声。
 weight_mag_hf: 1.0
 # 相位损失的权重。增大会更强调边界与细纹理重建。
@@ -113,11 +113,11 @@ decoder_stage_channels: "256,192,128"
 # - none: 不使用 attention；
 # - window: 使用窗口注意力；
 # - global: 使用全局注意力。
-decoder_attention_type: none
+decoder_attention_type: global
 # 各解码 stage 的注意力头数，长度需与 stage 数匹配。
-decoder_attention_heads: "8,4,4"
+decoder_attention_heads: "4,4,4"
 # 各解码 stage 的 attention block 数。设为 0 时该 stage 退化为 conv-only。
-decoder_attention_depths: "0,0,0"
+decoder_attention_depths: "4,0,0"
 # 各解码 stage 的卷积细化 block 数。一般越靠近输出端越重要。
 decoder_conv_depths: "3,2,2"
 # 窗口注意力的窗口大小，仅在 `decoder_attention_type=window` 时生效。
