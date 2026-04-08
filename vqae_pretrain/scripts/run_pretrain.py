@@ -288,6 +288,33 @@ def _run_torchrun_with_signal_guard(cmd: list[str], env: dict[str, str]) -> int:
         signal.signal(signal.SIGTERM, old_sigterm)
 
 
+def _build_torchrun_cmd(
+    *,
+    script_path: Path,
+    nproc_per_node: int,
+    master_port: int | None,
+) -> list[str]:
+    """Build one single-node torchrun command for local DDP auto-spawn.
+
+    When `master_port` is omitted, the launcher uses `--standalone` so torchrun
+    creates its local TCP store on a free port instead of the default static
+    rendezvous port `29500`.
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node",
+        str(nproc_per_node),
+    ]
+    if master_port is not None:
+        cmd.extend(["--master_port", str(master_port)])
+    else:
+        cmd.append("--standalone")
+    cmd.append(str(script_path.resolve()))
+    return cmd
+
+
 def main() -> None:
     """CLI main function for VQAE pretraining launch."""
     ensure_cuda_runtime_libs()
@@ -370,16 +397,11 @@ def main() -> None:
 
     if len(gpu_list) > 1 and "LOCAL_RANK" not in os.environ and not pre_args.no_auto_spawn and cuda_available:
         visible_gpu_csv = _normalize_gpu_csv(gpu_list)
-        cmd = [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--nproc_per_node",
-            str(len(gpu_list)),
-        ]
-        if pre_args.master_port is not None:
-            cmd.extend(["--master_port", str(pre_args.master_port)])
-        cmd.append(str(Path(__file__).resolve()))
+        cmd = _build_torchrun_cmd(
+            script_path=Path(__file__).resolve(),
+            nproc_per_node=len(gpu_list),
+            master_port=pre_args.master_port,
+        )
         if resolved_resume_dir is not None:
             cmd.extend(["--resume_dir", str(resolved_resume_dir)])
         else:

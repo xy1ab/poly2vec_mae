@@ -25,7 +25,7 @@ save_dir: ./outputs/ckpt
 # 运行环境
 # =========================
 # 使用的 CUDA 设备列表。单卡时写 `"0"`，多卡时写如 `"0,1,2,3"`。
-gpu: "0"
+gpu: "0,1,2,3,4,5,6,7"
 # DataLoader worker 数。增大通常能提升吞吐，但也会增加 CPU/内存压力。
 num_workers: 4
 
@@ -87,7 +87,7 @@ icft_spatial_chunk_size: 256
 stem_channels: "64,128,256"
 # Conv stem 各 stage 的 stride，使用逗号分隔；其乘积隐式决定 latent stride。
 # 输入频域图会自动 padding 到该总 stride 的整数倍，不再依赖 patch 对齐。
-stem_strides: "2,2,2"
+stem_strides: "2,2,1"
 # ViT 主干的 token/channel 维度，也是 encoder latent 的主工作维度。
 embed_dim: 256
 # ViT block 层数。增大可提升表达能力，但会增加算力和显存开销。
@@ -159,9 +159,9 @@ vq_kmeans_iters: 10
 # 训练总 epoch 数。总训练时长约由它与数据规模、batch size 共同决定。
 epochs: 300
 # 训练 batch 大小。增大可提升吞吐，但也会增加 GPU 显存压力。
-batch_size: 256
+batch_size: 64
 # 基础学习率。实际训练中会先经过 warmup 再进入余弦退火。
-lr: 1.5e-4
+lr: 3.0e-4
 # AdamW 的权重衰减系数。增大可增强正则化，但过大可能损伤重建细节。
 weight_decay: 0.05
 # 每条样本的在线增强重复次数。训练集虚拟长度会乘以该值。
