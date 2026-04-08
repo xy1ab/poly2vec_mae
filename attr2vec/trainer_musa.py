@@ -33,18 +33,41 @@ def load_all_caches(cache_files, is_master):
             all_layers_data.update(data)
     return all_layers_data
 
+import argparse
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for batch forward export."""
+    parser = argparse.ArgumentParser(
+        description="Batch forward triangulated polygon shards into embeddings and MAE frequency maps."
+    )
+    parser.add_argument("--cache_dir", type=str, required=True, help="")
+    parser.add_argument("--vocab_size", type=int, default=20000, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--lr", type=float, default=1.2e-4, help="")
+    parser.add_argument("--batch_size", type=int, default=1024, help="")
+    parser.add_argument("--epochs", type=int, default=1000, help="")
+    parser.add_argument("--warmup_epochs", type=int, default=50, help="")
+    return parser
+
 def train():
+    args = build_arg_parser().parse_args()
+
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
     local_rank = setup_ddp(); is_master = (dist.get_rank() == 0)
     
-    config = {'vocab_size': 20000}
-    batch_size, epochs, base_lr, warmup_epochs = 1024, 1000, 1.2e-4, 50
+    vocab_size = args.vocab_size
+    batch_size = args.batch_size
+    epochs = args.epochs
+    base_lr = args.lr
+    warmup_epochs = args.warmup_epochs
+
     
-    model = DDP(NaturalResourceFoundationModel(config).musa(local_rank), device_ids=[local_rank], find_unused_parameters=False)
+    model = DDP(NaturalResourceFoundationModel(vocab_size).musa(local_rank), device_ids=[local_rank], find_unused_parameters=False)
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
     scaler = GradScaler('musa')
 
-    cache_files = glob.glob("cache_*.pt")
+    cache_files = glob.glob(os.path.join(args.cache_dir, "cache_*.pt"))
     if is_master: 
         print(f"🧲 共发现 {len(cache_files)} 个张量缓存文件，准备汇入训练池...")
 
@@ -83,10 +106,10 @@ def train():
             history["loss"].append(avg_loss); history["lr"].append(curr_lr)
             if (epoch + 1) % 5 == 0:
                 save_visuals(history)
-                with open("train_history.json", "w") as f: json.dump(history, f)
+                with open(os.path.join(args.output_dir,"train_history.json"), "w") as f: json.dump(history, f)
             if avg_loss < best_loss:
                 best_loss = avg_loss; 
-                torch.save(model.module.state_dict(), "best_model.pth")
+                torch.save(model.module.state_dict(), os.path.join(args.output_dir,"best_model.pth"))
             print(f"📈 Ep {epoch+1:04d}/{epochs} | Loss: {avg_loss:.6f} | LR: {curr_lr:.2e} | T: {time.time()-start_time:.1f}s")
 
     dist.destroy_process_group()

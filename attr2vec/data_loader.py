@@ -140,15 +140,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Batch forward triangulated polygon shards into embeddings and MAE frequency maps."
     )
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--vocal_path", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
     return parser
 
 if __name__ == "__main__":
     print("=== data_loader.py 全自动张量化流水线启动 ===")
-    pump = NRE_DataPump()
+
     
     args = build_arg_parser().parse_args()
-
+    pump = NRE_DataPump(args.vocal_path)
     RAW_DATA_DIR = args.data_dir
     output_dir = args.output_dir
     if not os.path.exists(output_dir):
