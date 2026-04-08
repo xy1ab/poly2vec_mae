@@ -122,7 +122,7 @@ class PolyEncoderPipeline:
         imgs = imgs.to(device=self.device, dtype=torch.float32)
         with autocast_context(self.device, self.precision):
             encoder_features = self.encoder(imgs)
-        return encoder_features[:, 0, :].float()
+        return encoder_features[:, :, :].float()
 
     @torch.no_grad()
     def triangles_to_embedding(self, triangles_list: Sequence[np.ndarray]) -> torch.Tensor:
@@ -255,7 +255,11 @@ class PolyMaeReconstructionPipeline:
         mask_map = mask_seq.reshape(batch_size, h_p, w_p, 1, 1).expand(-1, -1, -1, patch_size, patch_size)
         mask_map = mask_map.permute(0, 1, 3, 2, 4).reshape(batch_size, 1, h, w)
 
-        recon_imgs = imgs * (1 - mask_map) + pred_img * mask_map
+        loss_mode = str(self.config.get("loss_mode", "mask")).lower()
+        if loss_mode == "full":
+            recon_imgs = pred_img
+        else:
+            recon_imgs = imgs * (1 - mask_map) + pred_img * mask_map
         recon_valid = recon_imgs[:, :, : self.valid_h, : self.valid_w]
 
         mag_valid = recon_valid[:, 0, :, :]

@@ -133,11 +133,26 @@ class NRE_DataPump:
         print(f"✅ 编译完成！共收录 {len(all_layers_data)} 个有效图层，张量缓存已保存至 {cache_path}")
         return all_layers_data
 
+import argparse
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for batch forward export."""
+    parser = argparse.ArgumentParser(
+        description="Batch forward triangulated polygon shards into embeddings and MAE frequency maps."
+    )
+    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    return parser
+
 if __name__ == "__main__":
     print("=== data_loader.py 全自动张量化流水线启动 ===")
     pump = NRE_DataPump()
     
-    RAW_DATA_DIR = "./raw_data"
+    args = build_arg_parser().parse_args()
+
+    RAW_DATA_DIR = args.data_dir
+    output_dir = args.output_dir
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     if not os.path.exists(RAW_DATA_DIR):
         os.makedirs(RAW_DATA_DIR)
         
@@ -145,7 +160,7 @@ if __name__ == "__main__":
     for file_path in glob.glob(os.path.join(RAW_DATA_DIR, "*")):
         if file_path.endswith('.csv') or file_path.endswith('.gdb'):
             base_name = os.path.splitext(os.path.basename(file_path))[0]
-            cache_name = f"cache_{base_name}.pt"
+            cache_name = os.path.join(output_dir, f"cache_{base_name}.pt")
             DATA_SOURCES.append({"file": file_path, "cache": cache_name})
             
     print(f"📦 共规划了 {len(DATA_SOURCES)} 个数据源的缓存生成任务。")

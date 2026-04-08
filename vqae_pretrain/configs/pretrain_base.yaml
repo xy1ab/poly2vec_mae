@@ -1,0 +1,184 @@
+# VQAE 预训练默认配置（polygon 版本）。
+# 该文件中的字段会直接映射到 `src/engine/trainer.py` 参数。
+
+# =========================
+# 任务与几何类型
+# =========================
+# 训练任务类型。当前项目固定为 `vqae`，主要用于运行时日志和配置落盘。
+train_type: vqae
+# 几何类型。当前实现主要支持 `polygon`，并据此选择对应的频域编码器。
+geom_type: polygon
+
+# =========================
+# 数据与输出路径
+# =========================
+# 训练数据目录。这里应指向由三角剖分脚本生成的 shard `.pt` 数据目录。
+data_dir: ./data/processed/hangzhou
+# 数据加载模式：
+# - eager: 启动时一次性把全部 shard 读入 host 内存，速度快但占用内存高；
+# - lazy: 运行时按需加载 shard，适合大数据集。
+load_mode: eager
+# 训练输出根目录。脚本会在其下自动创建带时间戳的 run 子目录。
+save_dir: ./outputs/ckpt
+
+# =========================
+# 运行环境
+# =========================
+# 使用的 CUDA 设备列表。单卡时写 `"0"`，多卡时写如 `"0,1,2,3"`。
+gpu: "0,1,2,3,4,5,6,7"
+# DataLoader worker 数。增大通常能提升吞吐，但也会增加 CPU/内存压力。
+num_workers: 4
+
+# =========================
+# 复现性
+# =========================
+# 全局随机种子，用于模型初始化、数据顺序和增强等随机过程。
+seed: 42
+# 训练/验证划分随机种子。单独保留该参数便于固定数据切分。
+split_seed: 42
+# 是否启用更严格的确定性模式。开启后更易复现，但可能降低速度。
+deterministic: false
+
+# =========================
+# 损失项权重
+# =========================
+# 幅值主损失的权重。增大会让模型更优先拟合 magnitude。
+weight_mag: 1.0
+# 幅值高频加权项的强度。增大通常有助于恢复高频细节，但也更容易放大量化噪声。
+weight_mag_hf: 1.0
+# 相位损失的权重。增大会更强调边界与细纹理重建。
+weight_phase: 1.0
+
+# =========================
+# 优化与 warmup
+# =========================
+# 验证集比例。其余样本用于训练。
+val_ratio: 0.05
+# 学习率 warmup 轮数。该 warmup 从训练开始即生效，可与 VQ warmup 重合。
+warmup_epochs: 10
+# VQ warmup 轮数。在这段时期内，模型完全按连续 AE 训练，不启用 quantizer。
+vq_warmup_epochs: 40
+# VQ beta warmup 轮数。它在 VQ warmup 结束后启动，并将 beta 从 0 线性增至 `vq_beta`。
+vq_beta_warmup_epochs: 10
+# 学习率调度的最小值。余弦退火后会逐步逼近该值。
+min_lr: 1.0e-6
+
+# =========================
+# Polygon 频域参数
+# =========================
+# 正频率上界。频域网格最终大小约为 `(2*pos_freqs+1, pos_freqs+1)`。
+pos_freqs: 63
+# 几何频率网格的最小频率，仅在 `freq_type=geometric` 时有意义。
+w_min: 0.1
+# 几何频率网格的最大频率。与 `w_min` 一起决定频率覆盖范围。
+w_max: 200.0
+# 频率采样方式。当前常用 `geometric`，更适合覆盖宽频段。
+freq_type: geometric
+# CFT 计算时按三角形分块的大小。减小可降低 GPU 峰值显存，但会变慢。
+cft_triangle_chunk_size: 256
+# ICFT 计算时按空间位置分块的大小。减小可降低 GPU 峰值显存，但会变慢。
+icft_spatial_chunk_size: 256
+
+# =========================
+# 编码器（Conv + ViT）
+# =========================
+# Conv stem 各 stage 的输出通道数，使用逗号分隔并按前到后排列。
+# 这些卷积层既负责局部建模，也共同决定 encoder 的空间下采样路径。
+stem_channels: "64,128,256"
+# Conv stem 各 stage 的 stride，使用逗号分隔；其乘积隐式决定 latent stride。
+# 输入频域图会自动 padding 到该总 stride 的整数倍，不再依赖 patch 对齐。
+stem_strides: "2,2,1"
+# ViT 主干的 token/channel 维度，也是 encoder latent 的主工作维度。
+embed_dim: 256
+# ViT block 层数。增大可提升表达能力，但会增加算力和显存开销。
+depth: 8
+# 多头注意力头数。通常需要与 `embed_dim` 搭配，保证每头维度不过小。
+num_heads: 4
+# Transformer 中 MLP 隐藏层扩张倍率。越大表达更强，但更耗显存。
+mlp_ratio: 4.0
+# 普通 dropout 概率。重建任务通常保持为 0 或很小。
+drop_rate: 0.0
+
+# =========================
+# 解码器（多 stage attention + conv）
+# =========================
+# 各解码 stage 的通道数，需与 encoder 下采样 stage 数量对齐。
+decoder_stage_channels: "256,192,128"
+# decoder 最终并不直接输出自由的 `Mag/Cos/Sin` 三通道，
+# 而是先输出两个 raw 通道 `(mag_raw, phase_raw)`，随后在模型内部映射为：
+# - `mag = softplus(mag_raw)`，保证幅值非负；
+# - `cos = cos(phase_raw)`、`sin = sin(phase_raw)`，保证相位位于单位圆上。
+# 这样可显式施加频域输出的物理约束，减少非法 `cos/sin` 组合。
+# 解码器注意力类型：
+# - none: 不使用 attention；
+# - window: 使用窗口注意力；
+# - global: 使用全局注意力。
+decoder_attention_type: none
+# 各解码 stage 的注意力头数，长度需与 stage 数匹配。
+decoder_attention_heads: "8,4,4"
+# 各解码 stage 的 attention block 数。设为 0 时该 stage 退化为 conv-only。
+decoder_attention_depths: "0,0,0"
+# 各解码 stage 的卷积细化 block 数。一般越靠近输出端越重要。
+decoder_conv_depths: "3,2,2"
+# 窗口注意力的窗口大小，仅在 `decoder_attention_type=window` 时生效。
+decoder_window_size: 8
+# 上采样方式。常用 `bilinear`，通常比反卷积更稳、更少棋盘伪影。
+decoder_upsample_mode: bilinear
+# 解码器 attention block 内 MLP 的扩张倍率。
+decoder_mlp_ratio: 4.0
+# 解码器内部普通 dropout 概率，重建任务中通常保持较小。
+decoder_drop_rate: 0.0
+
+# =========================
+# VQ 参数
+# =========================
+# 码本容量。越大表示离散表示越细，但越难训练，也更容易出现低利用率。
+codebook_size: 8192
+# 量化空间维度。通常建议小于等于 embed_dim，例如 embed_dim=256, code_dim=128。
+code_dim: 128
+# VQ commitment loss 的目标权重。过大会加重量化约束并放大量化噪声。
+vq_beta: 0.25
+# EMA 更新衰减系数。
+# 设置思路：
+# - 0.95 ~ 0.98: 更新更快，但波动更大；
+# - 0.99: 默认推荐，稳定性与适应速度较平衡；
+# - 0.995 ~ 0.999: 更稳，但需要更多训练 step 才能让 codebook 充分适应数据。
+vq_decay: 0.99
+# EMA 数值稳定项，用于 cluster_size 归一化时避免除零。
+vq_eps: 1.0e-5
+# 死码阈值；低于该 EMA 使用计数的 code 会被当前 batch 的 latent 特征重置。
+vq_dead_code_threshold: 1.0
+# VQ 初始化时最多采样多少个 latent 向量参与工程版 K-means。
+vq_init_max_vectors: 100000
+# 工程版 K-means 的迭代轮数。
+vq_kmeans_iters: 10
+
+# =========================
+# 训练超参数
+# =========================
+# 训练总 epoch 数。总训练时长约由它与数据规模、batch size 共同决定。
+epochs: 300
+# 训练 batch 大小。增大可提升吞吐，但也会增加 GPU 显存压力。
+batch_size: 64
+# 基础学习率。实际训练中会先经过 warmup 再进入余弦退火。
+lr: 3.0e-4
+# AdamW 的权重衰减系数。增大可增强正则化，但过大可能损伤重建细节。
+weight_decay: 0.05
+# 每条样本的在线增强重复次数。训练集虚拟长度会乘以该值。
+augment_times: 1
+
+# =========================
+# 精度策略
+# =========================
+# 训练时的计算精度。推荐优先试 `bf16`，兼顾速度和数值稳定性。
+precision: fp32
+# checkpoint 中浮点张量的保存精度。通常用 `fp32` 更稳妥。
+checkpoint_dtype: fp32
+
+# =========================
+# 保存与日志
+# =========================
+# 评测频率。每隔多少个 epoch 执行一次验证、可视化和 best/ckpt 更新。
+eval_every: 5
+# 训练时的 step 级日志打印间隔。
+log_interval: 50

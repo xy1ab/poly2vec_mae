@@ -1,0 +1,8 @@
+# VQAE 重建可视化默认配置（对应 `scripts/run_eval.py`）。
+
+row_index: 0
+data_dir: ./data/processed/hangzhou
+spatial_size: 256
+model_dir: ./outputs/ckpt/20260407_1200
+precision: bf16
+save_dir: ./outputs/eval

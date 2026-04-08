@@ -1,0 +1,11 @@
+# VQAE 导出默认配置（对应 `scripts/run_export.py`）。
+
+# 示例：
+# vqae_ckpt_path: ./outputs/ckpt/20260407_1200/best/vqae_best.pth
+# config_path: ./outputs/ckpt/20260407_1200/best/config.yaml
+# output_dir: ./outputs/exports/vqae_bundle
+
+vqae_ckpt_path: ""
+config_path: ""
+output_dir: ""
+precision: fp32

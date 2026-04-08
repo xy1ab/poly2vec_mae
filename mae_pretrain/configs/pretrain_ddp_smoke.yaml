@@ -42,6 +42,7 @@ batch_size: 1
 lr: 1.0e-3
 weight_decay: 0.05
 mask_ratio: 0.75
+loss_mode: full
 augment_times: 1
 
 precision: bf16

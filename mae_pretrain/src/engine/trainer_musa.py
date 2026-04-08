@@ -64,6 +64,7 @@ _RESUME_LOCKED_KEYS = {
     "geom_type",
     "data_dir",
     "data_path",
+    "loss_mode",
     "patch_size",
     "embed_dim",
     "depth",
@@ -284,6 +285,7 @@ def _build_model_config(args, img_size: tuple[int, int]) -> dict:
     """Build persisted model config dict for downstream reload."""
     return {
         "geom_type": args.geom_type,
+        "loss_mode": args.loss_mode,
         "img_size": img_size,
         "patch_size": args.patch_size,
         "in_chans": 3,
@@ -375,6 +377,8 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
     if args.patch_size <= 0:
         raise ValueError(f"`patch_size` must be > 0, got {args.patch_size}")
+    if args.loss_mode not in {"mask", "full"}:
+        raise ValueError(f"`loss_mode` must be 'mask' or 'full', got {args.loss_mode!r}")
     MaskedAutoencoderViTPoly._validate_mask_ratio(args.mask_ratio)
     if not (0.0 < float(args.val_ratio) < 1.0):
         raise ValueError(f"`val_ratio` must be in (0, 1), got {args.val_ratio}")
@@ -728,6 +732,7 @@ def train_main(args) -> None:
             f"rank={dist_ctx.rank}, local_rank={dist_ctx.local_rank}, device={device}, "
             f"MUSA_VISIBLE_DEVICES={os.environ.get('MUSA_VISIBLE_DEVICES', '<unset>')}"
         )
+        print(f"[INFO] Loss mode      : {args.loss_mode}")
         print(f"[INFO] Eval frequency  : every {args.eval_every} epoch(s)")
         if args.resume_dir:
             print(f"[INFO] Resume mode    : dir={args.resume_dir}, checkpoint={resume_path}")
@@ -753,6 +758,8 @@ def train_main(args) -> None:
 
     run_config = dict(vars(args))
     if is_main_process(dist_ctx):
+        print(f"[INFO] CFT tri chunk   : {converter.triangle_chunk_size}")
+        print(f"[INFO] ICFT spatial chunk: {converter.icft_spatial_chunk_size}")
         _sync_run_metadata(best_dir=best_dir, ckpt_dir=ckpt_dir, run_config=run_config, model_config=model_config)
 
     freq_span_patches = compute_freq_span_patches(converter, args.patch_size, device=device)
@@ -871,6 +878,7 @@ def train_main(args) -> None:
                     patch_size=args.patch_size,
                     freq_span_patches=freq_span_patches,
                     weight_mag_hf=args.weight_mag_hf,
+                    loss_mode=args.loss_mode,
                 )
                 loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
                 if not bool(torch.isfinite(loss).item()):
@@ -949,6 +957,7 @@ def train_main(args) -> None:
                             patch_size=args.patch_size,
                             freq_span_patches=freq_span_patches,
                             weight_mag_hf=args.weight_mag_hf,
+                            loss_mode=args.loss_mode,
                         )
 
                         loss_total_v = args.weight_mag * loss_mag_v + args.weight_phase * loss_phase_v
@@ -1028,8 +1037,11 @@ def train_main(args) -> None:
                     pred_img = pred_fix[0].cpu().reshape(h_p, w_p, 3, p, p)
                     pred_img = torch.einsum("hwcpq->chpwq", pred_img).reshape(3, h, w)
 
-                    img_recon = img_orig.clone()
-                    img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
+                    if str(args.loss_mode).lower() == "full":
+                        img_recon = pred_img
+                    else:
+                        img_recon = img_orig.clone()
+                        img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
 
                     mag_recon = img_recon[0].unsqueeze(0).to(device)
                     cos_recon = img_recon[1].unsqueeze(0).to(device)
@@ -1132,6 +1144,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--w_min", type=float, default=0.1)
     parser.add_argument("--w_max", type=float, default=200.0)
     parser.add_argument("--freq_type", type=str, default="geometric")
+    parser.add_argument("--cft_triangle_chunk_size", type=int, default=2048)
+    parser.add_argument("--icft_spatial_chunk_size", type=int, default=256)
 
     parser.add_argument("--patch_size", type=int, default=4)
     parser.add_argument("--embed_dim", type=int, default=384)
@@ -1147,6 +1161,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--mask_ratio", type=float, default=0.75)
+    parser.add_argument("--loss_mode", type=str, default="full", choices=("mask", "full"))
     parser.add_argument("--augment_times", type=int, default=10)
 
     parser.add_argument("--precision", type=str, default="bf16")

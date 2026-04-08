@@ -9,6 +9,7 @@ This module contains:
 
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import numpy as np
@@ -135,12 +136,17 @@ def build_poly_fourier_converter_from_config(config: dict, device: str | torch.d
     Returns:
         PolyFourierConverter instance.
     """
+    stem_strides = config.get("stem_strides", (2, 2, 2))
+    if isinstance(stem_strides, str):
+        stem_strides = [int(item.strip()) for item in stem_strides.split(",") if item.strip()]
+    align_stride = max(1, math.prod(int(value) for value in stem_strides))
+
     return PolyFourierConverter(
         pos_freqs=int(config.get("pos_freqs", 31)),
         w_min=float(config.get("w_min", 0.1)),
         w_max=float(config.get("w_max", 100.0)),
         freq_type=str(config.get("freq_type", "geometric")),
-        patch_size=int(config.get("patch_size", 2)),
+        align_stride=align_stride,
         triangle_chunk_size=int(config.get("cft_triangle_chunk_size", 2048)),
         icft_spatial_chunk_size=int(config.get("icft_spatial_chunk_size", 256)),
         device=device,
@@ -161,7 +167,7 @@ class PolyFourierConverter(nn.Module):
         w_max: float = 1.0,
         freq_type: str = "geometric",
         device: str | torch.device = "cuda",
-        patch_size: int = 16,
+        align_stride: int = 8,
         triangle_chunk_size: int = 2048,
         icft_spatial_chunk_size: int = 256,
     ):
@@ -172,14 +178,14 @@ class PolyFourierConverter(nn.Module):
         self.w_max = w_max
         self.freq_type = freq_type
         self.device = torch.device(device)
-        self.patch_size = patch_size
+        self.align_stride = int(align_stride)
         self.triangle_chunk_size = int(triangle_chunk_size)
         self.icft_spatial_chunk_size = int(icft_spatial_chunk_size)
 
         if self.pos_freqs < 1:
             raise ValueError(f"`pos_freqs` must be >= 1, got {self.pos_freqs}")
-        if self.patch_size < 1:
-            raise ValueError(f"`patch_size` must be >= 1, got {self.patch_size}")
+        if self.align_stride < 1:
+            raise ValueError(f"`align_stride` must be >= 1, got {self.align_stride}")
         if self.triangle_chunk_size < 1:
             raise ValueError(f"`triangle_chunk_size` must be >= 1, got {self.triangle_chunk_size}")
         if self.icft_spatial_chunk_size < 1:
@@ -194,7 +200,7 @@ class PolyFourierConverter(nn.Module):
         self.U, self.V, self.pad_h, self.pad_w = self._build_meshgrid()
 
     def _build_meshgrid(self):
-        """Build frequency meshgrid and compute patch-aligned paddings."""
+        """Build frequency meshgrid and compute stride-aligned paddings."""
         if self.freq_type == "geometric":
             g = (self.w_max / self.w_min) ** (1 / (self.pos_freqs - 1)) if self.pos_freqs > 1 else 1.0
             pos_w = [self.w_min * (g**u) for u in range(self.pos_freqs)]
@@ -207,8 +213,8 @@ class PolyFourierConverter(nn.Module):
         wy = torch.cat((torch.tensor([0.0]), pos_w))
 
         len_x, len_y = len(wx), len(wy)
-        pad_h = (self.patch_size - (len_x % self.patch_size)) % self.patch_size
-        pad_w = (self.patch_size - (len_y % self.patch_size)) % self.patch_size
+        pad_h = (self.align_stride - (len_x % self.align_stride)) % self.align_stride
+        pad_w = (self.align_stride - (len_y % self.align_stride)) % self.align_stride
 
         u, v = torch.meshgrid(wx, wy, indexing="ij")
         if pad_h > 0 or pad_w > 0:
@@ -549,7 +555,7 @@ class PolygonGeometryCodec(GeometryCodec):
         return self.converter.icft_2d(f_uv_real, f_uv_imag=f_uv_imag, spatial_size=spatial_size)
 
     def triangles_to_image_channels(self, triangles_list: Sequence[np.ndarray]) -> torch.Tensor:
-        """Convert triangle arrays to MAE input channels (mag, cos, sin).
+        """Convert triangle arrays to VQAE input channels (mag, cos, sin).
 
         Args:
             triangles_list: List of triangle arrays `[T_i,3,2]`.

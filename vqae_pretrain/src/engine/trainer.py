@@ -1,8 +1,8 @@
-"""Training engine for polygon MAE pretraining.
+"""Training engine for polygon VQAE pretraining.
 
 This module implements:
 1) Data loading and train/val split.
-2) MAE training loop with fp32/bf16/fp16 precision support.
+2) AE warmup -> VQ training loop with fp32/bf16/fp16 precision support.
 3) DDP-aware metric reduction.
 4) Checkpoint/export generation.
 5) Reconstruction visualization for qualitative monitoring.
@@ -22,12 +22,13 @@ import matplotlib.pyplot as plt
 from matplotlib.path import Path as MplPath
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from ..datasets.collate import mae_collate_fn
+from ..datasets.collate import triangle_collate_fn
 from ..datasets.pt_manifest import PtShardManifest
 from ..datasets.registry import get_geometry_codec
 from ..datasets.shard_io import resolve_triangle_shard_paths
@@ -37,11 +38,12 @@ from ..datasets.sharded_pt_dataset import (
     load_all_samples_from_manifest,
 )
 from ..losses.recon_mag_phase import compute_mag_phase_losses
-from ..models.mae import MaskedAutoencoderViTPoly
+from ..models.factory import build_vqae_model_from_config
 from ..utils.checkpoint import (
     load_latest_training_state,
     save_checkpoint,
     save_latest_training_state_pair,
+    save_training_state,
 )
 from ..utils.config import dump_yaml_config
 from ..utils.dist import (
@@ -63,37 +65,37 @@ _RESUME_LOCKED_KEYS = {
     "geom_type",
     "data_dir",
     "data_path",
-    "loss_mode",
-    "patch_size",
+    "stem_channels",
+    "stem_strides",
     "embed_dim",
     "depth",
     "num_heads",
-    "dec_embed_dim",
-    "dec_depth",
-    "dec_num_heads",
+    "mlp_ratio",
+    "drop_rate",
+    "decoder_stage_channels",
+    "decoder_attention_type",
+    "decoder_attention_heads",
+    "decoder_attention_depths",
+    "decoder_conv_depths",
+    "decoder_window_size",
+    "decoder_upsample_mode",
+    "decoder_mlp_ratio",
+    "decoder_drop_rate",
+    "codebook_size",
+    "code_dim",
+    "vq_beta",
+    "vq_decay",
+    "vq_eps",
+    "vq_dead_code_threshold",
+    "vq_warmup_epochs",
+    "vq_beta_warmup_epochs",
+    "vq_init_max_vectors",
+    "vq_kmeans_iters",
     "pos_freqs",
     "w_min",
     "w_max",
     "freq_type",
 }
-
-
-def patchify(imgs: torch.Tensor, patch_size: int) -> torch.Tensor:
-    """Convert image tensor into flattened patch tokens.
-
-    Args:
-        imgs: Input tensor `[B,C,H,W]`.
-        patch_size: Patch edge length.
-
-    Returns:
-        Patch tensor `[B,L,C*p*p]`.
-    """
-    batch, channels, height, width = imgs.shape
-    h_patch, w_patch = height // patch_size, width // patch_size
-    x = imgs.reshape(shape=(batch, channels, h_patch, patch_size, w_patch, patch_size))
-    x = torch.einsum("nchpwq->nhwcpq", x)
-    x = x.reshape(shape=(batch, h_patch * w_patch, channels * patch_size**2))
-    return x
 
 
 def mag_phase_to_real_imag(mag_log: torch.Tensor, phase: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -112,16 +114,15 @@ def mag_phase_to_real_imag(mag_log: torch.Tensor, phase: torch.Tensor) -> tuple[
     return real_part, imag_part
 
 
-def compute_freq_span_patches(converter, patch_size: int, device: torch.device) -> torch.Tensor:
-    """Compute patch-level frequency-span weighting map.
+def compute_freq_span_map(converter, device: torch.device) -> torch.Tensor:
+    """Compute full-image frequency-span weighting map.
 
     Args:
         converter: Polygon Fourier converter instance.
-        patch_size: Patch edge length.
         device: Runtime device.
 
     Returns:
-        Frequency-span weights shaped `[1,L,p*p]`.
+        Frequency-span weights shaped `[1,1,H,W]`.
     """
     h, w = converter.U.shape
     valid_h = h - converter.pad_h
@@ -153,9 +154,20 @@ def compute_freq_span_patches(converter, patch_size: int, device: torch.device) 
     freq_span_map[:valid_h, :valid_w] = d_u * d_v
 
     freq_span_map = torch.sqrt(freq_span_map.clamp_min(0.0))
-    freq_span_map = freq_span_map / (freq_span_map.mean() + 1e-8)
+    valid_mean = freq_span_map[:valid_h, :valid_w].mean()
+    freq_span_map = freq_span_map / (valid_mean + 1e-8)
 
-    return patchify(freq_span_map.unsqueeze(0).unsqueeze(0), patch_size)
+    return freq_span_map.unsqueeze(0).unsqueeze(0)
+
+
+def compute_valid_mask(converter, device: torch.device) -> torch.Tensor:
+    """Build one binary mask covering only valid non-padding frequency region."""
+    h, w = converter.U.shape
+    valid_h = h - converter.pad_h
+    valid_w = w - converter.pad_w
+    valid_mask = torch.zeros((h, w), dtype=torch.float32, device=device)
+    valid_mask[:valid_h, :valid_w] = 1.0
+    return valid_mask.unsqueeze(0).unsqueeze(0)
 
 
 def rasterize_tris_to_grid(tris: torch.Tensor, height: int, width: int) -> np.ndarray:
@@ -200,7 +212,7 @@ def plot_reconstruction(
         img_recon: Reconstructed image `[3,H,W]`.
         spatial_gt: Spatial ground truth raster `[H,W]`.
         spatial_icft_orig: ICFT reconstruction from original spectrum.
-        spatial_icft_recon: ICFT reconstruction from MAE output.
+        spatial_icft_recon: ICFT reconstruction from VQAE output.
         epoch: Current epoch index (1-based).
         save_dir: Directory for output images.
     """
@@ -225,11 +237,11 @@ def plot_reconstruction(
     axes_right = [fig.add_subplot(gs_right[0, 0]), fig.add_subplot(gs_right[0, 1]), fig.add_subplot(gs_right[0, 2])]
 
     titles_left = [
-        ["Original Mag", "Masked Mag", "Reconstructed Mag"],
-        ["Original Cos(Phase)", "Masked Cos(Phase)", "Reconstructed Cos(Phase)"],
-        ["Original Sin(Phase)", "Masked Sin(Phase)", "Reconstructed Sin(Phase)"],
+        ["Original Mag", "Input Mag", "Reconstructed Mag"],
+        ["Original Cos(Phase)", "Input Cos(Phase)", "Reconstructed Cos(Phase)"],
+        ["Original Sin(Phase)", "Input Sin(Phase)", "Reconstructed Sin(Phase)"],
     ]
-    titles_right = ["Strict Spatial GT (0/1)", "ICFT (Orig Freqs)", "ICFT (MAE Recon Freqs)"]
+    titles_right = ["Strict Spatial GT (0/1)", "ICFT (Orig Freqs)", "ICFT (AE Recon Freqs)"]
 
     data_left = [
         [(img_orig[0], vmin_mag, vmax_mag), (img_masked[0], vmin_mag, vmax_mag), (img_recon[0], vmin_mag, vmax_mag)],
@@ -285,6 +297,35 @@ def plot_reconstruction(
     plt.close()
 
 
+def _build_model_kwargs(args, img_size: tuple[int, int]) -> dict:
+    """Build one shared VQAE model-kwargs dict from runtime args."""
+    return {
+        "img_size": img_size,
+        "in_chans": 3,
+        "stem_channels": args.stem_channels,
+        "stem_strides": args.stem_strides,
+        "embed_dim": args.embed_dim,
+        "depth": args.depth,
+        "num_heads": args.num_heads,
+        "mlp_ratio": args.mlp_ratio,
+        "drop_rate": args.drop_rate,
+        "decoder_stage_channels": args.decoder_stage_channels,
+        "decoder_attention_type": args.decoder_attention_type,
+        "decoder_attention_heads": args.decoder_attention_heads,
+        "decoder_attention_depths": args.decoder_attention_depths,
+        "decoder_conv_depths": args.decoder_conv_depths,
+        "decoder_window_size": args.decoder_window_size,
+        "decoder_upsample_mode": args.decoder_upsample_mode,
+        "decoder_mlp_ratio": args.decoder_mlp_ratio,
+        "decoder_drop_rate": args.decoder_drop_rate,
+        "codebook_size": args.codebook_size,
+        "code_dim": args.code_dim,
+        "vq_decay": args.vq_decay,
+        "vq_eps": args.vq_eps,
+        "vq_dead_code_threshold": args.vq_dead_code_threshold,
+    }
+
+
 def _build_model_config(args, img_size: tuple[int, int]) -> dict:
     """Build persisted model config dict for downstream reload.
 
@@ -297,16 +338,8 @@ def _build_model_config(args, img_size: tuple[int, int]) -> dict:
     """
     return {
         "geom_type": args.geom_type,
-        "loss_mode": args.loss_mode,
-        "img_size": img_size,
-        "patch_size": args.patch_size,
-        "in_chans": 3,
-        "embed_dim": args.embed_dim,
-        "depth": args.depth,
-        "num_heads": args.num_heads,
-        "dec_embed_dim": args.dec_embed_dim,
-        "dec_depth": args.dec_depth,
-        "dec_num_heads": args.dec_num_heads,
+        "train_type": args.train_type,
+        **_build_model_kwargs(args, img_size=img_size),
         "pos_freqs": args.pos_freqs,
         "w_min": args.w_min,
         "w_max": args.w_max,
@@ -315,7 +348,7 @@ def _build_model_config(args, img_size: tuple[int, int]) -> dict:
 
 
 def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx: DistContext):
-    """Construct MAE model and optional DDP wrapper.
+    """Construct VQAE model and optional DDP wrapper.
 
     Args:
         args: Parsed training arguments.
@@ -326,23 +359,13 @@ def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx
     Returns:
         Model instance (possibly DDP-wrapped).
     """
-    model = MaskedAutoencoderViTPoly(
-        img_size=img_size,
-        patch_size=args.patch_size,
-        in_chans=3,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        decoder_embed_dim=args.dec_embed_dim,
-        decoder_depth=args.dec_depth,
-        decoder_num_heads=args.dec_num_heads,
-    ).to(device)
+    model = build_vqae_model_from_config(_build_model_kwargs(args, img_size=img_size), device=device, precision="fp32")
 
     if dist_ctx.enabled and dist_ctx.world_size > 1:
         if device.type == "cuda":
-            model = DDP(model, device_ids=[dist_ctx.local_rank])
+            model = DDP(model, device_ids=[dist_ctx.local_rank], broadcast_buffers=False)
         else:
-            model = DDP(model)
+            model = DDP(model, broadcast_buffers=False)
     return model
 
 
@@ -386,6 +409,15 @@ def _build_scheduler(args, optimizer):
 
 def _validate_training_args(args) -> None:
     """Validate numeric hyperparameters before building the training pipeline."""
+    def _parse_csv_ints(name: str, value: str) -> list[int]:
+        try:
+            items = [int(item.strip()) for item in str(value).split(",") if item.strip()]
+        except ValueError as exc:
+            raise ValueError(f"`{name}` must be a comma-separated integer list, got {value!r}") from exc
+        if not items:
+            raise ValueError(f"`{name}` must not be empty")
+        return items
+
     try:
         augment_float = float(args.augment_times)
     except (TypeError, ValueError) as exc:
@@ -397,11 +429,10 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`min_lr` must be >= 0, got {args.min_lr}")
     if args.batch_size <= 0:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
-    if args.patch_size <= 0:
-        raise ValueError(f"`patch_size` must be > 0, got {args.patch_size}")
-    if args.loss_mode not in {"mask", "full"}:
-        raise ValueError(f"`loss_mode` must be 'mask' or 'full', got {args.loss_mode!r}")
-    MaskedAutoencoderViTPoly._validate_mask_ratio(args.mask_ratio)
+    if args.depth <= 0:
+        raise ValueError(f"`depth` must be > 0, got {args.depth}")
+    if args.num_heads <= 0:
+        raise ValueError(f"`num_heads` must be > 0, got {args.num_heads}")
     if not (0.0 < float(args.val_ratio) < 1.0):
         raise ValueError(f"`val_ratio` must be in (0, 1), got {args.val_ratio}")
     if not augment_float.is_integer():
@@ -412,10 +443,46 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`warmup_epochs` must be >= 0, got {args.warmup_epochs}")
     if args.log_interval <= 0:
         raise ValueError(f"`log_interval` must be > 0, got {args.log_interval}")
+    if args.codebook_size <= 1:
+        raise ValueError(f"`codebook_size` must be > 1, got {args.codebook_size}")
+    if args.code_dim <= 0:
+        raise ValueError(f"`code_dim` must be > 0, got {args.code_dim}")
+    if args.vq_beta < 0:
+        raise ValueError(f"`vq_beta` must be >= 0, got {args.vq_beta}")
+    if not (0.0 < float(args.vq_decay) < 1.0):
+        raise ValueError(f"`vq_decay` must be in (0, 1), got {args.vq_decay}")
+    if args.vq_eps <= 0:
+        raise ValueError(f"`vq_eps` must be > 0, got {args.vq_eps}")
+    if args.vq_warmup_epochs < 0:
+        raise ValueError(f"`vq_warmup_epochs` must be >= 0, got {args.vq_warmup_epochs}")
+    if args.vq_beta_warmup_epochs < 0:
+        raise ValueError(f"`vq_beta_warmup_epochs` must be >= 0, got {args.vq_beta_warmup_epochs}")
+    if args.vq_init_max_vectors <= 0:
+        raise ValueError(f"`vq_init_max_vectors` must be > 0, got {args.vq_init_max_vectors}")
+    if args.vq_kmeans_iters <= 0:
+        raise ValueError(f"`vq_kmeans_iters` must be > 0, got {args.vq_kmeans_iters}")
     if args.freq_type == "geometric" and args.w_min <= 0:
         raise ValueError(f"`w_min` must be > 0 for geometric freq grids, got {args.w_min}")
     if args.w_max < args.w_min:
         raise ValueError(f"`w_max` must be >= `w_min`, got w_min={args.w_min}, w_max={args.w_max}")
+
+    stem_channels = _parse_csv_ints("stem_channels", args.stem_channels)
+    stem_strides = _parse_csv_ints("stem_strides", args.stem_strides)
+    if len(stem_channels) != len(stem_strides):
+        raise ValueError("`stem_channels` and `stem_strides` must have the same length")
+
+    decoder_stage_channels = _parse_csv_ints("decoder_stage_channels", args.decoder_stage_channels)
+    decoder_attention_heads = _parse_csv_ints("decoder_attention_heads", args.decoder_attention_heads)
+    decoder_attention_depths = _parse_csv_ints("decoder_attention_depths", args.decoder_attention_depths)
+    decoder_conv_depths = _parse_csv_ints("decoder_conv_depths", args.decoder_conv_depths)
+    stage_count = len(stem_strides)
+    if len(decoder_stage_channels) != stage_count:
+        raise ValueError(
+            f"`decoder_stage_channels` length must equal encoder stem stage count {stage_count}, "
+            f"got {len(decoder_stage_channels)}"
+        )
+    if not (len(decoder_attention_heads) == len(decoder_attention_depths) == len(decoder_conv_depths) == stage_count):
+        raise ValueError("Decoder stage config lengths must all match the encoder stem stage count")
 
 
 def _advance_scheduler(scheduler, completed_epochs: int) -> None:
@@ -498,8 +565,71 @@ def _sync_run_metadata(best_dir: Path, ckpt_dir: Path, run_config: dict, model_c
     """Persist training config and model config into both `best/` and `ckpt/`."""
     dump_yaml_config(run_config, best_dir / "config.yaml")
     dump_yaml_config(run_config, ckpt_dir / "config.yaml")
-    _write_json(best_dir / "poly_mae_config.json", model_config)
-    _write_json(ckpt_dir / "poly_mae_config.json", model_config)
+    _write_json(best_dir / "poly_vqae_config.json", model_config)
+    _write_json(ckpt_dir / "poly_vqae_config.json", model_config)
+
+
+def _should_use_vq(epoch_index: int, vq_warmup_epochs: int) -> bool:
+    """Whether current epoch should enable quantization."""
+    return int(epoch_index) >= int(vq_warmup_epochs)
+
+
+def _effective_vq_beta(epoch_index: int, args) -> float:
+    """Compute current epoch VQ beta with post-warmup linear ramp."""
+    if not _should_use_vq(epoch_index, args.vq_warmup_epochs):
+        return 0.0
+    if args.vq_beta_warmup_epochs <= 0:
+        return float(args.vq_beta)
+
+    beta_epoch = max(0, int(epoch_index) - int(args.vq_warmup_epochs))
+    ramp_progress = min(float(beta_epoch) / float(args.vq_beta_warmup_epochs), 1.0)
+    return float(args.vq_beta) * ramp_progress
+
+
+@torch.no_grad()
+def _collect_vq_init_vectors(
+    model_to_save,
+    train_loader,
+    codec,
+    device: torch.device,
+    max_vectors: int,
+) -> torch.Tensor:
+    """Collect one bounded latent-vector pool for codebook initialization."""
+    vector_chunks: list[torch.Tensor] = []
+    remaining = int(max_vectors)
+
+    model_to_save.eval()
+    for batch_tris, lengths in train_loader:
+        mag, phase = codec.cft_batch(batch_tris, lengths)
+        imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
+        code_features = model_to_save.encode_to_code_features(imgs).detach().float()
+        vectors = code_features.permute(0, 2, 3, 1).reshape(-1, code_features.shape[1])
+
+        if vectors.shape[0] > remaining:
+            perm = torch.randperm(vectors.shape[0], device=vectors.device)[:remaining]
+            vectors = vectors[perm]
+
+        vector_chunks.append(vectors)
+        remaining -= int(vectors.shape[0])
+        if remaining <= 0:
+            break
+
+    if not vector_chunks:
+        raise RuntimeError("Failed to collect any latent vectors for VQ codebook initialization.")
+    return torch.cat(vector_chunks, dim=0)
+
+
+def _broadcast_quantizer_state(model_to_save, dist_ctx: DistContext) -> None:
+    """Broadcast initialized quantizer buffers from rank 0 to all ranks."""
+    if not (dist_ctx.enabled and dist_ctx.world_size > 1):
+        return
+    for buffer in (
+        model_to_save.quantizer.codebook,
+        model_to_save.quantizer.cluster_size,
+        model_to_save.quantizer.embed_avg,
+        model_to_save.quantizer.initialized,
+    ):
+        dist.broadcast(buffer, src=0)
 
 
 def _resolve_training_pt_files(args, warn_fn=None) -> list[Path]:
@@ -627,6 +757,13 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
     persistent_workers = bool(args.num_workers > 0 and args.load_mode == "lazy")
 
     use_distributed_sampler = dist_ctx.enabled and dist_ctx.world_size > 1
+    common_loader_kwargs = {
+        "batch_size": args.batch_size,
+        "collate_fn": triangle_collate_fn,
+        "num_workers": args.num_workers,
+        "pin_memory": True,
+        "persistent_workers": persistent_workers,
+    }
 
     if use_distributed_sampler:
         train_sampler = DistributedSampler(train_dataset)
@@ -634,41 +771,25 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size,
             sampler=train_sampler,
-            collate_fn=mae_collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
+            **common_loader_kwargs,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=args.batch_size,
             sampler=val_sampler,
-            collate_fn=mae_collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
+            **common_loader_kwargs,
         )
     else:
         train_sampler = None
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size,
             shuffle=True,
-            collate_fn=mae_collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
+            **common_loader_kwargs,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=args.batch_size,
             shuffle=False,
-            collate_fn=mae_collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
+            **common_loader_kwargs,
         )
 
     return train_dataset, val_dataset, train_loader, val_loader, train_sampler
@@ -700,6 +821,176 @@ def _prepare_fixed_visual_sample(args, codec, val_dataset, device: torch.device)
         spatial_gt = rasterize_tris_to_grid(fixed_tris.cpu(), h_sp, w_sp)
 
     return fixed_batch_tris, fixed_lengths, spatial_gt, spatial_icft_orig
+
+
+def _accumulate_epoch_metrics(metric_sums: dict[str, float], step_outputs: dict[str, torch.Tensor]) -> None:
+    """Accumulate scalar metrics from one model step into running sums."""
+    metric_sums["total"] += float(step_outputs["loss_total"].item())
+    metric_sums["mag"] += float(step_outputs["loss_mag"].item())
+    metric_sums["phase"] += float(step_outputs["loss_phase"].item())
+    metric_sums["vq"] += float(step_outputs["weighted_vq"].item())
+    metric_sums["perplexity"] += float(step_outputs["outputs"].perplexity.item())
+    metric_sums["active"] += float(step_outputs["outputs"].active_codes.item())
+
+
+def _reduce_epoch_metrics(
+    metric_sums: dict[str, float],
+    steps: int,
+    *,
+    device: torch.device,
+    dist_ctx: DistContext,
+) -> dict[str, torch.Tensor]:
+    """Average and all-reduce one epoch metric bundle."""
+    step_count = max(1, int(steps))
+    return {
+        name: all_reduce_mean(torch.tensor(value / step_count, device=device), dist_ctx)
+        for name, value in metric_sums.items()
+    }
+
+
+def _format_epoch_metrics(prefix: str, metrics: dict[str, torch.Tensor]) -> str:
+    """Format one train/val epoch metric line."""
+    return (
+        f"  [{prefix}] Total: {metrics['total'].item():.4f} | "
+        f"Mag: {metrics['mag'].item():.4f} | Phase: {metrics['phase'].item():.4f} | "
+        f"VQ: {metrics['vq'].item():.4f} | Perplexity: {metrics['perplexity'].item():.2f} | "
+        f"ActiveCodes: {int(metrics['active'].item())}"
+    )
+
+
+def _save_fixed_visualization(
+    *,
+    model,
+    codec,
+    fixed_batch_tris: torch.Tensor,
+    fixed_lengths: torch.Tensor,
+    spatial_gt,
+    spatial_icft_orig: torch.Tensor,
+    device: torch.device,
+    precision: str,
+    use_vq: bool,
+    epoch: int,
+    save_dir: Path,
+) -> None:
+    """Render and save one fixed validation visualization snapshot."""
+    with torch.no_grad():
+        mag_fix, phase_fix = codec.cft_batch(fixed_batch_tris, fixed_lengths)
+        imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
+
+        with autocast_context(device, precision):
+            outputs_fix = model(imgs_fix, use_vq=use_vq)
+
+        img_orig = imgs_fix[0].cpu()
+        img_masked = img_orig.clone()
+        img_recon = outputs_fix.recon_imgs[0].float().cpu()
+
+        mag_recon = img_recon[0].unsqueeze(0).to(device)
+        cos_recon = img_recon[1].unsqueeze(0).to(device)
+        sin_recon = img_recon[2].unsqueeze(0).to(device)
+
+        phase_recon = torch.atan2(sin_recon, cos_recon)
+        real_recon, imag_recon = mag_phase_to_real_imag(mag_recon, phase_recon)
+        spatial_icft_recon = codec.icft_2d(real_recon, imag_recon)[0].squeeze().cpu()
+
+        plot_reconstruction(
+            img_orig=img_orig,
+            img_masked=img_masked,
+            img_recon=img_recon,
+            spatial_gt=spatial_gt,
+            spatial_icft_orig=spatial_icft_orig.squeeze(),
+            spatial_icft_recon=spatial_icft_recon,
+            epoch=epoch + 1,
+            save_dir=save_dir,
+        )
+
+
+def _build_nonfinite_tensor_map(
+    *,
+    stage: str,
+    imgs: torch.Tensor,
+    recon_imgs: torch.Tensor,
+    loss_mag: torch.Tensor,
+    loss_phase: torch.Tensor,
+    vq_loss: torch.Tensor,
+    loss_total: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Build one standardized tensor bundle for non-finite diagnostics."""
+    suffix = "_val" if stage == "val_loss" else ""
+    return {
+        f"imgs{suffix}": imgs,
+        f"recon_imgs{suffix}": recon_imgs,
+        f"loss_mag{suffix}": loss_mag,
+        f"loss_phase{suffix}": loss_phase,
+        f"loss_vq{suffix}": vq_loss,
+        f"loss_total{suffix}": loss_total,
+    }
+
+
+def _run_model_step(
+    *,
+    model,
+    codec,
+    batch_tris,
+    lengths,
+    device: torch.device,
+    precision: str,
+    use_vq: bool,
+    freq_span_map: torch.Tensor,
+    valid_mask: torch.Tensor,
+    args,
+    current_vq_beta: float,
+    epoch: int,
+    step: int,
+    stage: str,
+) -> dict[str, torch.Tensor]:
+    """Run one shared forward+loss step for both train and validation."""
+    with torch.no_grad():
+        mag, phase = codec.cft_batch(batch_tris, lengths)
+        imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
+
+    with autocast_context(device, precision):
+        outputs = model(imgs, use_vq=use_vq)
+
+    recon_imgs = outputs.recon_imgs.float()
+    vq_loss = outputs.vq_loss.float()
+
+    loss_mag, loss_phase = compute_mag_phase_losses(
+        pred_imgs=recon_imgs,
+        target_imgs=imgs.float(),
+        freq_span_map=freq_span_map,
+        valid_mask=valid_mask,
+        weight_mag_hf=args.weight_mag_hf,
+    )
+    recon_loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
+    weighted_vq = current_vq_beta * vq_loss
+    loss_total = recon_loss + weighted_vq
+
+    if not bool(torch.isfinite(loss_total).item()):
+        _raise_nonfinite_training_error(
+            stage=stage,
+            epoch=epoch,
+            step=step,
+            tensors=_build_nonfinite_tensor_map(
+                stage=stage,
+                imgs=imgs,
+                recon_imgs=recon_imgs,
+                loss_mag=loss_mag,
+                loss_phase=loss_phase,
+                vq_loss=vq_loss,
+                loss_total=loss_total,
+            ),
+        )
+
+    return {
+        "imgs": imgs,
+        "outputs": outputs,
+        "recon_imgs": recon_imgs,
+        "loss_mag": loss_mag,
+        "loss_phase": loss_phase,
+        "vq_loss": vq_loss,
+        "weighted_vq": weighted_vq,
+        "loss_total": loss_total,
+    }
 
 def count_parameters(model):
     model = model.module if hasattr(model, 'module') else model
@@ -747,11 +1038,7 @@ def _raise_nonfinite_training_error(stage: str, epoch: int, step: int, tensors: 
     )
 
 def train_main(args) -> None:
-    """Main training entrypoint.
-
-    Args:
-        args: Parsed training arguments namespace.
-    """
+    """Main training entrypoint."""
     register_numpy_safe_globals()
     args.load_mode = str(args.load_mode).lower()
     args.resume_dir = str(Path(args.resume_dir).expanduser().resolve()) if args.resume_dir else None
@@ -807,8 +1094,11 @@ def train_main(args) -> None:
             f"rank={dist_ctx.rank}, local_rank={dist_ctx.local_rank}, device={device}, "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
         )
-        print(f"[INFO] Loss mode      : {args.loss_mode}")
         print(f"[INFO] Eval frequency  : every {args.eval_every} epoch(s)")
+        print(
+            "[INFO] Warmups        : "
+            f"lr={args.warmup_epochs}, vq={args.vq_warmup_epochs}, beta={args.vq_beta_warmup_epochs}"
+        )
         if args.resume_dir:
             print(f"[INFO] Resume mode    : dir={args.resume_dir}, checkpoint={resume_path}")
             print(f"[INFO] Resume state   : completed_epoch={start_epoch}, best_val_loss={best_val_loss:.6f}")
@@ -830,18 +1120,28 @@ def train_main(args) -> None:
     converter = codec.converter
     img_size = (converter.U.shape[0], converter.U.shape[1])
     model_config = _build_model_config(args, img_size=img_size)
-
     run_config = dict(vars(args))
 
     if is_main_process(dist_ctx):
         print(f"[INFO] CFT tri chunk   : {converter.triangle_chunk_size}")
         print(f"[INFO] ICFT spatial chunk: {converter.icft_spatial_chunk_size}")
-        _sync_run_metadata(best_dir=best_dir, ckpt_dir=ckpt_dir, run_config=run_config, model_config=model_config)
 
-    freq_span_patches = compute_freq_span_patches(converter, args.patch_size, device=device)
-    
+    freq_span_map = compute_freq_span_map(converter, device=device)
+    valid_mask = compute_valid_mask(converter, device=device)
+
     model = _build_model(args, img_size=img_size, device=device, dist_ctx=dist_ctx)
     model_to_save = model.module if isinstance(model, DDP) else model
+    model_config["latent_stride"] = int(model_to_save.encoder.latent_stride)
+    model_config["latent_grid_size"] = tuple(int(v) for v in model_to_save.encoder.latent_grid_size)
+    model_config["num_latent_tokens"] = int(model_to_save.encoder.num_latent_tokens)
+    run_config["latent_stride"] = model_config["latent_stride"]
+    run_config["latent_grid_size"] = model_config["latent_grid_size"]
+    run_config["num_latent_tokens"] = model_config["num_latent_tokens"]
+    if is_main_process(dist_ctx):
+        print(f"[INFO] Latent stride  : {model_config['latent_stride']}")
+        print(f"[INFO] Latent grid    : {model_config['latent_grid_size']}")
+        print(f"[INFO] Latent tokens  : {model_config['num_latent_tokens']}")
+        _sync_run_metadata(best_dir=best_dir, ckpt_dir=ckpt_dir, run_config=run_config, model_config=model_config)
 
     if resume_state is not None:
         model_to_save.load_state_dict(resume_state["model_state"], strict=True)
@@ -925,53 +1225,62 @@ def train_main(args) -> None:
             if dist_ctx.enabled and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
+            use_vq = _should_use_vq(epoch, args.vq_warmup_epochs)
+            current_vq_beta = _effective_vq_beta(epoch, args)
+
+            if use_vq and not model_to_save.quantizer.is_initialized:
+                if is_main_process(dist_ctx):
+                    print(
+                        f"[INFO] Initializing VQ codebook at epoch {epoch + 1} "
+                        f"from up to {args.vq_init_max_vectors} latent vectors..."
+                    )
+                    init_vectors = _collect_vq_init_vectors(
+                        model_to_save=model_to_save,
+                        train_loader=train_loader,
+                        codec=codec,
+                        device=device,
+                        max_vectors=args.vq_init_max_vectors,
+                    )
+                    model_to_save.initialize_codebook(init_vectors, num_iters=args.vq_kmeans_iters)
+                _broadcast_quantizer_state(model_to_save, dist_ctx)
+                distributed_barrier(dist_ctx)
+
             model.train()
-            train_total, train_mag, train_phase = 0.0, 0.0, 0.0
+            train_metric_sums = {
+                "total": 0.0,
+                "mag": 0.0,
+                "phase": 0.0,
+                "vq": 0.0,
+                "perplexity": 0.0,
+                "active": 0.0,
+            }
             train_steps = 0
             start_time = time.time()
 
             if is_main_process(dist_ctx):
-                print(f"\n--- Epoch [{epoch + 1}/{args.epochs}] Started ---")
+                stage_name = "VQAE" if use_vq else "AE warmup"
+                print(f"\n--- Epoch [{epoch + 1}/{args.epochs}] Started | stage={stage_name}, vq_beta={current_vq_beta:.4f} ---")
 
             for step, (batch_tris, lengths) in enumerate(train_loader):
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.no_grad():
-                    mag, phase = codec.cft_batch(batch_tris, lengths)
-                    imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
-
-                with autocast_context(device, args.precision):
-                    pred, mask = model(imgs, mask_ratio=args.mask_ratio)
-
-                pred = pred.float()
-                mask = mask.float()
-                target_patches = patchify(imgs, args.patch_size).float()
-
-                loss_mag, loss_phase = compute_mag_phase_losses(
-                    pred=pred,
-                    target_patches=target_patches,
-                    mask=mask,
-                    patch_size=args.patch_size,
-                    freq_span_patches=freq_span_patches,
-                    weight_mag_hf=args.weight_mag_hf,
-                    loss_mode=args.loss_mode,
+                step_outputs = _run_model_step(
+                    model=model,
+                    codec=codec,
+                    batch_tris=batch_tris,
+                    lengths=lengths,
+                    device=device,
+                    precision=args.precision,
+                    use_vq=use_vq,
+                    freq_span_map=freq_span_map,
+                    valid_mask=valid_mask,
+                    args=args,
+                    current_vq_beta=current_vq_beta,
+                    epoch=epoch,
+                    step=step,
+                    stage="train_loss",
                 )
-                loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
-                if not bool(torch.isfinite(loss).item()):
-                    _raise_nonfinite_training_error(
-                        stage="train_loss",
-                        epoch=epoch,
-                        step=step,
-                        tensors={
-                            "imgs": imgs,
-                            "pred": pred,
-                            "target_patches": target_patches,
-                            "mask": mask,
-                            "loss_mag": loss_mag,
-                            "loss_phase": loss_phase,
-                            "loss_total": loss,
-                        },
-                    )
+                loss = step_outputs["loss_total"]
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
@@ -982,175 +1291,109 @@ def train_main(args) -> None:
                     loss.backward()
                     optimizer.step()
 
-                train_total += loss.item()
-                train_mag += loss_mag.item()
-                train_phase += loss_phase.item()
+                _accumulate_epoch_metrics(train_metric_sums, step_outputs)
                 train_steps += 1
 
                 if is_main_process(dist_ctx) and step % args.log_interval == 0:
-                    print(f"  -> Step [{step}/{len(train_loader)}], Train Loss: {loss.item():.4f}")
+                    print(
+                        f"  -> Step [{step}/{len(train_loader)}], "
+                        f"Train Loss: {loss.item():.4f}, VQ: {step_outputs['weighted_vq'].item():.4f}, "
+                        f"Perplexity: {step_outputs['outputs'].perplexity.item():.2f}, "
+                        f"ActiveCodes: {int(step_outputs['outputs'].active_codes.item())}"
+                    )
 
                 if max_train_steps > 0 and train_steps >= max_train_steps:
                     break
 
-            avg_train_loss = all_reduce_mean(
-                torch.tensor(train_total / max(1, train_steps), device=device),
-                dist_ctx,
-            )
-            avg_train_mag = all_reduce_mean(
-                torch.tensor(train_mag / max(1, train_steps), device=device),
-                dist_ctx,
-            )
-            avg_train_phase = all_reduce_mean(
-                torch.tensor(train_phase / max(1, train_steps), device=device),
-                dist_ctx,
+            train_metrics = _reduce_epoch_metrics(
+                train_metric_sums,
+                train_steps,
+                device=device,
+                dist_ctx=dist_ctx,
             )
 
             should_eval = _is_eval_epoch(epoch, total_epochs=args.epochs, eval_every=args.eval_every)
-            avg_val_loss = avg_val_mag = avg_val_phase = None
+            val_metrics = None
 
             if should_eval:
                 model.eval()
-                val_total, val_mag, val_phase = 0.0, 0.0, 0.0
+                val_metric_sums = {
+                    "total": 0.0,
+                    "mag": 0.0,
+                    "phase": 0.0,
+                    "vq": 0.0,
+                    "perplexity": 0.0,
+                    "active": 0.0,
+                }
                 val_steps = 0
 
                 with torch.no_grad():
                     for _, (val_batch_tris, val_lengths) in enumerate(val_loader):
-                        mag_v, phase_v = codec.cft_batch(val_batch_tris, val_lengths)
-                        imgs_v = torch.cat([mag_v, torch.cos(phase_v), torch.sin(phase_v)], dim=1)
-
-                        with autocast_context(device, args.precision):
-                            pred_v, mask_v = model(imgs_v, mask_ratio=args.mask_ratio)
-
-                        pred_v = pred_v.float()
-                        mask_v = mask_v.float()
-                        target_patches_v = patchify(imgs_v, args.patch_size).float()
-
-                        loss_mag_v, loss_phase_v = compute_mag_phase_losses(
-                            pred=pred_v,
-                            target_patches=target_patches_v,
-                            mask=mask_v,
-                            patch_size=args.patch_size,
-                            freq_span_patches=freq_span_patches,
-                            weight_mag_hf=args.weight_mag_hf,
-                            loss_mode=args.loss_mode,
+                        step_outputs = _run_model_step(
+                            model=model,
+                            codec=codec,
+                            batch_tris=val_batch_tris,
+                            lengths=val_lengths,
+                            device=device,
+                            precision=args.precision,
+                            use_vq=use_vq,
+                            freq_span_map=freq_span_map,
+                            valid_mask=valid_mask,
+                            args=args,
+                            current_vq_beta=current_vq_beta,
+                            epoch=epoch,
+                            step=val_steps,
+                            stage="val_loss",
                         )
-
-                        loss_total_v = args.weight_mag * loss_mag_v + args.weight_phase * loss_phase_v
-                        if not bool(torch.isfinite(loss_total_v).item()):
-                            _raise_nonfinite_training_error(
-                                stage="val_loss",
-                                epoch=epoch,
-                                step=val_steps,
-                                tensors={
-                                    "imgs_val": imgs_v,
-                                    "pred_val": pred_v,
-                                    "target_patches_val": target_patches_v,
-                                    "mask_val": mask_v,
-                                    "loss_mag_val": loss_mag_v,
-                                    "loss_phase_val": loss_phase_v,
-                                    "loss_total_val": loss_total_v,
-                                },
-                            )
-                        val_total += loss_total_v.item()
-                        val_mag += loss_mag_v.item()
-                        val_phase += loss_phase_v.item()
+                        _accumulate_epoch_metrics(val_metric_sums, step_outputs)
                         val_steps += 1
 
                         if max_val_steps > 0 and val_steps >= max_val_steps:
                             break
 
-                avg_val_loss = all_reduce_mean(
-                    torch.tensor(val_total / max(1, val_steps), device=device),
-                    dist_ctx,
-                )
-                avg_val_mag = all_reduce_mean(
-                    torch.tensor(val_mag / max(1, val_steps), device=device),
-                    dist_ctx,
-                )
-                avg_val_phase = all_reduce_mean(
-                    torch.tensor(val_phase / max(1, val_steps), device=device),
-                    dist_ctx,
+                val_metrics = _reduce_epoch_metrics(
+                    val_metric_sums,
+                    val_steps,
+                    device=device,
+                    dist_ctx=dist_ctx,
                 )
 
             current_lr = optimizer.param_groups[0]["lr"]
 
             if is_main_process(dist_ctx):
                 print(f"Epoch {epoch + 1} Completed in {time.time() - start_time:.2f}s | LR: {current_lr:.2e}")
-                print(
-                    f"  [Train] Total: {avg_train_loss.item():.4f} | "
-                    f"Mag: {avg_train_mag.item():.4f} | Phase: {avg_train_phase.item():.4f}"
+                print(_format_epoch_metrics("Train", train_metrics))
+                if should_eval and val_metrics is not None:
+                    print(_format_epoch_metrics("Val", val_metrics))
+
+            if should_eval and is_main_process(dist_ctx) and val_metrics is not None:
+                _save_fixed_visualization(
+                    model=model,
+                    codec=codec,
+                    fixed_batch_tris=fixed_batch_tris,
+                    fixed_lengths=fixed_lengths,
+                    spatial_gt=spatial_gt,
+                    spatial_icft_orig=spatial_icft_orig,
+                    device=device,
+                    precision=args.precision,
+                    use_vq=use_vq,
+                    epoch=epoch,
+                    save_dir=viz_dir,
                 )
-                if should_eval and avg_val_loss is not None and avg_val_mag is not None and avg_val_phase is not None:
-                    print(
-                        f"  [Val]   Total: {avg_val_loss.item():.4f} | "
-                        f"Mag: {avg_val_mag.item():.4f} | Phase: {avg_val_phase.item():.4f}"
-                    )
 
-            if should_eval and is_main_process(dist_ctx):
-                with torch.no_grad():
-                    mag_fix, phase_fix = codec.cft_batch(fixed_batch_tris, fixed_lengths)
-                    imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
-
-                    with autocast_context(device, args.precision):
-                        pred_fix, mask_fix = model(imgs_fix, mask_ratio=args.mask_ratio)
-
-                    pred_fix = pred_fix.float()
-                    mask_fix = mask_fix.float()
-
-                    p = args.patch_size
-                    h, w = imgs_fix.shape[2], imgs_fix.shape[3]
-                    h_p, w_p = h // p, w // p
-
-                    img_orig = imgs_fix[0].cpu()
-
-                    mask_map = mask_fix[0].cpu().reshape(h_p, w_p, 1, 1).expand(-1, -1, p, p)
-                    mask_map = mask_map.permute(0, 2, 1, 3).reshape(h, w)
-
-                    img_masked = img_orig.clone()
-                    img_masked[:, mask_map == 1] = torch.nan
-
-                    pred_img = pred_fix[0].cpu().reshape(h_p, w_p, 3, p, p)
-                    pred_img = torch.einsum("hwcpq->chpwq", pred_img).reshape(3, h, w)
-
-                    if str(args.loss_mode).lower() == "full":
-                        img_recon = pred_img
-                    else:
-                        img_recon = img_orig.clone()
-                        img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
-
-                    mag_recon = img_recon[0].unsqueeze(0).to(device)
-                    cos_recon = img_recon[1].unsqueeze(0).to(device)
-                    sin_recon = img_recon[2].unsqueeze(0).to(device)
-
-                    phase_recon = torch.atan2(sin_recon, cos_recon)
-                    real_recon, imag_recon = mag_phase_to_real_imag(mag_recon, phase_recon)
-                    spatial_icft_recon = codec.icft_2d(real_recon, imag_recon)[0].squeeze().cpu()
-
-                    plot_reconstruction(
-                        img_orig=img_orig,
-                        img_masked=img_masked,
-                        img_recon=img_recon,
-                        spatial_gt=spatial_gt,
-                        spatial_icft_orig=spatial_icft_orig.squeeze(),
-                        spatial_icft_recon=spatial_icft_recon,
-                        epoch=epoch + 1,
-                        save_dir=viz_dir,
-                    )
-
-                current_val_loss = float(avg_val_loss.item())
+                current_val_loss = float(val_metrics["total"].item())
                 if current_val_loss < best_val_loss:
                     best_val_loss = current_val_loss
-                    save_checkpoint(
-                        best_dir / "mae_best.pth",
-                        model_to_save.state_dict(),
-                        precision=args.checkpoint_dtype,
+                    save_checkpoint(best_dir / "vqae_best.pth", model_to_save.state_dict(), precision=args.checkpoint_dtype)
+                    save_checkpoint(best_dir / "encoder.pth", model_to_save.encoder.state_dict(), precision=args.checkpoint_dtype)
+                    save_training_state(
+                        best_dir / "decoder.pth",
+                        {
+                            "post_vq_proj": model_to_save.post_vq_proj.state_dict(),
+                            "decoder": model_to_save.decoder.state_dict(),
+                        },
                     )
-                    save_checkpoint(
-                        best_dir / "encoder_best.pth",
-                        model_to_save.encoder.state_dict(),
-                        precision=args.checkpoint_dtype,
-                    )
+                    save_training_state(best_dir / "quantizer.pth", model_to_save.quantizer.state_dict())
                     print(f"  [Best] Updated best checkpoint at epoch {epoch + 1} | val={best_val_loss:.4f}")
 
                 train_state = {
@@ -1176,7 +1419,6 @@ def train_main(args) -> None:
                 print(f"  [Ckpt] Updated latest resume checkpoint at epoch {epoch + 1}")
 
             distributed_barrier(dist_ctx)
-
             scheduler.step()
     except KeyboardInterrupt:
         if is_main_process(dist_ctx):
@@ -1189,14 +1431,10 @@ def train_main(args) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build CLI parser for training engine.
+    """Build CLI parser for training engine."""
+    parser = argparse.ArgumentParser(description="VQAE pretraining trainer")
 
-    Returns:
-        Configured argument parser.
-    """
-    parser = argparse.ArgumentParser(description="MAE pretraining trainer")
-
-    parser.add_argument("--train_type", type=str, default="mae")
+    parser.add_argument("--train_type", type=str, default="vqae")
     parser.add_argument("--geom_type", type=str, default="polygon")
 
     parser.add_argument("--data_dir", type=str, default="./data/processed/hangzhou")
@@ -1218,6 +1456,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--val_ratio", type=float, default=0.05)
     parser.add_argument("--warmup_epochs", type=int, default=15)
+    parser.add_argument("--vq_warmup_epochs", type=int, default=10)
+    parser.add_argument("--vq_beta_warmup_epochs", type=int, default=5)
     parser.add_argument("--min_lr", type=float, default=1e-6)
 
     parser.add_argument("--pos_freqs", type=int, default=63)
@@ -1227,21 +1467,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cft_triangle_chunk_size", type=int, default=2048)
     parser.add_argument("--icft_spatial_chunk_size", type=int, default=256)
 
-    parser.add_argument("--patch_size", type=int, default=4)
+    parser.add_argument("--stem_channels", type=str, default="64,128,256")
+    parser.add_argument("--stem_strides", type=str, default="2,2,2")
     parser.add_argument("--embed_dim", type=int, default=384)
-    parser.add_argument("--depth", type=int, default=12)
+    parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--drop_rate", type=float, default=0.0)
 
-    parser.add_argument("--dec_embed_dim", type=int, default=128)
-    parser.add_argument("--dec_depth", type=int, default=4)
-    parser.add_argument("--dec_num_heads", type=int, default=4)
+    parser.add_argument("--decoder_stage_channels", type=str, default="256,192,128")
+    parser.add_argument("--decoder_attention_type", type=str, default="window", choices=("none", "window", "global"))
+    parser.add_argument("--decoder_attention_heads", type=str, default="8,4,4")
+    parser.add_argument("--decoder_attention_depths", type=str, default="1,1,0")
+    parser.add_argument("--decoder_conv_depths", type=str, default="2,2,2")
+    parser.add_argument("--decoder_window_size", type=int, default=8)
+    parser.add_argument("--decoder_upsample_mode", type=str, default="bilinear", choices=("nearest", "bilinear", "bicubic"))
+    parser.add_argument("--decoder_mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--decoder_drop_rate", type=float, default=0.0)
+
+    parser.add_argument("--codebook_size", type=int, default=8192)
+    parser.add_argument("--code_dim", type=int, default=128)
+    parser.add_argument("--vq_beta", type=float, default=0.25)
+    parser.add_argument("--vq_decay", type=float, default=0.99)
+    parser.add_argument("--vq_eps", type=float, default=1.0e-5)
+    parser.add_argument("--vq_dead_code_threshold", type=float, default=1.0)
+    parser.add_argument("--vq_init_max_vectors", type=int, default=100000)
+    parser.add_argument("--vq_kmeans_iters", type=int, default=10)
 
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=0.05)
-    parser.add_argument("--mask_ratio", type=float, default=0.75)
-    parser.add_argument("--loss_mode", type=str, default="full", choices=("mask", "full"))
     parser.add_argument("--augment_times", type=int, default=10)
 
     parser.add_argument("--precision", type=str, default="bf16")

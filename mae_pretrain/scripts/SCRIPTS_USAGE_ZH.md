@@ -14,7 +14,7 @@ cd /home/xiaoyang/workspace/poly2vec_mae/mae_pretrain
   
 - 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`；训练输出统一写入 `<save_dir>/<run_timestamp>/best` 与 `ckpt`；支持用 `--resume_dir` 从既有 run 目录续训。
   
-- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--eval_every` 控制评测频率；只有评测 epoch 才会输出 val loss、PNG、并更新 `best/` 与 `ckpt/`。当前关键参数会严格校验：`--mask_ratio` 必须在 `[0,1)`，`--val_ratio` 必须在 `(0,1)`，`--augment_times` 必须 `>= 1`；不再对非法值做静默钳制。
+- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--eval_every` 控制评测频率；只有评测 epoch 才会输出 val loss、PNG、并更新 `best/` 与 `ckpt/`。当前关键参数会严格校验：`--mask_ratio` 必须在 `[0,1)`，`--val_ratio` 必须在 `(0,1)`，`--augment_times` 必须 `>= 1`；不再对非法值做静默钳制。新增 `--loss_mode {full,mask}`，默认 `full`：`full` 对全图 patch 计算频域重构损失，`mask` 保持原 MAE 的 masked-only loss 语义。
   
 - 调取示例：
   
@@ -32,10 +32,16 @@ python scripts/run_pretrain.py \
 
   --precision bf16 \
 
+  --loss_mode full \
+
   --mask_ratio 0.75 \
 
   --eval_every 10
 ```
+
+- 模式建议：
+  - 连续重构 AE：`--loss_mode full --mask_ratio 0.0`
+  - 原 MAE 预训练：`--loss_mode mask --mask_ratio 0.75`
 
 - 续训示例：
 

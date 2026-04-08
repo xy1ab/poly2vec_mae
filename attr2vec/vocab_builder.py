@@ -39,9 +39,9 @@ class DataConnector:
 # 第二层：自适应层级密码本构建器 (Schema-Free + 增量版)
 # ==========================================
 class NRE_UniversalVocabBuilder:
-    def __init__(self, config):
-        self.config = config
-        self.vocab_path = config.get('vocab_path', 'global_vocab_auto.json')
+    def __init__(self, output_dir):
+
+        self.vocab_path = output_dir
         
         if os.path.exists(self.vocab_path):
             print(f"🔄 发现已有字典 {self.vocab_path}，启动【增量追加模式】...")
@@ -134,10 +134,20 @@ class NRE_UniversalVocabBuilder:
 # ==========================================
 # 统一调度流 (实战入口：一键通吃所有数据)
 # ==========================================
-if __name__ == "__main__":
-    vocab_config = {'vocab_path': 'global_vocab_auto.json'}
+import argparse
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for batch forward export."""
+    parser = argparse.ArgumentParser(
+        description="Batch forward triangulated polygon shards into embeddings and MAE frequency maps."
+    )
+    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    return parser
 
-    RAW_DATA_DIR = "./raw_data"
+if __name__ == "__main__":
+    args = build_arg_parser().parse_args()
+    output_dir = os.path.join(args.output_dir,  'global_vocab_auto.json')
+    RAW_DATA_DIR = args.data_dir
     if not os.path.exists(RAW_DATA_DIR):
         os.makedirs(RAW_DATA_DIR)
         print(f"📁 已自动创建数据存放目录: {RAW_DATA_DIR}，请将GDB和CSV放入此目录！")
@@ -150,7 +160,7 @@ if __name__ == "__main__":
         
     print(f"🔍 扫描到 {len(data_sources)} 个数据源，准备构建/更新字典...")
 
-    builder = NRE_UniversalVocabBuilder(vocab_config)
+    builder = NRE_UniversalVocabBuilder(output_dir)
     for source in data_sources:
         print(f"\n==============================================")
         print(f"🚀 开始执行新任务流: {source['path']}")
