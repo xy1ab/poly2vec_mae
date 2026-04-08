@@ -37,16 +37,17 @@ def compute_mag_phase_losses(
     pred_sin = pred_imgs[:, 2:3]
 
     valid_mask = valid_mask.to(dtype=pred_imgs.dtype, device=pred_imgs.device)
-    valid_denom = valid_mask.sum().clamp_min(1.0)
+    valid_mask_expanded = valid_mask.expand_as(pred_mag)
+    valid_denom = valid_mask_expanded.sum().clamp_min(1.0)
 
     mag_l1 = torch.abs(pred_mag - target_mag)
-    loss_mag_base = (mag_l1 * valid_mask).sum() / valid_denom
+    loss_mag_base = (mag_l1 * valid_mask_expanded).sum() / valid_denom
 
-    weighted_mag = mag_l1 * freq_span_map * valid_mask
+    weighted_mag = mag_l1 * freq_span_map * valid_mask_expanded
     loss_mag_penalty = weighted_mag.sum() / valid_denom
     loss_mag = loss_mag_base + weight_mag_hf * loss_mag_penalty
 
-    phase_l1 = (torch.abs(pred_cos - target_cos) + torch.abs(pred_sin - target_sin)) * valid_mask
+    phase_l1 = (torch.abs(pred_cos - target_cos) + torch.abs(pred_sin - target_sin)) * valid_mask_expanded
     loss_phase = phase_l1.sum() / valid_denom
 
     return loss_mag, loss_phase
