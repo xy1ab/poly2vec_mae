@@ -293,7 +293,13 @@ class EMAVectorQuantizer(nn.Module):
                 restarted_dead_codes = False
                 if self._is_main_rank():
                     restarted_dead_codes = self._restart_dead_codes(vectors)
-                if restarted_dead_codes:
+                restart_flag = torch.tensor(
+                    int(restarted_dead_codes),
+                    device=vectors.device,
+                    dtype=torch.int32,
+                )
+                self._broadcast_in_place(restart_flag)
+                if bool(restart_flag.item()):
                     self._broadcast_state_from_rank0()
 
         return QuantizerOutput(
