@@ -55,11 +55,11 @@ weight_phase: 1.0
 # 验证集比例。其余样本用于训练。
 val_ratio: 0.05
 # 学习率 warmup 轮数。该 warmup 从训练开始即生效，可与 VQ warmup 重合。
-warmup_epochs: 6
+warmup_epochs: 8
 # VQ warmup 轮数。在这段时期内，模型完全按连续 AE 训练，不启用 quantizer。
-vq_warmup_epochs: 10
+vq_warmup_epochs: 12
 # VQ beta warmup 轮数。它在 VQ warmup 结束后启动，并将 beta 从 0 线性增至 `vq_beta`。
-vq_beta_warmup_epochs: 14
+vq_beta_warmup_epochs: 18
 # 学习率调度的最小值。余弦退火后会逐步逼近该值。
 min_lr: 1.0e-6
 
@@ -89,11 +89,11 @@ stem_channels: "64,128,256"
 # 输入频域图会自动 padding 到该总 stride 的整数倍，不再依赖 patch 对齐。
 stem_strides: "2,2,1"
 # ViT 主干的 token/channel 维度，也是 encoder latent 的主工作维度。
-embed_dim: 384
+embed_dim: 512
 # ViT block 层数。增大可提升表达能力，但会增加算力和显存开销。
-depth: 10
+depth: 14
 # 多头注意力头数。通常需要与 `embed_dim` 搭配，保证每头维度不过小。
-num_heads: 6
+num_heads: 8
 # Transformer 中 MLP 隐藏层扩张倍率。越大表达更强，但更耗显存。
 mlp_ratio: 4.0
 # 普通 dropout 概率。重建任务通常保持为 0 或很小。
@@ -103,7 +103,7 @@ drop_rate: 0.0
 # 解码器（多 stage attention + conv）
 # =========================
 # 各解码 stage 的通道数，需与 encoder 下采样 stage 数量对齐。
-decoder_stage_channels: "384,256,192"
+decoder_stage_channels: "896,704,512"
 # decoder 最终并不直接输出自由的 `Mag/Cos/Sin` 三通道，
 # 而是先输出两个 raw 通道 `(mag_raw, phase_raw)`，随后在模型内部映射为：
 # - `mag = softplus(mag_raw)`，保证幅值非负；
@@ -115,17 +115,17 @@ decoder_stage_channels: "384,256,192"
 # - global: 使用全局注意力。
 decoder_attention_type: global
 # 各解码 stage 的注意力头数，长度需与 stage 数匹配。
-decoder_attention_heads: "6,4,4"
+decoder_attention_heads: "8,8,8"
 # 各解码 stage 的 attention block 数。设为 0 时该 stage 退化为 conv-only。
-decoder_attention_depths: "6,0,0"
+decoder_attention_depths: "8,0,0"
 # 各解码 stage 的卷积细化 block 数。一般越靠近输出端越重要。
-decoder_conv_depths: "4,3,3"
+decoder_conv_depths: "6,5,4"
 # 全分辨率精修残差块数量。设为 0 表示关闭该模块，行为与旧 decoder 一致。
-refine_full_res_depth: 1
+refine_full_res_depth: 4
 # 全分辨率精修模块内部通道数。
 # 设为 0 表示直接沿用 decoder 最后一级输出通道数；
 # 设为正整数时，会先用 1x1 卷积投影到该通道数后再做精修。
-refine_full_res_channels: 0
+refine_full_res_channels: 512
 # 窗口注意力的窗口大小，仅在 `decoder_attention_type=window` 时生效。
 decoder_window_size: 8
 # 上采样方式。常用 `bilinear`，通常比反卷积更稳、更少棋盘伪影。
@@ -141,7 +141,7 @@ decoder_drop_rate: 0.0
 # 码本容量。越大表示离散表示越细，但越难训练，也更容易出现低利用率。
 codebook_size: 8192
 # 量化空间维度。通常建议小于等于 embed_dim，例如 embed_dim=256, code_dim=128。
-code_dim: 256
+code_dim: 512
 # VQ commitment loss 的目标权重。过大会加重量化约束并放大量化噪声。
 vq_beta: 0.25
 # EMA 更新衰减系数。
@@ -155,9 +155,9 @@ vq_eps: 1.0e-5
 # 死码阈值；低于该 EMA 使用计数的 code 会被当前 batch 的 latent 特征重置。
 vq_dead_code_threshold: 0.25
 # VQ 初始化时最多采样多少个 latent 向量参与工程版 K-means。
-vq_init_max_vectors: 100000
+vq_init_max_vectors: 150000
 # 工程版 K-means 的迭代轮数。
-vq_kmeans_iters: 10
+vq_kmeans_iters: 12
 # 死码重置时每张卡最多贡献多少个 latent 向量作为候选池。
 # 若当前 rank 可用向量少于该值，会自动按实际数量截断。
 vq_restart_pool_size_per_rank: 4096
@@ -166,11 +166,11 @@ vq_restart_pool_size_per_rank: 4096
 # 训练超参数
 # =========================
 # 训练总 epoch 数。总训练时长约由它与数据规模、batch size 共同决定。
-epochs: 400
+epochs: 1000
 # 训练 batch 大小。增大可提升吞吐，但也会增加 GPU 显存压力。
 batch_size: 32
 # 基础学习率。实际训练中会先经过 warmup 再进入余弦退火。
-lr: 2e-4
+lr: 3.2e-4
 # AdamW 的权重衰减系数。增大可增强正则化，但过大可能损伤重建细节。
 weight_decay: 0.05
 # 每条样本的在线增强重复次数。训练集虚拟长度会乘以该值。
