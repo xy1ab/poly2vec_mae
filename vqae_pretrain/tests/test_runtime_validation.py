@@ -32,6 +32,8 @@ def _build_training_args(**overrides):
         "decoder_attention_heads": "4,4,4",
         "decoder_attention_depths": "1,1,0",
         "decoder_conv_depths": "2,2,2",
+        "refine_full_res_depth": 0,
+        "refine_full_res_channels": 0,
         "codebook_size": 128,
         "code_dim": 64,
         "vq_beta": 0.25,
@@ -70,6 +72,13 @@ class RuntimeValidationTest(unittest.TestCase):
         for vq_decay in (0.0, 1.0, 1.1):
             with self.assertRaisesRegex(ValueError, "vq_decay"):
                 _validate_training_args(_build_training_args(vq_decay=vq_decay))
+
+    def test_training_args_reject_negative_full_res_refine_values(self) -> None:
+        """Trainer validation should reject negative full-resolution refine settings."""
+        with self.assertRaisesRegex(ValueError, "refine_full_res_depth"):
+            _validate_training_args(_build_training_args(refine_full_res_depth=-1))
+        with self.assertRaisesRegex(ValueError, "refine_full_res_channels"):
+            _validate_training_args(_build_training_args(refine_full_res_channels=-1))
 
 
 if __name__ == "__main__":

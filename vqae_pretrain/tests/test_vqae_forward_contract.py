@@ -83,6 +83,64 @@ class VqAeForwardContractTest(unittest.TestCase):
 
         self.assertEqual(recon.shape, imgs.shape)
 
+    def test_forward_supports_full_res_refine_without_channel_projection(self) -> None:
+        """Full-resolution refine blocks should preserve output image shapes."""
+        model = PolyVqAutoencoder(
+            img_size=(8, 8),
+            in_chans=3,
+            stem_channels=(8,),
+            stem_strides=(2,),
+            embed_dim=16,
+            depth=1,
+            num_heads=4,
+            mlp_ratio=2.0,
+            decoder_stage_channels=(16,),
+            decoder_attention_type="none",
+            decoder_attention_heads=(1,),
+            decoder_attention_depths=(0,),
+            decoder_conv_depths=(1,),
+            refine_full_res_depth=2,
+            refine_full_res_channels=0,
+            decoder_upsample_mode="nearest",
+            codebook_size=32,
+            code_dim=8,
+        )
+        imgs = torch.randn(2, 3, 8, 8)
+
+        outputs = model(imgs, use_vq=True)
+
+        self.assertEqual(outputs.recon_imgs.shape, imgs.shape)
+        self.assertEqual(len(model.decoder.full_res_refine_blocks), 2)
+
+    def test_forward_supports_full_res_refine_with_channel_projection(self) -> None:
+        """Full-resolution refine should support a custom projected channel width."""
+        model = PolyVqAutoencoder(
+            img_size=(8, 8),
+            in_chans=3,
+            stem_channels=(8,),
+            stem_strides=(2,),
+            embed_dim=16,
+            depth=1,
+            num_heads=4,
+            mlp_ratio=2.0,
+            decoder_stage_channels=(16,),
+            decoder_attention_type="none",
+            decoder_attention_heads=(1,),
+            decoder_attention_depths=(0,),
+            decoder_conv_depths=(1,),
+            refine_full_res_depth=2,
+            refine_full_res_channels=12,
+            decoder_upsample_mode="nearest",
+            codebook_size=32,
+            code_dim=8,
+        )
+        imgs = torch.randn(2, 3, 8, 8)
+
+        outputs = model(imgs, use_vq=True)
+
+        self.assertEqual(outputs.recon_imgs.shape, imgs.shape)
+        self.assertEqual(model.decoder.output_head[0].in_channels, 12)
+
 
 if __name__ == "__main__":
     unittest.main()

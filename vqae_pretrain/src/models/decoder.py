@@ -184,6 +184,8 @@ class PolyDecoder(nn.Module):
         attention_heads: Sequence[int] | None = None,
         attention_depths: Sequence[int] | None = None,
         conv_depths: Sequence[int] | None = None,
+        refine_full_res_depth: int = 0,
+        refine_full_res_channels: int = 0,
         window_size: int = 8,
         mlp_ratio: float = 4.0,
         drop_rate: float = 0.0,
@@ -203,6 +205,10 @@ class PolyDecoder(nn.Module):
 
         if not (len(stage_channels) == len(attention_heads) == len(attention_depths) == len(conv_depths)):
             raise ValueError("Decoder stage config lists must have matching lengths")
+        if int(refine_full_res_depth) < 0:
+            raise ValueError(f"`refine_full_res_depth` must be >= 0, got {refine_full_res_depth}")
+        if int(refine_full_res_channels) < 0:
+            raise ValueError(f"`refine_full_res_channels` must be >= 0, got {refine_full_res_channels}")
 
         self.latent_proj = nn.Conv2d(latent_dim, stage_channels[0], kernel_size=1, bias=True)
         self.stages = nn.ModuleList()
@@ -237,11 +243,26 @@ class PolyDecoder(nn.Module):
             current_channels = next_channels
 
         self.out_channels = current_channels
-        self.output_head = nn.Conv2d(self.out_channels, int(out_chans), kernel_size=3, stride=1, padding=1, bias=True)
+        refine_channels = int(refine_full_res_channels) if int(refine_full_res_channels) > 0 else self.out_channels
+        self.refine_proj = None
+        if refine_channels != self.out_channels:
+            self.refine_proj = nn.Conv2d(self.out_channels, refine_channels, kernel_size=1, bias=True)
+        self.full_res_refine_blocks = nn.ModuleList(
+            [ConvRefineBlock(refine_channels) for _ in range(int(refine_full_res_depth))]
+        )
+        self.output_head = nn.Sequential(
+            nn.Conv2d(refine_channels, refine_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(refine_channels, int(out_chans), kernel_size=3, stride=1, padding=1, bias=True),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.latent_proj(x)
         for stage, upsample in zip(self.stages, self.upsamplers):
             x = stage(x)
             x = upsample(x)
+        if self.refine_proj is not None:
+            x = self.refine_proj(x)
+        for block in self.full_res_refine_blocks:
+            x = block(x)
         return self.output_head(x)

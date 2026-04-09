@@ -88,6 +88,8 @@ def build_vqae_model_from_config(
         decoder_attention_heads=decoder_attention_heads,
         decoder_attention_depths=decoder_attention_depths,
         decoder_conv_depths=decoder_conv_depths,
+        refine_full_res_depth=int(config.get("refine_full_res_depth", 0)),
+        refine_full_res_channels=int(config.get("refine_full_res_channels", 0)),
         decoder_window_size=int(config.get("decoder_window_size", 8)),
         decoder_upsample_mode=str(config.get("decoder_upsample_mode", "bilinear")),
         decoder_mlp_ratio=float(config.get("decoder_mlp_ratio", 4.0)),

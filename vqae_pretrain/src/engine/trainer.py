@@ -77,6 +77,8 @@ _RESUME_LOCKED_KEYS = {
     "decoder_attention_heads",
     "decoder_attention_depths",
     "decoder_conv_depths",
+    "refine_full_res_depth",
+    "refine_full_res_channels",
     "decoder_window_size",
     "decoder_upsample_mode",
     "decoder_mlp_ratio",
@@ -314,6 +316,8 @@ def _build_model_kwargs(args, img_size: tuple[int, int]) -> dict:
         "decoder_attention_heads": args.decoder_attention_heads,
         "decoder_attention_depths": args.decoder_attention_depths,
         "decoder_conv_depths": args.decoder_conv_depths,
+        "refine_full_res_depth": args.refine_full_res_depth,
+        "refine_full_res_channels": args.refine_full_res_channels,
         "decoder_window_size": args.decoder_window_size,
         "decoder_upsample_mode": args.decoder_upsample_mode,
         "decoder_mlp_ratio": args.decoder_mlp_ratio,
@@ -466,6 +470,10 @@ def _validate_training_args(args) -> None:
             "`vq_restart_pool_size_per_rank` must be >= 0, "
             f"got {args.vq_restart_pool_size_per_rank}"
         )
+    if args.refine_full_res_depth < 0:
+        raise ValueError(f"`refine_full_res_depth` must be >= 0, got {args.refine_full_res_depth}")
+    if args.refine_full_res_channels < 0:
+        raise ValueError(f"`refine_full_res_channels` must be >= 0, got {args.refine_full_res_channels}")
     if args.freq_type == "geometric" and args.w_min <= 0:
         raise ValueError(f"`w_min` must be > 0 for geometric freq grids, got {args.w_min}")
     if args.w_max < args.w_min:
@@ -1622,6 +1630,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder_attention_heads", type=str, default="8,4,4")
     parser.add_argument("--decoder_attention_depths", type=str, default="1,1,0")
     parser.add_argument("--decoder_conv_depths", type=str, default="2,2,2")
+    parser.add_argument("--refine_full_res_depth", type=int, default=0)
+    parser.add_argument("--refine_full_res_channels", type=int, default=0)
     parser.add_argument("--decoder_window_size", type=int, default=8)
     parser.add_argument("--decoder_upsample_mode", type=str, default="bilinear", choices=("nearest", "bilinear", "bicubic"))
     parser.add_argument("--decoder_mlp_ratio", type=float, default=4.0)
