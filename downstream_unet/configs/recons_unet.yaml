@@ -1,0 +1,27 @@
+# recons_unet.yaml
+
+data:
+  data_path: "./data/unet_dataset_25k.pt"         
+  test_dataset: "./data/test_indices_25k.pt"
+
+training:
+  batch_size: 12
+  epochs: 100
+  learning_rate: 2e-4
+  num_workers: 0
+  val_freq: 1             # 每轮都验证
+
+model:
+  encoder_name: "resnet34"
+  encoder_weights: null
+  in_channels: 3
+  classes: 1
+
+loss:
+  dice_weight: 1.0
+  tv_weight: 0.1
+  spec_weight: 0.05
+
+logging:
+  save_dir: "./unet_checkpoints"
+  save_freq: 20
