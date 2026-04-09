@@ -14,21 +14,6 @@ import sys
 import time
 from pathlib import Path
 
-if __package__ in {None, ""}:
-    _CURRENT_DIR = Path(__file__).resolve().parent
-    _PROJECT_ROOT = _CURRENT_DIR.parent
-    _REPO_ROOT = _PROJECT_ROOT.parent
-    if str(_REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(_REPO_ROOT))
-
-    import importlib
-
-    ensure_cuda_runtime_libs = importlib.import_module(
-        "vqae_pretrain.scripts.runtime_bootstrap"
-    ).ensure_cuda_runtime_libs
-else:
-    from .runtime_bootstrap import ensure_cuda_runtime_libs
-
 
 def _inject_repo_root() -> Path:
     """Inject repository root into `sys.path` for direct script execution.
@@ -142,33 +127,34 @@ def _normalize_gpu_csv(gpu_list: list[str]) -> str:
     return ",".join(gpu_list)
 
 
-def _is_cuda_available() -> bool:
-    """Check whether CUDA runtime is available for current Python process.
+def _is_musa_available() -> bool:
+    """Check whether MUSA runtime is available for current Python process.
 
     Returns:
-        True when torch can be imported and CUDA is available, else False.
+        True when torch can be imported and MUSA is available, else False.
     """
     try:
         import torch_musa
         import torch
-
-        return bool(torch.cuda.is_available())
+        torch.backends.mudnn.allow_tf32 = True
+        return bool(torch.musa.is_available())
     except Exception:
         return False
 
 
 def _get_visible_cuda_device_count() -> int:
-    """Query the number of CUDA devices visible to current process.
+    """Query the number of MUSA devices visible to current process.
 
     Returns:
-        Visible CUDA device count, or `0` when unavailable.
+        Visible MUSA device count, or `0` when unavailable.
     """
     try:
+        import torch_musa
         import torch
 
-        if not torch.cuda.is_available():
+        if not torch.musa.is_available():
             return 0
-        return int(torch.cuda.device_count())
+        return int(torch.musa.device_count())
     except Exception:
         return 0
 
@@ -181,7 +167,7 @@ def _normalize_requested_gpu_list(gpu_list: list[str], visible_device_count: int
 
     Args:
         gpu_list: Requested GPU id list from config/CLI.
-        visible_device_count: CUDA device count visible to current process.
+        visible_device_count: MUSA device count visible to current process.
 
     Returns:
         Effective GPU list safe for current runtime.
@@ -329,7 +315,7 @@ def main() -> None:
             "vqae_pretrain.src.utils.config"
         ).load_yaml_config
     else:
-        from ..src.engine.trainer import run_cli
+        from ..src.engine.trainer_musa import run_cli
         from ..src.utils.config import load_yaml_config
 
     pre_parser = argparse.ArgumentParser(add_help=False)
@@ -385,12 +371,12 @@ def main() -> None:
 
     gpu_from_config = str(config.get("gpu", "0"))
     requested_gpu_list = _split_gpu_list(gpu_from_config)
-    cuda_available = _is_cuda_available()
+    cuda_available = _is_musa_available()
     visible_device_count = _get_visible_cuda_device_count() if cuda_available else 0
     gpu_list = _normalize_requested_gpu_list(requested_gpu_list, visible_device_count)
     if gpu_list != requested_gpu_list:
         print(
-            "[WARN] Requested GPUs exceed visible CUDA devices; "
+            "[WARN] Requested GPUs exceed visible MUSA devices; "
             f"using {gpu_list} instead of {requested_gpu_list}.",
             file=sys.stderr,
         )
@@ -427,7 +413,7 @@ def main() -> None:
 
     if len(gpu_list) > 1 and not pre_args.no_auto_spawn and not cuda_available:
         print(
-            "[WARN] Multiple GPUs configured but CUDA is unavailable in current runtime; "
+            "[WARN] Multiple GPUs configured but MUSA is unavailable in current runtime; "
             "fallback to single-process launch.",
             file=sys.stderr,
         )
