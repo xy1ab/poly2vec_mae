@@ -705,6 +705,17 @@ def _gather_restart_candidates(
     return torch.cat(gathered_vectors, dim=0)
 
 
+def _gather_debug_counts(local_count: int, device: torch.device, dist_ctx: DistContext) -> list[int]:
+    """Gather one integer count from all ranks for init/debug reporting."""
+    count_tensor = torch.tensor([int(local_count)], device=device, dtype=torch.int64)
+    if not (dist_ctx.enabled and dist.is_initialized()):
+        return [int(count_tensor.item())]
+
+    gathered_counts = [torch.zeros_like(count_tensor) for _ in range(dist_ctx.world_size)]
+    dist.all_gather(gathered_counts, count_tensor)
+    return [int(item.item()) for item in gathered_counts]
+
+
 def _sync_quantizer_step_state(
     *,
     outputs,
@@ -1374,19 +1385,68 @@ def train_main(args) -> None:
             current_vq_beta = _effective_vq_beta(epoch, args)
 
             if use_vq and not model_to_save.quantizer.is_initialized:
-                if is_main_process(dist_ctx):
-                    print(
-                        f"[INFO] Initializing VQ codebook at epoch {epoch + 1} "
-                        f"from up to {args.vq_init_max_vectors} latent vectors..."
-                    )
-                    init_vectors = _collect_vq_init_vectors(
+                if args.vq_init_mode == "all_ranks_gather":
+                    local_budget = max(1, int(math.ceil(args.vq_init_max_vectors / max(1, dist_ctx.world_size))))
+                    local_init_vectors = _collect_vq_init_vectors(
                         model_to_save=model_to_save,
                         train_loader=train_loader,
                         codec=codec,
                         device=device,
-                        max_vectors=args.vq_init_max_vectors,
+                        max_vectors=local_budget,
                     )
-                    model_to_save.initialize_codebook(init_vectors, num_iters=args.vq_kmeans_iters)
+                    gathered_init_vectors = _gather_restart_candidates(
+                        local_init_vectors,
+                        code_dim=int(model_to_save.quantizer.embedding_dim),
+                        max_per_rank=local_budget,
+                        device=device,
+                        dist_ctx=dist_ctx,
+                    )
+                    if is_main_process(dist_ctx):
+                        if args.vq_init_debug:
+                            gathered_counts = _gather_debug_counts(
+                                local_count=int(local_init_vectors.shape[0]),
+                                device=device,
+                                dist_ctx=dist_ctx,
+                            )
+                            print(
+                                f"[VQ-INIT-DEBUG] mode=all_ranks_gather "
+                                f"epoch={epoch + 1} target_max={args.vq_init_max_vectors} "
+                                f"local_budget={local_budget} gathered_total_before_trim={int(gathered_init_vectors.shape[0])} "
+                                f"per_rank_min={min(gathered_counts)} per_rank_max={max(gathered_counts)} "
+                                f"per_rank_mean={sum(gathered_counts) / max(1, len(gathered_counts)):.1f}"
+                            )
+                        if int(gathered_init_vectors.shape[0]) > int(args.vq_init_max_vectors):
+                            perm = torch.randperm(gathered_init_vectors.shape[0], device=gathered_init_vectors.device)[
+                                : int(args.vq_init_max_vectors)
+                            ]
+                            gathered_init_vectors = gathered_init_vectors[perm]
+                        print(
+                            f"[INFO] Initializing VQ codebook at epoch {epoch + 1} "
+                            f"from {int(gathered_init_vectors.shape[0])} gathered latent vectors "
+                            f"(mode={args.vq_init_mode})."
+                        )
+                        model_to_save.initialize_codebook(gathered_init_vectors, num_iters=args.vq_kmeans_iters)
+                else:
+                    if is_main_process(dist_ctx):
+                        init_vectors = _collect_vq_init_vectors(
+                            model_to_save=model_to_save,
+                            train_loader=train_loader,
+                            codec=codec,
+                            device=device,
+                            max_vectors=args.vq_init_max_vectors,
+                        )
+                        if args.vq_init_debug:
+                            print(
+                                f"[VQ-INIT-DEBUG] mode=rank0_local "
+                                f"epoch={epoch + 1} target_max={args.vq_init_max_vectors} "
+                                f"rank0_local_vectors={int(init_vectors.shape[0])}"
+                            )
+                        print(
+                            f"[INFO] Initializing VQ codebook at epoch {epoch + 1} "
+                            f"from {int(init_vectors.shape[0])} latent vectors "
+                            f"(mode={args.vq_init_mode})."
+                        )
+                        model_to_save.initialize_codebook(init_vectors, num_iters=args.vq_kmeans_iters)
                 _broadcast_quantizer_state(model_to_save, dist_ctx)
                 distributed_barrier(dist_ctx)
 
@@ -1448,6 +1508,24 @@ def train_main(args) -> None:
                         f"Train Loss: {loss.item():.4f}, VQ: {step_outputs['weighted_vq'].item():.4f}, "
                         f"Perplexity: {step_outputs['outputs'].perplexity.item():.2f}, "
                         f"ActiveCodes: {int(step_outputs['outputs'].active_codes.item())}"
+                    )
+                if (
+                    args.vq_init_debug
+                    and use_vq
+                    and epoch == args.vq_warmup_epochs
+                    and step < 3
+                    and is_main_process(dist_ctx)
+                    and step_outputs["outputs"].usage_counts is not None
+                ):
+                    usage_counts = step_outputs["outputs"].usage_counts.detach().float()
+                    topk = torch.topk(usage_counts, k=min(10, int(usage_counts.numel()))).values.tolist()
+                    print(
+                        f"[VQ-STEP-DEBUG] mode={args.vq_init_mode} "
+                        f"epoch={epoch + 1} step={step} "
+                        f"usage_sum={int(usage_counts.sum().item())} "
+                        f"perplexity={step_outputs['outputs'].perplexity.item():.2f} "
+                        f"active={int(step_outputs['outputs'].active_codes.item())} "
+                        f"topk_usage={[int(v) for v in topk]}"
                     )
 
                 if max_train_steps > 0 and train_steps >= max_train_steps:
@@ -1647,6 +1725,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vq_init_max_vectors", type=int, default=100000)
     parser.add_argument("--vq_kmeans_iters", type=int, default=10)
     parser.add_argument("--vq_restart_pool_size_per_rank", type=int, default=2048)
+    parser.add_argument(
+        "--vq_init_mode",
+        type=str,
+        default="rank0_local",
+        choices=("rank0_local", "all_ranks_gather"),
+    )
+    parser.add_argument("--vq_init_debug", action="store_true")
 
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=512)
