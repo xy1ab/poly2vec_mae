@@ -1,42 +1,36 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 '''
-@File    :   run_reconstruction_musa.py
-@Time    :   2026/04/07 14:34:03
+@File    :   run_getdata.py
+@Time    :   2026/04/09 14:06:10
 @Author  :   Hu Bin 
 @Version :   1.0
 @Desc    :   None
 '''
 
+
 import torch
 import argparse
 from pathlib import Path
-
-from tqdm import tqdm
-from datetime import datetime
 import sys
-import re
 from typing import Any
-
-import numpy as np
-import matplotlib.path as mpltPath
-
+import re
 import os
+from tqdm import tqdm
 import numpy as np
-
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, "../../"))
 sys.path.append(project_root)
+from mae_pretrain.src.datasets.sharded_pt_dataset import _ensure_numpy_float32
 from mae_pretrain.src.datasets.geometry_polygon import pad_triangle_batch
 from mae_pretrain.src.datasets.registry import get_geometry_codec
-from mae_pretrain.src.datasets.shard_io import load_triangle_shard, resolve_triangle_shard_paths
-from mae_pretrain.src.datasets.sharded_pt_dataset import _ensure_numpy_float32
 from mae_pretrain.src.models.factory import load_mae_model, load_pretrained_encoder
-from mae_pretrain.src.models.decoder import TransUNetdecoder
 from mae_pretrain.src.utils.config import load_config_any
+from mae_pretrain.src.datasets.shard_io import load_triangle_shard, resolve_triangle_shard_paths
 from mae_pretrain.src.utils.filesystem import ensure_dir
 from mae_pretrain.src.utils.precision import autocast_context, normalize_precision
-
+from datetime import datetime
+import torch.nn.functional as F
 
 def rasterize_triangles_pytorch(batch_tris, spatial_size=256):
     """
@@ -89,54 +83,12 @@ def rasterize_triangles_pytorch(batch_tris, spatial_size=256):
 
     return final_mask.view(B, H, W).float()
 
-def _default_device() -> str:
-    """Resolve default runtime device string."""
-    try:
-        import torch
-
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:
-        return "cpu"
-
 def _extract_last_int(text: str) -> int | None:
     """Extract the last integer substring from text, if present."""
     matches = re.findall(r"(\d+)", text)
     if not matches:
         return None
     return int(matches[-1])
-
-def _resolve_user_path(path_str: str, project_root: Path) -> Path:
-    """Resolve one user-provided path against cwd and project root."""
-    raw_path = Path(path_str).expanduser()
-    if raw_path.is_absolute():
-        return raw_path
-
-    cwd_candidate = (Path.cwd() / raw_path).resolve()
-    if cwd_candidate.exists():
-        return cwd_candidate
-    return (project_root / raw_path).resolve()
-
-def _inject_repo_root() -> Path:
-    """Inject repository root into `sys.path` for direct script execution.
-
-    Returns:
-        `mae_pretrain` project root path.
-    """
-    current_dir = Path(__file__).resolve().parent
-    project_root = current_dir.parent
-    repo_root = project_root.parent
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    return project_root
-
-def _build_output_path(project_root: Path, data_dir: str, output_path: str | None) -> Path:
-    """Resolve output path from explicit CLI path or one timestamped default."""
-    if output_path:
-        return Path(output_path).expanduser().resolve()
-
-    data_name = Path(data_dir).expanduser().resolve().name
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return project_root / "outputs" / "forward_batch" / f"{data_name}_forward_batch_{timestamp}.pt"
 
 def _resolve_model_artifacts(model_dir: str) -> tuple[Path, Path, Path, bool]:
     """Resolve encoder weight, MAE weight, and config under one model directory."""
@@ -202,6 +154,51 @@ def _resolve_model_artifacts(model_dir: str) -> tuple[Path, Path, Path, bool]:
     if encoder_candidates:
         return encoder_candidates[0], config_candidates[0], False
 
+def _default_device() -> str:
+    """Resolve default runtime device string."""
+    try:
+        import torch
+
+        return "musa" if torch.musa.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _resolve_user_path(path_str: str, project_root: Path) -> Path:
+    """Resolve one user-provided path against cwd and project root."""
+    raw_path = Path(path_str).expanduser()
+    if raw_path.is_absolute():
+        return raw_path
+
+    cwd_candidate = (Path.cwd() / raw_path).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return (project_root / raw_path).resolve()
+
+def _inject_repo_root() -> Path:
+    """Inject repository root into `sys.path` for direct script execution.
+
+    Returns:
+        `mae_pretrain` project root path.
+    """
+    current_dir = Path(__file__).resolve().parent
+    project_root = current_dir.parent
+    repo_root = project_root.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    return project_root
+
+
+def _build_output_path(project_root: Path, data_dir: str, output_path: str | None) -> Path:
+    """Resolve output path from explicit CLI path or one timestamped default."""
+    if output_path:
+        return Path(output_path).expanduser().resolve()
+
+    data_name = Path(data_dir).expanduser().resolve().name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return project_root / "outputs" / "forward_batch" / f"{data_name}_forward_batch_{timestamp}.pt"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build CLI parser for batch forward export."""
     parser = argparse.ArgumentParser(
@@ -210,150 +207,166 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model_dir", type=str, required=True, help="Directory containing encoder/MAE checkpoints and config.")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
     parser.add_argument("--output_path", type=str, default="", help="Output `.pt` file path.")
-    parser.add_argument("--batch_size", type=int, default=64, help="Inference batch size.")
-    parser.add_argument("--device", type=str, default=_default_device(), help="Runtime device, e.g. cuda or cpu.")
     parser.add_argument("--precision", type=str, default="fp32", help="Runtime precision: fp32/bf16/fp16.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Inference batch size.")
     parser.add_argument("--max_samples", type=int, default=0, help="Optional export cap; 0 means all samples.")
+    parser.add_argument("--device", type=str, default=_default_device(), help="Runtime device, e.g. musa or cpu.")
+    
     return parser
 
-import os
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from pathlib import Path
-from tqdm import tqdm
-from datetime import datetime
-    
 
-def cleanup():
-    dist.destroy_process_group()
-
-def worker(rank, world_size, args):
-
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    print(f"Rank {rank} initialized.")
-    # 1. 设备初始化
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+def getdata(args) -> None:
+    """CLI main entrypoint."""
     project_root = _inject_repo_root()
-    
-    # 2. 路径处理：每个进程生成独特的文件名
+
+    args.precision = normalize_precision(args.precision)
+    if args.batch_size <= 0:
+        raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
+    if args.max_samples < 0:
+        raise ValueError(f"`max_samples` must be >= 0, got {args.max_samples}")
+
     args.model_dir = str(_resolve_user_path(args.model_dir, project_root))
     args.data_dir = str(_resolve_user_path(args.data_dir, project_root))
-    base_output_path = _build_output_path(project_root, args.data_dir, args.output_path or None)
-    
-    # 每个进程的文件名：output_name.part0.pt, output_name.part1.pt ...
-    rank_output_path = base_output_path.parent / f"{base_output_path.stem}.part{rank}{base_output_path.suffix}"
-    
-    if rank == 0:
-        ensure_dir(base_output_path.parent)
-    dist.barrier() # 确保目录创建完毕
+    output_path = _build_output_path(project_root, args.data_dir, args.output_path or None)
+    ensure_dir(output_path.parent)
 
-    # 3. 数据分片 (Data Sharding)
-    all_shard_paths = resolve_triangle_shard_paths(args.data_dir, warn_fn=lambda m: print(m) if rank == 0 else None)
-    my_shard_paths = all_shard_paths[rank::world_size] # 均匀分配
+    requested_device = args.device or _default_device()
+    if str(requested_device).startswith("musa") and not torch.musa.is_available():
+        print("[WARN] MUSA unavailable, fallback to CPU for forward export.")
+        requested_device = "cpu"
+    device = torch.device(requested_device)
 
-    # 4. 加载模型与插件
-    encoder_weight, config_path, _ = _resolve_model_artifacts(args.model_dir)
+    shard_paths = resolve_triangle_shard_paths(args.data_dir, warn_fn=lambda message: print(message))
+    encoder_weight, config_path, encoder_fallback_to_mae = _resolve_model_artifacts(args.model_dir)
+
     config = load_config_any(config_path)
     geom_type = str(config.get("geom_type", "polygon")).lower()
     codec = get_geometry_codec(geom_type, config, device=str(device))
-    
+
     encoder = load_pretrained_encoder(
-        weight_path=encoder_weight, config_path=config_path,
-        device=device, precision=args.precision
+        weight_path=encoder_weight,
+        config_path=config_path,
+        device=device,
+        precision=args.precision,
     )
+
     encoder.eval()
 
-    # 5. 局部变量
-    local_samples = []
-    exported_count = 0
-    pending_tris = []
 
-    def flush_pending_to_memory():
+    metadata: dict[str, Any] = {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "model_dir": str(Path(args.model_dir).expanduser().resolve()),
+        "data_dir": str(Path(args.data_dir).expanduser().resolve()),
+        "config_path": str(Path(config_path).expanduser().resolve()),
+        "encoder_weight": str(Path(encoder_weight).expanduser().resolve()),
+        "precision": args.precision,
+        "device": str(device),
+        "spatial_size": 256,
+        "geom_type": geom_type,
+        "config": dict(config),
+        "shard_paths": [str(path) for path in shard_paths],
+        "processed_shard_count": 0,
+        "sample_count": 0,
+    }
+
+    output_samples: list[dict[str, Any]] = []
+    pending_tris: list[Any] = []
+    exported_count = 0
+    processed_shard_count = 0
+
+    def flush_pending() -> None:
+        """Run one inference batch and append output sample dicts."""
         nonlocal exported_count
-        if not pending_tris: return
-        
+        if not pending_tris:
+            return
+
         batch_tris, lengths = pad_triangle_batch(pending_tris, device=device)
         with torch.no_grad():
-            # 特征提取
             mag, phase = codec.cft_batch(batch_tris, lengths)
             imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
-            true_imag = rasterize_triangles_pytorch(batch_tris)
-            
+            # true_imag = rasterize_triangles_pytorch(batch_tris)
             with autocast_context(device, args.precision):
                 encoder_features = encoder(imgs)
-            
-            # 关键：立即转回 CPU 释放显存
-            embeddings = encoder_features.float().cpu()
-            imgs_cpu = true_imag.cpu()
 
-        for i in range(len(pending_tris)):
-            local_samples.append({
-                "embedding": embeddings[i],
-                "imag": imgs_cpu[i],
-            })
-        
+            embeddings = encoder_features.float().cpu()
+            # 逆变换出模糊空间图 (通道1)
+            raw_mag = torch.expm1(mag)
+            # F_uv = raw_mag * torch.exp(1j * phase)
+            F_uv_real = raw_mag * torch.cos(phase)
+            F_uv_imag = raw_mag * torch.sin(phase)
+            # x_spatial = engine.icft_2d(F_uv.squeeze(1), spatial_size=cfg.SPATIAL_SIZE)
+            x_spatial = codec.icft_2d(F_uv_real.squeeze(1), F_uv_imag.squeeze(1), spatial_size=256)
+            x_spatial = x_spatial.unsqueeze(1) #[1, 1, 256, 256]
+            
+            # 使用双线性插值, 将频域特征强制缩放到 256x256 (通道2, 通道3)
+            mag_map = F.interpolate(mag, size=(256, 256), mode='bilinear', align_corners=False)
+            phase_map = F.interpolate(phase, size=(256, 256), mode='bilinear', align_corners=False)
+            
+            # 拼接成 3 通道输入
+            x_3channel = torch.cat([x_spatial, mag_map, phase_map], dim=1).squeeze(0).cpu().half() # [3, 256, 256]
+
+
+        start_index = exported_count + 1
+        for offset, tri_np in enumerate(pending_tris):
+            sample_index = start_index + offset
+            output_samples.append(
+                {
+                    "sample_index": int(sample_index),
+                    # "triangles": torch.from_numpy(tri_np.astype("float32", copy=False)),
+                    "embedding": embeddings[offset],
+                    "x_3channel": x_3channel[offset],
+                }
+            )
+
         exported_count += len(pending_tris)
         pending_tris.clear()
 
-    # 6. 开始循环
-    with tqdm(my_shard_paths, desc=f"Rank {rank}", position=rank, disable=False) as pbar:
-        for shard_path in pbar:
-            shard_data = load_triangle_shard(shard_path)
-            for sample in shard_data:
-                pending_tris.append(_ensure_numpy_float32(sample))
-                
-                if len(pending_tris) >= args.batch_size:
-                    flush_pending_to_memory()
-                
-                # 检查是否达到总样本限制 (近似平分)
-                if args.max_samples > 0 and (exported_count * world_size) >= args.max_samples:
-                    break
-            if args.max_samples > 0 and (exported_count * world_size) >= args.max_samples:
+    for shard_path in tqdm(shard_paths, desc="Reading shards"):
+        processed_shard_count += 1
+        shard_data = load_triangle_shard(shard_path)
+        for sample in shard_data:
+            tri_np = _ensure_numpy_float32(sample)
+            pending_tris.append(tri_np)
+
+            if len(pending_tris) >= args.batch_size:
+                flush_pending()
+
+            if args.max_samples > 0 and exported_count + len(pending_tris) >= args.max_samples:
+                remaining = args.max_samples - exported_count
+                if remaining < len(pending_tris):
+                    pending_tris[:] = pending_tris[:remaining]
+                flush_pending()
                 break
 
-    flush_pending_to_memory()
+        if args.max_samples > 0 and exported_count >= args.max_samples:
+            break
 
-    # 7. 独立保存本进程文件
-    metadata = {
-        "rank": rank,
-        "world_size": world_size,
-        "created_at": datetime.now().isoformat(),
-        "sample_count": len(local_samples),
-        "precision": args.precision,
+    flush_pending()
+
+
+
+
+    # metadata["processed_shard_count"] = int(processed_shard_count)
+    metadata["sample_count"] = int(len(output_samples))
+    if output_samples:
+        metadata["embedding_dim"] = int(output_samples[0]["embedding"].numel())
+
+    payload = {
+        "metadata": metadata,
+        "samples": output_samples,
     }
-    
-    payload = {"metadata": metadata, "samples": local_samples}
-    torch.save(payload, rank_output_path)
-    print(f"Rank {rank} saved {len(local_samples)} samples to {rank_output_path.name}")
+    torch.save(payload, output_path)
 
-    dist.barrier()
-    if rank == 0:
-        print(f"\n[DONE] All workers finished. Files are saved as {base_output_path.stem}.partX.pt")
-    
-    cleanup()
-
-def getdata(args) -> None:
-    """入口函数"""
-    world_size = torch.cuda.device_count()
-    if world_size == 0:
-        world_size = 1 # 支持 CPU 模式
-    """每个 GPU 进程执行的逻辑"""
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    print(f"[INFO] Launching {world_size} processes...")
-    mp.spawn(
-        worker,
-        args=(world_size, args),
-        nprocs=world_size,
-        join=True
-    )
-
+    print(f"[DONE] Saved: {output_path}")
+    print(f"[DONE] Shards read: {processed_shard_count}")
+    print(f"[DONE] Sample count: {len(output_samples)}")
+    if output_samples:
+        print(f"[DONE] Embedding dim: {int(output_samples[0]['embedding'].numel())}")
+    else:
+        print("[DONE] No samples exported.")
 
 
 if __name__ == '__main__':
     args = build_arg_parser().parse_args()
     getdata(args)
-
-

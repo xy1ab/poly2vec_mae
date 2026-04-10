@@ -404,6 +404,48 @@ def _summarize_row_geometry(geom) -> dict[str, Any]:
     }
 
 
+def _build_row_meta4(geom) -> np.ndarray:
+    """Build one row-level meta vector `[cx, cy, L, Lx, Ly, N]`.
+
+    Meta definition:
+    1) `cx`: row bbox center x.
+    2) `cy`: row bbox center y.
+    3) `L`: row bbox longest side length.
+    4) `Lx`: row bbox width along x axis.
+    5) `Ly`: row bbox height along y axis.
+    6) `N`: total node count across all polygon parts (shell + holes), after
+       ring cleanup used by existing node-count helpers.
+
+    Args:
+        geom: Raw shapely geometry from one source row.
+
+    Returns:
+        Float32 vector shaped `(6,)`. Invalid geometries return zeros.
+    """
+    if geom is None or geom.is_empty or geom.geom_type not in {"Polygon", "MultiPolygon"}:
+        return np.zeros((6,), dtype=np.float32)
+
+    try:
+        minx, miny, maxx, maxy = geom.bounds
+        cx = (float(minx) + float(maxx)) * 0.5
+        cy = (float(miny) + float(maxy)) * 0.5
+        bbox_width = float(maxx) - float(minx)
+        bbox_height = float(maxy) - float(miny)
+        longest_side = max(bbox_width, bbox_height)
+    except Exception:
+        return np.zeros((6,), dtype=np.float32)
+
+    polygon_parts = _expand_geometry_to_polygons(geom)
+    node_count = 0
+    for poly, _ in polygon_parts:
+        node_count += int(_polygon_node_count(poly))
+
+    return np.asarray(
+        [cx, cy, longest_side, bbox_width, bbox_height, float(node_count)],
+        dtype=np.float32,
+    )
+
+
 def _build_special_row_log_record(
     *,
     file_path: str,
@@ -1238,6 +1280,7 @@ def _init_result_counters() -> dict[str, Any]:
     """Create a reusable row-level counter payload for triangulation statistics."""
     return {
         "triangles": [],
+        "meta": [],
         "triangulated_output_count": 0,
         "total_rows": 0,
         "degenerate_row_count": 0,
@@ -1268,6 +1311,7 @@ def _merge_result_counters(target: dict[str, Any], partial: dict[str, Any]) -> N
         partial: Partial payload from row/chunk computation.
     """
     target["triangles"].extend(list(partial.get("triangles", [])))
+    target["meta"].extend(list(partial.get("meta", [])))
     target["triangulated_output_count"] += int(partial.get("triangulated_output_count", 0))
     target["total_rows"] += int(partial.get("total_rows", 0))
     target["degenerate_row_count"] += int(partial.get("degenerate_row_count", 0))
@@ -1483,6 +1527,7 @@ def _triangulate_row_geometry(
     is_degenerated_row = bool(had_part_filter or filtered_triangle_count > 0)
 
     row_out["triangles"].append(triangles.astype(np.float32))
+    row_out["meta"].append(_build_row_meta4(geom))
     row_out["triangulated_output_count"] = 1
     row_out["triangulated_multipolygon_row_count"] = int(is_multipolygon)
     row_out["triangulated_hole_row_count"] = int(has_holes)
@@ -1874,10 +1919,12 @@ def _triangulate_task_worker(
                             _merge_result_counters(task_out, ordered_chunk)
                         else:
                             chunk_triangles = list(ordered_chunk.get("triangles", []))
+                            chunk_meta = list(ordered_chunk.get("meta", []))
                             if writer is not None and chunk_triangles:
-                                writer.add_many(chunk_triangles)
+                                writer.add_many(chunk_triangles, chunk_meta if writer.with_meta else None)
                                 ordered_chunk = dict(ordered_chunk)
                                 ordered_chunk["triangles"] = []
+                                ordered_chunk["meta"] = []
                             task_output_sample_count += int(len(chunk_triangles))
                             _merge_result_counters(task_out, ordered_chunk)
 
@@ -1936,6 +1983,17 @@ def _build_shard_path(base_output_path: Path, part_index: int) -> Path:
     return base_output_path.with_name(f"{base_output_path.stem}_part_{part_index:04d}{suffix}")
 
 
+def _build_meta_output_path(base_output_path: Path) -> Path:
+    """Build paired meta output path from one triangle output base path."""
+    suffix = base_output_path.suffix if base_output_path.suffix else ".pt"
+    stem = base_output_path.stem
+    if stem.endswith("_tri"):
+        meta_stem = f"{stem[:-4]}_meta"
+    else:
+        meta_stem = f"{stem}_meta"
+    return base_output_path.with_name(f"{meta_stem}{suffix}")
+
+
 def _default_log_path(output_path: Path) -> Path:
     """Build default triangulation-log path beside output `.pt` base file.
 
@@ -1956,33 +2014,54 @@ def _default_row_failures_path(output_path: Path) -> Path:
 class _ShardWriter:
     """Incremental writer that flushes samples to `.pt` shards by size estimate."""
 
-    def __init__(self, output_path: Path, shard_size_mb: float):
+    def __init__(self, output_path: Path, shard_size_mb: float, with_meta: bool):
         """Initialize shard writer.
 
         Args:
             output_path: Base output path.
             shard_size_mb: Target shard size in MB. `<=0` means single-file output.
+            with_meta: Whether to write paired meta shards.
         """
         self.output_path = output_path
         self.shard_size_bytes = int(max(0.0, float(shard_size_mb)) * 1024.0 * 1024.0)
+        self.with_meta = bool(with_meta)
+        self.meta_output_path = _build_meta_output_path(output_path) if self.with_meta else None
         self._buffer: list[np.ndarray] = []
+        self._meta_buffer: list[np.ndarray] = []
         self._buffer_estimated_bytes = 0
 
         self.shard_paths: list[Path] = []
         self.shard_sample_counts: list[int] = []
+        self.meta_shard_paths: list[Path] = []
+        self.meta_shard_sample_counts: list[int] = []
 
-    def add_many(self, samples: list[np.ndarray]) -> None:
+    def add_many(self, samples: list[np.ndarray], meta: list[np.ndarray] | None = None) -> None:
         """Add multiple samples into current shard buffer.
 
         Args:
             samples: Triangle sample list.
+            meta: Optional meta sample list aligned with `samples`.
         """
-        for sample in samples:
+        if self.with_meta:
+            if meta is None:
+                raise ValueError("Meta payload is required when with_meta=True.")
+            if len(samples) != len(meta):
+                raise ValueError(
+                    f"Sample/meta length mismatch: triangles={len(samples)}, meta={len(meta)}"
+                )
+
+        for idx, sample in enumerate(samples):
             est_bytes = _estimate_triangle_sample_bytes(sample)
             if self.shard_size_bytes > 0 and self._buffer and (self._buffer_estimated_bytes + est_bytes > self.shard_size_bytes):
                 self.flush()
             self._buffer.append(sample)
             self._buffer_estimated_bytes += est_bytes
+            if self.with_meta:
+                assert meta is not None
+                meta_sample = np.asarray(meta[idx], dtype=np.float32)
+                if meta_sample.shape != (6,):
+                    raise ValueError(f"Meta sample must have shape (6,), got {meta_sample.shape}")
+                self._meta_buffer.append(meta_sample)
 
     def flush(self) -> Path | None:
         """Flush current buffer to disk as one `.pt` file.
@@ -2003,7 +2082,24 @@ class _ShardWriter:
         self.shard_paths.append(written_path)
         self.shard_sample_counts.append(len(self._buffer))
 
+        if self.with_meta:
+            if self.meta_output_path is None:
+                raise RuntimeError("meta_output_path is missing while with_meta=True.")
+            if len(self._meta_buffer) != len(self._buffer):
+                raise RuntimeError(
+                    "Meta buffer and triangle buffer length mismatch before flush: "
+                    f"meta={len(self._meta_buffer)}, tri={len(self._buffer)}"
+                )
+            if self.shard_size_bytes > 0:
+                meta_output_file = _build_shard_path(self.meta_output_path, len(self.meta_shard_paths) + 1)
+            else:
+                meta_output_file = self.meta_output_path
+            written_meta_path = save_triangle_shard(meta_output_file, self._meta_buffer)
+            self.meta_shard_paths.append(written_meta_path)
+            self.meta_shard_sample_counts.append(len(self._meta_buffer))
+
         self._buffer = []
+        self._meta_buffer = []
         self._buffer_estimated_bytes = 0
         return output_file
 
@@ -2014,12 +2110,6 @@ class _ShardWriter:
             Tuple `(shard_paths, manifest_path)`.
         """
         self.flush()
-        if not self.shard_paths:
-            return [], None
-
-        if self.shard_size_bytes <= 0:
-            return self.shard_paths, None
-
         manifest_path = self.output_path.with_name(f"{self.output_path.stem}.manifest.json")
         manifest = {
             "base_output_path": str(self.output_path),
@@ -2036,6 +2126,30 @@ class _ShardWriter:
                 for path, sample_count in zip(self.shard_paths, self.shard_sample_counts)
             ],
         }
+
+        if self.with_meta:
+            if self.meta_output_path is None:
+                raise RuntimeError("meta_output_path is missing while with_meta=True.")
+            if len(self.meta_shard_paths) != len(self.shard_paths):
+                raise RuntimeError(
+                    "Triangle/meta shard count mismatch: "
+                    f"tri={len(self.shard_paths)}, meta={len(self.meta_shard_paths)}"
+                )
+            if self.meta_shard_sample_counts != self.shard_sample_counts:
+                raise RuntimeError(
+                    "Triangle/meta shard sample-count mismatch: "
+                    f"tri={self.shard_sample_counts}, meta={self.meta_shard_sample_counts}"
+                )
+            manifest["meta_base_output_path"] = str(self.meta_output_path)
+            manifest["meta_shards"] = [
+                {
+                    "path": str(path),
+                    "sample_count": int(sample_count),
+                    "size_bytes": int(path.stat().st_size) if path.exists() else -1,
+                }
+                for path, sample_count in zip(self.meta_shard_paths, self.meta_shard_sample_counts)
+            ]
+
         with manifest_path.open("w", encoding="utf-8") as fp:
             json.dump(manifest, fp, ensure_ascii=False, indent=2)
 
@@ -2109,8 +2223,9 @@ def _consume_worker_result(result: dict[str, Any], writer: _ShardWriter) -> dict
             tqdm.write(f"[WARN] Failed to read/process {file_path} (layer={layer_name}): {error}")
         return stats
 
-    triangles = result.get("triangles", [])
-    writer.add_many(triangles)
+    triangles = list(result.get("triangles", []))
+    meta = list(result.get("meta", []))
+    writer.add_many(triangles, meta if writer.with_meta else None)
     return stats
 
 
@@ -2133,6 +2248,7 @@ def process_and_save(
     timeout_safe: float = _TRIANGLE_SUBPROC_TIMEOUT_SEC,
     norm_max: float = 1.0,
     log: bool = False,
+    with_meta: bool = True,
 ) -> None:
     """Build triangulated polygon dataset and save to disk.
 
@@ -2155,6 +2271,7 @@ def process_and_save(
         timeout_safe: Row-isolation subprocess timeout in seconds.
         norm_max: Maximum absolute normalized coordinate.
         log: Whether to save triangulation audit log JSON.
+        with_meta: Whether to export one paired `*_meta*.pt` stream.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2183,6 +2300,7 @@ def process_and_save(
     edge_safe = float(edge_safe)
     timeout_safe = float(timeout_safe)
     norm_max = float(norm_max)
+    with_meta = bool(with_meta)
     if norm_max <= 0.0:
         raise ValueError("--norm_max must be > 0.")
     if timeout_safe <= 0.0:
@@ -2205,12 +2323,13 @@ def process_and_save(
         f"{safe_mode} | part>{part_safe}, node>{node_safe}, hole>{hole_safe}, edge<{edge_safe:.3e}, timeout={timeout_safe:.1f}s"
     )
     print(f"[INFO] Row normalization max  : {norm_max:.3f}")
+    print(f"[INFO] Write paired meta      : {with_meta}")
     if shard_size_mb > 0:
         print(f"[INFO] Sharding enabled: target {shard_size_mb:.2f} MB per output .pt")
     else:
         print("[WARN] Sharding disabled: single output .pt keeps all triangulated samples buffered until finalize().")
 
-    writer = _ShardWriter(output_path=output_path, shard_size_mb=shard_size_mb)
+    writer = _ShardWriter(output_path=output_path, shard_size_mb=shard_size_mb, with_meta=with_meta)
 
     files_ok = 0
     files_failed = 0
@@ -2305,13 +2424,10 @@ def process_and_save(
             pbar.update(1)
 
     if triangulated_total == 0:
-        print("[WARN] No valid polygons were triangulated. Nothing to save.")
-        shard_paths: list[Path] = []
-        manifest_path: Path | None = None
-    else:
-        shard_paths, manifest_path = writer.finalize()
-        if not shard_paths:
-            print("[WARN] No output shard was written.")
+        print("[WARN] No valid polygons were triangulated. Tri shards are empty; manifest will still be written.")
+    shard_paths, manifest_path = writer.finalize()
+    if not shard_paths:
+        print("[WARN] No output shard was written.")
 
     if failed_rows > 0 or chunk_failures > 0:
         row_failures_path = _default_row_failures_path(output_path)
@@ -2386,15 +2502,21 @@ def process_and_save(
         f"total={hole_rows}, triangulated={triangulated_hole_rows}, dropped={dropped_hole_rows}"
     )
 
-    if triangulated_total == 0:
-        return
-
     if shard_size_mb > 0:
         print(f"[INFO] Output shards           : {len(shard_paths)}")
         for shard_path in shard_paths:
             size_mb = shard_path.stat().st_size / (1024.0 * 1024.0)
             print(f"[INFO]   - {shard_path} ({size_mb:.2f} MB)")
-        if manifest_path is not None:
-            print(f"[INFO] Shard manifest         : {manifest_path}")
+        if with_meta and writer.meta_shard_paths:
+            print(f"[INFO] Meta shards             : {len(writer.meta_shard_paths)}")
+            for meta_shard_path in writer.meta_shard_paths:
+                meta_size_mb = meta_shard_path.stat().st_size / (1024.0 * 1024.0)
+                print(f"[INFO]   - {meta_shard_path} ({meta_size_mb:.2f} MB)")
     else:
-        print(f"[INFO] Saved output           : {shard_paths[0]}")
+        if shard_paths:
+            print(f"[INFO] Saved output           : {shard_paths[0]}")
+        if with_meta and writer.meta_shard_paths:
+            print(f"[INFO] Saved meta output      : {writer.meta_shard_paths[0]}")
+
+    if manifest_path is not None:
+        print(f"[INFO] Shard manifest         : {manifest_path}")

@@ -28,12 +28,11 @@ class PhysicalTokenizer(nn.Module):
     def forward(self, x): return self.proj(x.unsqueeze(-1))
 
 class NaturalResourceFoundationModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, vocab_size=20000):
         super().__init__()
-        self.config = config
         self.truth_dim, self.semantic_dim = 256, 256
         self.embed_dim = 768 
-        self.vocab_size = config.get('vocab_size', 20000)
+        self.vocab_size = vocab_size
         self.mask_ratio = 0.20
         
         self.inn_core = InvertibleNetwork(dim=self.truth_dim, num_layers=12)

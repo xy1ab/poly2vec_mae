@@ -45,6 +45,18 @@ def _inject_repo_root() -> Path:
     return project_root
 
 
+def _parse_bool_arg(raw_value: str) -> bool:
+    """Parse a CLI bool token from common truthy/falsy spellings."""
+    value = str(raw_value).strip().lower()
+    if value in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Invalid boolean value: {raw_value!r}. Use one of: true/false, 1/0, yes/no."
+    )
+
+
 def main() -> None:
     """CLI main function for dataset building."""
     ensure_cuda_runtime_libs()
@@ -167,6 +179,12 @@ def main() -> None:
         action="store_true",
         help="Save triangulation quality log JSON beside output .pt.",
     )
+    parser.add_argument(
+        "--with_meta",
+        type=_parse_bool_arg,
+        default=True,
+        help="Whether to write paired row-meta shards (`*_meta*.pt`) alongside triangle shards.",
+    )
     args = parser.parse_args()
     if args.file_type != "gdb" and str(args.layer).strip().lower() != "all":
         print(f"[WARN] --layer is ignored when --file_type={args.file_type}.")
@@ -212,6 +230,7 @@ def main() -> None:
         timeout_safe=args.timeout_safe,
         norm_max=args.norm_max,
         log=args.log,
+        with_meta=args.with_meta,
     )
 
 

@@ -1,18 +1,24 @@
 # loaders/loader.py
 import torch
-import os
 from torch.utils.data import Dataset
-
+from pathlib import Path
 class V2Dataset(Dataset):
     def __init__(self, data_dir):
-        self.data_dir = data_dir
-        self.file_list = sorted([f for f in os.listdir(data_dir) if f.endswith('.pt')])
-
+        """
+        Args:
+            data_path: 单个 .pt 文件路径，包含所有样本
+        """
+        shards = sorted(Path(data_dir).glob("shard_*.pt"))
+        all_samples = []
+        for shard in shards:
+            data = torch.load(shard)
+            all_samples.extend(data)
+        self.data = all_samples
+        print(f"✅ 加载数据: {data_dir}, 共 {len(self.data)} 个样本")
+    
     def __len__(self):
-        return len(self.file_list)
-
+        return len(self.data)
+    
     def __getitem__(self, idx):
-        file_path = os.path.join(self.data_dir, self.file_list[idx])
-        data = torch.load(file_path, map_location='cpu')
-        # 读取时转回 float32 供模型计算
-        return data['input'].float(), data['label'].float()
+        sample = self.data[idx]
+        return sample['input'].float(), sample['label'].float()

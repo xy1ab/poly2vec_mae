@@ -50,10 +50,8 @@ class PolyVqAePipeline:
         """Encode one triangle batch into code-index grids `[B,H_lat,W_lat]`."""
         imgs = self.triangles_to_images(triangles_list)
         with autocast_context(self.device, self.precision):
-            outputs = self.model(imgs, use_vq=True)
-        if outputs.indices is None:
-            raise RuntimeError("VQAE inference expected indices but received None.")
-        return outputs.indices.long().cpu()
+            indices = self.model.tokenize(imgs)
+        return indices.long().cpu()
 
     @torch.no_grad()
     def reconstruct_triangles(

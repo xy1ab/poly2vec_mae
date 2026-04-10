@@ -34,6 +34,9 @@ class VqAeForwardOutput:
     active_codes: torch.Tensor
     indices: torch.Tensor | None
     using_vq: bool
+    usage_counts: torch.Tensor | None = None
+    embed_sum: torch.Tensor | None = None
+    restart_candidates: torch.Tensor | None = None
 
 
 class PolyVqAutoencoder(nn.Module):
@@ -55,6 +58,8 @@ class PolyVqAutoencoder(nn.Module):
         decoder_attention_heads: Sequence[int] = (8, 4, 4),
         decoder_attention_depths: Sequence[int] = (1, 1, 0),
         decoder_conv_depths: Sequence[int] = (2, 2, 2),
+        refine_full_res_depth: int = 0,
+        refine_full_res_channels: int = 0,
         decoder_window_size: int = 8,
         decoder_upsample_mode: str = "bilinear",
         decoder_mlp_ratio: float = 4.0,
@@ -110,6 +115,8 @@ class PolyVqAutoencoder(nn.Module):
             attention_heads=decoder_attention_heads,
             attention_depths=decoder_attention_depths,
             conv_depths=decoder_conv_depths,
+            refine_full_res_depth=refine_full_res_depth,
+            refine_full_res_channels=refine_full_res_channels,
             window_size=decoder_window_size,
             mlp_ratio=decoder_mlp_ratio,
             drop_rate=decoder_drop_rate,
@@ -124,6 +131,12 @@ class PolyVqAutoencoder(nn.Module):
         """Encode inputs into pre-quantization latent code features."""
         latent = self.encode(imgs)
         return self.pre_vq_proj(self.pre_vq_norm(latent))
+
+    @torch.no_grad()
+    def tokenize(self, imgs: torch.Tensor) -> torch.Tensor:
+        """Encode inputs into discrete code-index grids `[B,H_lat,W_lat]`."""
+        code_features = self.encode_to_code_features(imgs)
+        return self.quantizer.encode_indices(code_features)
 
     def decode_from_code_features(self, code_features: torch.Tensor) -> torch.Tensor:
         """Decode code features into physically constrained frequency images."""
@@ -144,7 +157,7 @@ class PolyVqAutoencoder(nn.Module):
         """Initialize the EMA codebook from one set of latent vectors."""
         self.quantizer.initialize_codebook(vectors=vectors, num_iters=num_iters)
 
-    def forward(self, imgs: torch.Tensor, use_vq: bool = True) -> VqAeForwardOutput:
+    def forward(self, imgs: torch.Tensor, use_vq: bool = True, restart_pool_size: int = 0) -> VqAeForwardOutput:
         """Run full-image VQAE forward pass.
 
         During AE warmup, `use_vq=False` bypasses the quantizer while keeping the
@@ -153,12 +166,18 @@ class PolyVqAutoencoder(nn.Module):
         code_features = self.encode_to_code_features(imgs)
 
         if use_vq:
-            quantizer_output: QuantizerOutput = self.quantizer(code_features)
+            quantizer_output: QuantizerOutput = self.quantizer(
+                code_features,
+                restart_pool_size=restart_pool_size,
+            )
             decoded_features = quantizer_output.quantized
             vq_loss = quantizer_output.vq_loss
             perplexity = quantizer_output.perplexity
             active_codes = quantizer_output.active_codes
             indices = quantizer_output.indices
+            usage_counts = quantizer_output.usage_counts
+            embed_sum = quantizer_output.embed_sum
+            restart_candidates = quantizer_output.restart_candidates
         else:
             decoded_features = code_features
             device = code_features.device
@@ -166,6 +185,9 @@ class PolyVqAutoencoder(nn.Module):
             perplexity = torch.zeros((), device=device)
             active_codes = torch.zeros((), device=device)
             indices = None
+            usage_counts = None
+            embed_sum = None
+            restart_candidates = None
 
         recon_imgs = self.decode_from_code_features(decoded_features)
         return VqAeForwardOutput(
@@ -175,4 +197,7 @@ class PolyVqAutoencoder(nn.Module):
             active_codes=active_codes,
             indices=indices,
             using_vq=bool(use_vq),
+            usage_counts=usage_counts,
+            embed_sum=embed_sum,
+            restart_candidates=restart_candidates,
         )

@@ -77,6 +77,8 @@ _RESUME_LOCKED_KEYS = {
     "decoder_attention_heads",
     "decoder_attention_depths",
     "decoder_conv_depths",
+    "refine_full_res_depth",
+    "refine_full_res_channels",
     "decoder_window_size",
     "decoder_upsample_mode",
     "decoder_mlp_ratio",
@@ -314,6 +316,8 @@ def _build_model_kwargs(args, img_size: tuple[int, int]) -> dict:
         "decoder_attention_heads": args.decoder_attention_heads,
         "decoder_attention_depths": args.decoder_attention_depths,
         "decoder_conv_depths": args.decoder_conv_depths,
+        "refine_full_res_depth": args.refine_full_res_depth,
+        "refine_full_res_channels": args.refine_full_res_channels,
         "decoder_window_size": args.decoder_window_size,
         "decoder_upsample_mode": args.decoder_upsample_mode,
         "decoder_mlp_ratio": args.decoder_mlp_ratio,
@@ -461,6 +465,15 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`vq_init_max_vectors` must be > 0, got {args.vq_init_max_vectors}")
     if args.vq_kmeans_iters <= 0:
         raise ValueError(f"`vq_kmeans_iters` must be > 0, got {args.vq_kmeans_iters}")
+    if args.vq_restart_pool_size_per_rank < 0:
+        raise ValueError(
+            "`vq_restart_pool_size_per_rank` must be >= 0, "
+            f"got {args.vq_restart_pool_size_per_rank}"
+        )
+    if args.refine_full_res_depth < 0:
+        raise ValueError(f"`refine_full_res_depth` must be >= 0, got {args.refine_full_res_depth}")
+    if args.refine_full_res_channels < 0:
+        raise ValueError(f"`refine_full_res_channels` must be >= 0, got {args.refine_full_res_channels}")
     if args.freq_type == "geometric" and args.w_min <= 0:
         raise ValueError(f"`w_min` must be > 0 for geometric freq grids, got {args.w_min}")
     if args.w_max < args.w_min:
@@ -619,17 +632,132 @@ def _collect_vq_init_vectors(
     return torch.cat(vector_chunks, dim=0)
 
 
-def _broadcast_quantizer_state(model_to_save, dist_ctx: DistContext) -> None:
-    """Broadcast initialized quantizer buffers from rank 0 to all ranks."""
+def _broadcast_quantizer_state(model_or_quantizer, dist_ctx: DistContext) -> None:
+    """Broadcast quantizer buffers from rank 0 to all ranks."""
     if not (dist_ctx.enabled and dist_ctx.world_size > 1):
         return
+    quantizer = getattr(model_or_quantizer, "quantizer", model_or_quantizer)
     for buffer in (
-        model_to_save.quantizer.codebook,
-        model_to_save.quantizer.cluster_size,
-        model_to_save.quantizer.embed_avg,
-        model_to_save.quantizer.initialized,
+        quantizer.codebook,
+        quantizer.cluster_size,
+        quantizer.embed_avg,
+        quantizer.initialized,
     ):
         dist.broadcast(buffer, src=0)
+
+
+def _all_reduce_sum(value: torch.Tensor, dist_ctx: DistContext) -> torch.Tensor:
+    """All-reduce one tensor sum across ranks when distributed is enabled."""
+    if not (dist_ctx.enabled and dist.is_initialized()):
+        return value
+
+    out = value.clone()
+    dist.all_reduce(out)
+    return out
+
+
+def _gather_restart_candidates(
+    local_candidates: torch.Tensor | None,
+    *,
+    code_dim: int,
+    max_per_rank: int,
+    device: torch.device,
+    dist_ctx: DistContext,
+) -> torch.Tensor:
+    """Gather one bounded restart-candidate pool from all ranks.
+
+    Each rank contributes at most `max_per_rank` vectors. When distributed is
+    disabled, the function simply returns the local candidate tensor.
+    """
+    max_per_rank = max(0, int(max_per_rank))
+    if local_candidates is None:
+        local_candidates = torch.zeros((0, int(code_dim)), device=device, dtype=torch.float32)
+    else:
+        local_candidates = local_candidates.detach().float()
+
+    if max_per_rank == 0:
+        return local_candidates.new_zeros((0, int(code_dim)))
+
+    local_count = min(int(local_candidates.shape[0]), max_per_rank)
+    local_padded = torch.zeros((max_per_rank, int(code_dim)), device=device, dtype=torch.float32)
+    if local_count > 0:
+        local_padded[:local_count] = local_candidates[:local_count]
+
+    if not (dist_ctx.enabled and dist.is_initialized()):
+        return local_padded[:local_count]
+
+    count_tensor = torch.tensor([local_count], device=device, dtype=torch.int64)
+    gathered_counts = [torch.zeros_like(count_tensor) for _ in range(dist_ctx.world_size)]
+    dist.all_gather(gathered_counts, count_tensor)
+
+    gathered_padded = [torch.zeros_like(local_padded) for _ in range(dist_ctx.world_size)]
+    dist.all_gather(gathered_padded, local_padded)
+
+    gathered_vectors: list[torch.Tensor] = []
+    for padded, count in zip(gathered_padded, gathered_counts):
+        rank_count = int(count.item())
+        if rank_count > 0:
+            gathered_vectors.append(padded[:rank_count])
+
+    if not gathered_vectors:
+        return local_padded[:0]
+    return torch.cat(gathered_vectors, dim=0)
+
+
+def _sync_quantizer_step_state(
+    *,
+    outputs,
+    quantizer,
+    dist_ctx: DistContext,
+    apply_ema_update: bool,
+    restart_pool_size_per_rank: int,
+) -> None:
+    """Synchronize VQ stats and trainer-owned EMA updates across ranks."""
+    if outputs.usage_counts is None:
+        return
+
+    global_usage_counts = _all_reduce_sum(outputs.usage_counts.float(), dist_ctx)
+    global_perplexity, global_active_codes = quantizer.compute_usage_metrics(global_usage_counts)
+    outputs.perplexity = global_perplexity
+    outputs.active_codes = global_active_codes
+    outputs.usage_counts = global_usage_counts
+
+    if not apply_ema_update:
+        return
+
+    if outputs.embed_sum is None:
+        raise RuntimeError("Training VQ step expected local embed_sum but received None.")
+
+    global_embed_sum = _all_reduce_sum(outputs.embed_sum.float(), dist_ctx)
+    outputs.embed_sum = global_embed_sum
+    quantizer.apply_ema_update(global_usage_counts, global_embed_sum)
+
+    dead_code_threshold = float(quantizer.dead_code_threshold)
+    dead_code_count = int((quantizer.cluster_size < dead_code_threshold).sum().item()) if dead_code_threshold > 0 else 0
+    if dead_code_count <= 0:
+        return
+
+    restart_candidates = _gather_restart_candidates(
+        outputs.restart_candidates,
+        code_dim=int(quantizer.embedding_dim),
+        max_per_rank=restart_pool_size_per_rank,
+        device=quantizer.codebook.device,
+        dist_ctx=dist_ctx,
+    )
+
+    restarted_dead_codes = False
+    if is_main_process(dist_ctx):
+        restarted_dead_codes = quantizer.restart_dead_codes(restart_candidates)
+
+    restart_flag = torch.tensor(
+        [int(restarted_dead_codes)],
+        device=quantizer.codebook.device,
+        dtype=torch.int32,
+    )
+    if dist_ctx.enabled and dist.is_initialized():
+        dist.broadcast(restart_flag, src=0)
+    if bool(restart_flag.item()):
+        _broadcast_quantizer_state(quantizer, dist_ctx)
 
 
 def _resolve_training_pt_files(args, warn_fn=None) -> list[Path]:
@@ -860,7 +988,7 @@ def _format_epoch_metrics(prefix: str, metrics: dict[str, torch.Tensor]) -> str:
 
 def _save_fixed_visualization(
     *,
-    model,
+    model_to_save,
     codec,
     fixed_batch_tris: torch.Tensor,
     fixed_lengths: torch.Tensor,
@@ -878,7 +1006,7 @@ def _save_fixed_visualization(
         imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
 
         with autocast_context(device, precision):
-            outputs_fix = model(imgs_fix, use_vq=use_vq)
+            outputs_fix = model_to_save(imgs_fix, use_vq=use_vq, restart_pool_size=0)
 
         img_orig = imgs_fix[0].cpu()
         img_masked = img_orig.clone()
@@ -929,12 +1057,15 @@ def _build_nonfinite_tensor_map(
 def _run_model_step(
     *,
     model,
+    model_to_save,
     codec,
     batch_tris,
     lengths,
     device: torch.device,
+    dist_ctx: DistContext,
     precision: str,
     use_vq: bool,
+    restart_pool_size_per_rank: int,
     freq_span_map: torch.Tensor,
     valid_mask: torch.Tensor,
     args,
@@ -949,7 +1080,20 @@ def _run_model_step(
         imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
 
     with autocast_context(device, precision):
-        outputs = model(imgs, use_vq=use_vq)
+        outputs = model(
+            imgs,
+            use_vq=use_vq,
+            restart_pool_size=restart_pool_size_per_rank if use_vq else 0,
+        )
+
+    if use_vq:
+        _sync_quantizer_step_state(
+            outputs=outputs,
+            quantizer=model_to_save.quantizer,
+            dist_ctx=dist_ctx,
+            apply_ema_update=bool(model_to_save.training),
+            restart_pool_size_per_rank=restart_pool_size_per_rank,
+        )
 
     recon_imgs = outputs.recon_imgs.float()
     vq_loss = outputs.vq_loss.float()
@@ -1266,12 +1410,15 @@ def train_main(args) -> None:
 
                 step_outputs = _run_model_step(
                     model=model,
+                    model_to_save=model_to_save,
                     codec=codec,
                     batch_tris=batch_tris,
                     lengths=lengths,
                     device=device,
+                    dist_ctx=dist_ctx,
                     precision=args.precision,
                     use_vq=use_vq,
+                    restart_pool_size_per_rank=args.vq_restart_pool_size_per_rank,
                     freq_span_map=freq_span_map,
                     valid_mask=valid_mask,
                     args=args,
@@ -1331,12 +1478,15 @@ def train_main(args) -> None:
                     for _, (val_batch_tris, val_lengths) in enumerate(val_loader):
                         step_outputs = _run_model_step(
                             model=model,
+                            model_to_save=model_to_save,
                             codec=codec,
                             batch_tris=val_batch_tris,
                             lengths=val_lengths,
                             device=device,
+                            dist_ctx=dist_ctx,
                             precision=args.precision,
                             use_vq=use_vq,
+                            restart_pool_size_per_rank=0,
                             freq_span_map=freq_span_map,
                             valid_mask=valid_mask,
                             args=args,
@@ -1368,7 +1518,7 @@ def train_main(args) -> None:
 
             if should_eval and is_main_process(dist_ctx) and val_metrics is not None:
                 _save_fixed_visualization(
-                    model=model,
+                    model_to_save=model_to_save,
                     codec=codec,
                     fixed_batch_tris=fixed_batch_tris,
                     fixed_lengths=fixed_lengths,
@@ -1480,6 +1630,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder_attention_heads", type=str, default="8,4,4")
     parser.add_argument("--decoder_attention_depths", type=str, default="1,1,0")
     parser.add_argument("--decoder_conv_depths", type=str, default="2,2,2")
+    parser.add_argument("--refine_full_res_depth", type=int, default=0)
+    parser.add_argument("--refine_full_res_channels", type=int, default=0)
     parser.add_argument("--decoder_window_size", type=int, default=8)
     parser.add_argument("--decoder_upsample_mode", type=str, default="bilinear", choices=("nearest", "bilinear", "bicubic"))
     parser.add_argument("--decoder_mlp_ratio", type=float, default=4.0)
@@ -1493,6 +1645,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vq_dead_code_threshold", type=float, default=1.0)
     parser.add_argument("--vq_init_max_vectors", type=int, default=100000)
     parser.add_argument("--vq_kmeans_iters", type=int, default=10)
+    parser.add_argument("--vq_restart_pool_size_per_rank", type=int, default=2048)
 
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=512)
