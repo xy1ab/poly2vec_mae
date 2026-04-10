@@ -117,11 +117,11 @@ decoder_attention_type: global
 # 各解码 stage 的注意力头数，长度需与 stage 数匹配。
 decoder_attention_heads: "6,0,0"
 # 各解码 stage 的 attention block 数。设为 0 时该 stage 退化为 conv-only。
-decoder_attention_depths: "10,0,0"
+decoder_attention_depths: "6,0,0"
 # 各解码 stage 的卷积细化 block 数。一般越靠近输出端越重要。
 decoder_conv_depths: "4,3,3"
 # 全分辨率精修残差块数量。设为 0 表示关闭该模块，行为与旧 decoder 一致。
-refine_full_res_depth: 2
+refine_full_res_depth: 0
 # 全分辨率精修模块内部通道数。
 # 设为 0 表示直接沿用 decoder 最后一级输出通道数；
 # 设为正整数时，会先用 1x1 卷积投影到该通道数后再做精修。
@@ -141,7 +141,7 @@ decoder_drop_rate: 0.0
 # 码本容量。越大表示离散表示越细，但越难训练，也更容易出现低利用率。
 codebook_size: 8192
 # 量化空间维度。通常建议小于等于 embed_dim，例如 embed_dim=256, code_dim=128。
-code_dim: 384
+code_dim: 256
 # VQ commitment loss 的目标权重。过大会加重量化约束并放大量化噪声。
 vq_beta: 0.25
 # EMA 更新衰减系数。

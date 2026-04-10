@@ -348,6 +348,18 @@ def main() -> None:
         default=None,
         help="Resume from an existing run directory `<save_dir>/<run_timestamp>`.",
     )
+    pre_parser.add_argument(
+        "--vq_init_mode",
+        type=str,
+        default=None,
+        choices=("rank0_local", "all_ranks_gather"),
+        help="Optional VQ codebook initialization mode override for diagnosis.",
+    )
+    pre_parser.add_argument(
+        "--vq_init_debug",
+        action="store_true",
+        help="Enable VQ initialization debug logging for diagnosis.",
+    )
     pre_parser.add_argument("--no_auto_spawn", action="store_true")
     pre_args, remaining = pre_parser.parse_known_args()
 
@@ -368,6 +380,10 @@ def main() -> None:
         config["eval_every"] = int(pre_args.eval_every)
     if resolved_resume_dir is not None:
         config["resume_dir"] = str(resolved_resume_dir)
+    if pre_args.vq_init_mode is not None:
+        config["vq_init_mode"] = str(pre_args.vq_init_mode)
+    if pre_args.vq_init_debug:
+        config["vq_init_debug"] = True
 
     gpu_from_config = str(config.get("gpu", "0"))
     requested_gpu_list = _split_gpu_list(gpu_from_config)

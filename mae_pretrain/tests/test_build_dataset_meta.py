@@ -24,16 +24,18 @@ def test_build_meta_output_path_suffix_swap() -> None:
 
 
 def test_build_row_meta4_from_polygon() -> None:
-    """Meta vector should follow `[cx, cy, L, N]` definition."""
+    """Meta vector should follow `[cx, cy, L, Lx, Ly, N]` definition."""
     poly = Polygon([(0.0, 0.0), (4.0, 0.0), (4.0, 2.0), (0.0, 2.0)])
     meta = bdt._build_row_meta4(poly)
 
     assert meta.dtype == np.float32
-    assert meta.shape == (4,)
+    assert meta.shape == (6,)
     assert np.isclose(meta[0], 2.0)  # cx
     assert np.isclose(meta[1], 1.0)  # cy
     assert np.isclose(meta[2], 4.0)  # longest bbox side length
-    assert np.isclose(meta[3], 4.0)  # cleaned shell node count
+    assert np.isclose(meta[3], 4.0)  # bbox width
+    assert np.isclose(meta[4], 2.0)  # bbox height
+    assert np.isclose(meta[5], 4.0)  # cleaned shell node count
 
 
 def test_shard_writer_finalize_writes_manifest_without_samples(tmp_path) -> None:

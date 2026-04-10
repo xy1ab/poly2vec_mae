@@ -405,38 +405,45 @@ def _summarize_row_geometry(geom) -> dict[str, Any]:
 
 
 def _build_row_meta4(geom) -> np.ndarray:
-    """Build one row-level meta vector `[cx, cy, L, N]` in source coordinates.
+    """Build one row-level meta vector `[cx, cy, L, Lx, Ly, N]`.
 
     Meta definition:
     1) `cx`: row bbox center x.
     2) `cy`: row bbox center y.
     3) `L`: row bbox longest side length.
-    4) `N`: total node count across all polygon parts (shell + holes), after
+    4) `Lx`: row bbox width along x axis.
+    5) `Ly`: row bbox height along y axis.
+    6) `N`: total node count across all polygon parts (shell + holes), after
        ring cleanup used by existing node-count helpers.
 
     Args:
         geom: Raw shapely geometry from one source row.
 
     Returns:
-        Float32 vector shaped `(4,)`. Invalid geometries return zeros.
+        Float32 vector shaped `(6,)`. Invalid geometries return zeros.
     """
     if geom is None or geom.is_empty or geom.geom_type not in {"Polygon", "MultiPolygon"}:
-        return np.zeros((4,), dtype=np.float32)
+        return np.zeros((6,), dtype=np.float32)
 
     try:
         minx, miny, maxx, maxy = geom.bounds
         cx = (float(minx) + float(maxx)) * 0.5
         cy = (float(miny) + float(maxy)) * 0.5
-        longest_side = max(float(maxx) - float(minx), float(maxy) - float(miny))
+        bbox_width = float(maxx) - float(minx)
+        bbox_height = float(maxy) - float(miny)
+        longest_side = max(bbox_width, bbox_height)
     except Exception:
-        return np.zeros((4,), dtype=np.float32)
+        return np.zeros((6,), dtype=np.float32)
 
     polygon_parts = _expand_geometry_to_polygons(geom)
     node_count = 0
     for poly, _ in polygon_parts:
         node_count += int(_polygon_node_count(poly))
 
-    return np.asarray([cx, cy, longest_side, float(node_count)], dtype=np.float32)
+    return np.asarray(
+        [cx, cy, longest_side, bbox_width, bbox_height, float(node_count)],
+        dtype=np.float32,
+    )
 
 
 def _build_special_row_log_record(
@@ -2052,8 +2059,8 @@ class _ShardWriter:
             if self.with_meta:
                 assert meta is not None
                 meta_sample = np.asarray(meta[idx], dtype=np.float32)
-                if meta_sample.shape != (4,):
-                    raise ValueError(f"Meta sample must have shape (4,), got {meta_sample.shape}")
+                if meta_sample.shape != (6,):
+                    raise ValueError(f"Meta sample must have shape (6,), got {meta_sample.shape}")
                 self._meta_buffer.append(meta_sample)
 
     def flush(self) -> Path | None:
