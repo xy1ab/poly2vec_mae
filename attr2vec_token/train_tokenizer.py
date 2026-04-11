@@ -68,12 +68,9 @@ def extract_all_texts(data_dir, output_dir):
             for col in df.columns:
                 unique_texts = df[col].dropna().unique()
                 for text in unique_texts:
-                    text = str(text).strip()
-                    # 如果为空，或者完全是纯数字，就直接跳过不放入语料
-                    if not text or pure_number_pattern.match(text):
-                        continue
+                    if isinstance(text, str):
+                        text = text.strip()
                     corpus.append(text)
-                
     # 动态扫荡所有 GDB
     for gdb_file in glob.glob(os.path.join(data_dir, "*.gdb")):
         print(f"  -> 解析 GDB: {os.path.basename(gdb_file)}")

@@ -128,7 +128,9 @@ class NRE_DataPump:
         word_list = []
         for col in word_cols:
             col_vocab = self.vocab.get(col, {})
-            encoded = df[col].astype(str).map(lambda x: col_vocab.get(x, 0)).fillna(0).values
+            # 🌟 这里的逻辑是：先把数据转字符串，如果是以 .0 结尾，直接切掉，再去查字典
+            clean_func = lambda x: col_vocab.get(str(x)[:-2] if str(x).endswith('.0') else str(x), 0)
+            encoded = df[col].map(clean_func).fillna(0).values
             word_list.append(encoded)
         word_data = (np.stack(word_list, axis=1).astype(np.float32) / 16384.0) if word_list else np.zeros((len(df), 0), dtype=np.float32)
 
