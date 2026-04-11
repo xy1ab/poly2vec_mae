@@ -128,10 +128,17 @@ class NRE_DataPump:
         word_list = []
         for col in word_cols:
             col_vocab = self.vocab.get(col, {})
-            # 🌟 这里的逻辑是：先把数据转字符串，如果是以 .0 结尾，直接切掉，再去查字典
-            clean_func = lambda x: col_vocab.get(str(x)[:-2] if str(x).endswith('.0') else str(x), 0)
-            encoded = df[col].map(clean_func).fillna(0).values
+            
+            # 🛡️ 终极清洗装甲：去空值、去首尾空格、去幽灵 .0
+            def safe_map(val):
+                if pd.isna(val): return 0
+                s = str(val).strip()
+                if s.endswith('.0'): s = s[:-2]
+                return col_vocab.get(s, 0)
+                
+            encoded = df[col].map(safe_map).fillna(0).values
             word_list.append(encoded)
+            
         word_data = (np.stack(word_list, axis=1).astype(np.float32) / 16384.0) if word_list else np.zeros((len(df), 0), dtype=np.float32)
 
         char_tensors = []

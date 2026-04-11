@@ -56,7 +56,7 @@ def extract_all_texts(data_dir, output_dir):
     corpus = []
     
     # 🌟 核心防御：匹配纯数字、小数、负数。这些即使作为字符串读进来，也不要喂给 Tokenizer 去占用词表名额！
-    pure_number_pattern = re.compile(r'^-?\d+(\.\d+)?$')
+    # pure_number_pattern = re.compile(r'^-?\d+(\.\d+)?$')
     
     # 动态扫荡所有 CSV
     for csv_file in glob.glob(os.path.join(data_dir, "*.csv")):
@@ -71,6 +71,7 @@ def extract_all_texts(data_dir, output_dir):
                     if isinstance(text, str):
                         text = text.strip()
                     corpus.append(text)
+                
     # 动态扫荡所有 GDB
     for gdb_file in glob.glob(os.path.join(data_dir, "*.gdb")):
         print(f"  -> 解析 GDB: {os.path.basename(gdb_file)}")
@@ -84,7 +85,8 @@ def extract_all_texts(data_dir, output_dir):
                             if isinstance(v, str):
                                 text = v.strip()
                                 # GDB里的文本也加上过滤，防患于未然
-                                if text and not pure_number_pattern.match(text):
+                                # if text and not pure_number_pattern.match(text):
+                                if text:
                                     corpus.append(text)
         except Exception as e:
             print(f"❌ 读取 GDB 失败 [{gdb_file}]: {e}")
