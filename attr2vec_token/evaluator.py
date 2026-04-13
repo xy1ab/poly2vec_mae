@@ -1,18 +1,125 @@
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
-import seaborn as sns
 import torch
 import os
 import json
+import joblib
 import glob
 import numpy as np
 from models import NaturalResourceFoundationModel
 from tokenizers import Tokenizer 
+from torch.utils.data import TensorDataset, DataLoader
+import argparse
+from tqdm import tqdm
 
-# ==========================================
-# 1. 数据审计员（负责对账单渲染）
-# ==========================================
+def build_arg_parser() -> argparse.ArgumentParser:
+    """构建南湖平台标准 CLI 解析器"""
+    parser = argparse.ArgumentParser(
+        description="Extract text corpus and train a custom BPE tokenizer for NRE data."
+    )
+    parser.add_argument("--cache_dir", type=str, required=True, help="Directory containing raw data (CSV and GDB).")
+    parser.add_argument("--output_embedding_dir", type=str, required=True, help="Directory to save the corpus and tokenizer json.")
+    parser.add_argument("--tokenizer_path", type=str, required=True, help="Vocabulary size for the BPE tokenizer (default: 20000).")
+    parser.add_argument("--vocab_path", type=str, required=True, help="Vocabulary size for the BPE tokenizer (default: 20000).")
+    parser.add_argument("--model_path", type=str, required=True, help="Vocabulary size for the BPE tokenizer (default: 20000).")
+    parser.add_argument("--vocab_size", type=int, default=8192, help="Vocabulary size for the BPE tokenizer (default: 20000).")
+    parser.add_argument("--batch_size", type=int, default=2048, help="Vocabulary size for the BPE tokenizer (default: 20000).")
+    return parser
+
+
+class EmbeddingInference:
+    def __init__(self, model_path, tokenizer_path, vocab_size, device=None):
+        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 1. 加载分词器
+        self.tokenizer = Tokenizer.from_file(tokenizer_path)
+        
+        # 2. 模拟/读取配置 (需与训练时保持一致)
+        self.config = {
+            'truth_dim': 256,
+            'semantic_dim': 256,
+            'vocab_size': vocab_size, # 根据实际情况调整
+            'max_seq_len': 64
+        }
+        
+        # 3. 加载模型
+        self.model = NaturalResourceFoundationModel(self.config).to(self.device)
+        state_dict = torch.load(model_path, map_location=self.device)
+        # 移除可能存在的 module. 前缀
+        new_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        self.model.load_state_dict(new_state_dict)
+        self.model.eval()
+        
+        print(f"✅ 推理引擎已就绪。设备: {self.device}")
+
+    @torch.no_grad()
+    def infer_from_embedding(self, latent_tensor, meta):
+        """
+        核心推理逻辑：从 Embedding 还原原始数据
+        :param latent_tensor: 模型生成的特征向量 (Batch, truth_dim + semantic_dim)
+        :param meta: 包含列信息的元数据字典
+        """
+        # A. 提取物理属性向量 (前 truth_dim 维)
+        v_attr = latent_tensor[:, :self.config['truth_dim']].to(self.device)
+        
+        # B. 通过可逆网络 (INN) 进行无损解码
+        dec = self.model.inn_core(v_attr, reverse=True)
+        
+        # C. 物理还原
+        num_cont = len(meta.get('cont_cols', []))
+        num_word = len(meta.get('word_cols', []))
+        num_char = len(meta.get('char_cols', []))
+        max_seq_len = self.config['max_seq_len']
+        
+        results = []
+        batch_size = dec.shape[0]
+
+        # --- 1. 还原连续数值 ---
+        cont_values = None
+        if num_cont > 0:
+            c_exp = dec[:, :num_cont]
+            c_hi = dec[:, num_cont : 2*num_cont]
+            c_lo = dec[:, 2*num_cont : 3*num_cont]
+            # 这里的还原逻辑对应训练时的 torch.frexp
+            cont_values = torch.ldexp(c_hi.double() + c_lo.double(), c_exp.int())
+
+        # --- 2. 还原文本 (Character-level) ---
+        char_texts = []
+        if num_char > 0:
+            start_idx = 3 * num_cont + num_word
+            end_idx = start_idx + (num_char * max_seq_len)
+            ch_sc = dec[:, start_idx:end_idx].view(batch_size, num_char, max_seq_len)
+            
+            # 将 0-1 的归一化数值映射回 Token ID (32768 是原始缩放因子)
+            pred_char_ids = torch.round(ch_sc * 32768.0).long()
+            
+            for i in range(batch_size):
+                sample_texts = []
+                for c in range(num_char):
+                    ids = pred_char_ids[i, c].cpu().tolist()
+                    text = self.tokenizer.decode(ids, skip_special_tokens=True).strip()
+                    sample_texts.append(text if text else "")
+                char_texts.append(sample_texts)
+
+        # --- 3. 组装结果 ---
+        for i in range(batch_size):
+            entry = {
+                "numerical": {},
+                "textual": {}
+            }
+            if cont_values is not None:
+                for idx, col in enumerate(meta['cont_cols']):
+                    entry["numerical"][col] = cont_values[i, idx].item()
+            
+            if char_texts:
+                for idx, col in enumerate(meta['char_cols']):
+                    entry["textual"][col] = char_texts[i][idx]
+            
+            results.append(entry)
+            
+        return results
+
 class DataAuditor:
     def __init__(self, tokenizer, vocab): 
         self.tokenizer = tokenizer
@@ -26,30 +133,72 @@ class DataAuditor:
             print(f"{i+1:<4} | {str(orig):<60} | {str(dec):<60}")
         print(f"{'='*130}")
 
+def decode_latent_to_output(dec, meta, tokenizer):
+    """
+    将模型反向传播/解码出的张量还原为原始含义的数据
+    """
+    num_cont = len(meta.get('cont_cols', []))
+    num_word = len(meta.get('word_cols', []))
+    num_char = len(meta.get('char_cols', []))
+    max_seq_len = meta.get('max_seq_len', 64)
+    
+    results = {}
+
+    # 1. 还原连续数值 (torch.ldexp 逆操作)
+    if num_cont > 0:
+        c_exp = dec[:, :num_cont]
+        c_hi = dec[:, num_cont : 2*num_cont]
+        c_lo = dec[:, 2*num_cont : 3*num_cont]
+        # 还原：(hi + lo) * 2^exp
+        results['cont_val'] = torch.ldexp(c_hi.double() + c_lo.double(), c_exp.int())
+
+    # 2. 还原字符文本
+    if num_char > 0:
+        # 定位 char 数据在 dec 中的切片位置
+        start_idx = 3 * num_cont + num_word
+        end_idx = start_idx + (num_char * max_seq_len)
+        ch_sc = dec[:, start_idx:end_idx].view(-1, num_char, max_seq_len)
+        
+        # 将归一化数值还原为 Token ID
+        pred_char_ids = torch.round(ch_sc * 32768.0).long()
+        
+        decoded_texts = []
+        for i in range(pred_char_ids.size(0)):
+            batch_texts = []
+            for c in range(num_char):
+                ids = pred_char_ids[i, c].cpu().tolist()
+                text = tokenizer.decode(ids, skip_special_tokens=True).replace(" ", "")
+                batch_texts.append(text if text else "None")
+            decoded_texts.append(batch_texts)
+        results['char_text'] = decoded_texts
+
+    return results
+
 # ==========================================
 # 2. 核心评估流水线
 # ==========================================
-def evaluate():
+def evaluate(args):
+    tokenizer_path = args.tokenizer_path
+    vocab_path = args.vocab_path
+    model_path = args.model_path
     print("🔬 [大一统底座] 全要素无损审计系统启动...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    if not os.path.exists("zrzy_tokenizer.json"):
+    if not os.path.exists(tokenizer_path):
         raise FileNotFoundError("❌ 未找到 zrzy_tokenizer.json 分词器，请先运行 train_tokenizer_modify.py")
-    tokenizer = Tokenizer.from_file("zrzy_tokenizer.json")
+    tokenizer = Tokenizer.from_file(tokenizer_path)
     
-    vocab_path = "global_vocab_auto.json"
     vocab = json.load(open(vocab_path, "r", encoding="utf-8")) if os.path.exists(vocab_path) else {}
     auditor = DataAuditor(tokenizer, vocab)
 
     config = {
         'truth_dim': 256,
         'semantic_dim': 256,
-        'vocab_size': 20000,
+        'vocab_size': args.vocab_size,
         'max_seq_len': 64
     }
     model = NaturalResourceFoundationModel(config).to(device)
     
-    model_path = "best_model.pth"
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"❌ 找不到权重文件 {model_path}，请先完成训练。")
     
@@ -59,115 +208,85 @@ def evaluate():
     model.eval()
     print("✅ 成功装载最优生产权重 [best_model.pth]")
 
-    cache_files = glob.glob("cache_*.pt")
+    cache_files = glob.glob(args.cache_dir + "/*.joblib")
     if not cache_files:
-        print("⚠️ 未找到任何 cache_*.pt 数据缓存文件！")
+        print("⚠️ 未找到任何 cache_*.joblib 数据缓存文件！")
         return
 
-    latent_pool = None 
+    all_results = {}
 
     with torch.no_grad():
         for cache_file in cache_files:
-            source_name = os.path.basename(cache_file).replace("cache_", "").replace(".pt", "")
-            data_dict = torch.load(cache_file, map_location=device, weights_only=False)
-            
+            source_name = os.path.basename(cache_file).replace("cache_", "").replace(".joblib", "")
+            data_dict = joblib.load(cache_file)
+            layer_results = {}
             for layer_name, layer_data in data_dict.items():
                 meta = layer_data.get('meta', {})
-                cont_cols = meta.get('cont_cols', [])
-                char_cols = meta.get('char_cols', [])
-                word_cols = meta.get('word_cols', [])
-                max_seq_len = meta.get('max_seq_len', 64)
-                
-                num_cont, num_word, num_char = len(cont_cols), len(word_cols), len(char_cols)
-                if num_cont == 0 and num_word == 0 and num_char == 0: continue
+                num_cont = len(meta.get('cont_cols', []))
+                num_char = len(meta.get('char_cols', []))
 
-                TEST_BSZ = 64
-                b0 = torch.tensor(layer_data['cont_int'][:TEST_BSZ], device=device)
-                b1 = torch.tensor(layer_data['cont_frac_hi'][:TEST_BSZ], device=device)
-                b2 = torch.tensor(layer_data['cont_frac_lo'][:TEST_BSZ], device=device)
-                b3 = torch.tensor(layer_data['cont_norm'][:TEST_BSZ], device=device)
-                b4 = torch.tensor(layer_data['word_data'][:TEST_BSZ], device=device)
-                b5 = torch.tensor(layer_data['char_data'][:TEST_BSZ], device=device)
 
-                latent, _ = model(b0, b1, b2, b3, b4, b5)
-                if latent_pool is None: latent_pool = latent.cpu().numpy()[:40, :] 
-                
-                v_attr = latent[:, :config['truth_dim']]
-                dec = model.inn_core(v_attr, reverse=True)
-                
-                c_exp = dec[:, :num_cont]
-                c_hi = dec[:, num_cont:2*num_cont]
-                c_lo = dec[:, 2*num_cont:3*num_cont]
-                ch_sc = dec[:, 3*num_cont+num_word : 3*num_cont+num_word+(num_char*max_seq_len)]
+                dataset = TensorDataset(
+                    torch.tensor(layer_data['cont_int']),
+                    torch.tensor(layer_data['cont_frac_hi']),
+                    torch.tensor(layer_data['cont_frac_lo']),
+                    torch.tensor(layer_data['cont_norm']),
+                    torch.tensor(layer_data['word_data']),
+                    torch.tensor(layer_data['char_data'])
+                )
+                dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+                layer_latent_list = []
+                layer_stats = {'cont_acc_sum': 0.0, 'char_acc_sum': 0.0, 'batch_count': 0}
+                batch_pbar = tqdm(dataloader, desc=f"  -> {layer_name}", leave=False, unit="batch")
+                for batch in batch_pbar:
+                    # 将数据一次性移动到指定的 device
+                    b = [item.to(device) for item in batch]
+                    b0, b1, b2, b3, b4, b5 = b
 
-                limit = min(5, b0.size(0))
-                
-                # ==========================================
-                # 1. 连续数值对账 
-                # ==========================================
-                if num_cont > 0:
-                    gt_cont = torch.ldexp(b1.double() + b2.double(), b0.int())
-                    orig_cont = torch.ldexp(c_hi.double() + c_lo.double(), c_exp.int())
+                    latent, _ = model(b0, b1, b2, b3, b4, b5)
+                    layer_latent_list.append(latent.cpu())
+ 
                     
-                    cont_samples = []
-                    for i in range(limit):
-                        col_idx = 0 
-                        gt_val = f"{gt_cont[i, col_idx].item():.6f}"
-                        pred_val = f"{orig_cont[i, col_idx].item():.6f}"
-                        cont_samples.append((f"[{cont_cols[col_idx]}] 原始真值: {gt_val}", f"模型预测: {pred_val}"))
-                    auditor.render_section(source_name, layer_name, cont_samples, mode="num")
+                    v_attr = latent[:, :config['truth_dim']]
+                    dec = model.inn_core(v_attr, reverse=True)
+                    pred_out = decode_latent_to_output(dec, meta, tokenizer)
 
-                # ==========================================
-                # 2. 文本对账 
-                # ==========================================
-                if num_char > 0:
-                    ch_sc = ch_sc.view(-1, num_char, max_seq_len)
-                    
-                    # 🌟 修复点：将输入的真值 (b5) 也乘回 32768.0 并转成整数
-                    gt_char_ids = torch.round(b5 * 32768.0).long()
-                    pred_char_ids = torch.round(ch_sc * 32768.0).long()
-                    
-                    char_samples = []
-                    for i in range(limit):
-                        col_idx = 0 
+                    res = {'cont_acc': 0.0, 'char_acc': 0.0}
+                    if num_cont > 0:
+                        gt_cont = torch.ldexp(b1.double() + b2.double(), b0.int())
+                        is_correct = torch.isclose(pred_out['cont_val'], gt_cont, rtol=1e-9, atol=1e-9)
+                        res['cont_acc'] = is_correct.float().mean().item()
+                    if num_char > 0:
+                        gt_char_ids = torch.round(b5 * 32768.0).long()
+                        # 重新从 dec 拿 ID 方便对比
+                        start_idx = 3 * num_cont + len(meta.get('word_cols', []))
+                        ch_sc = dec[:, start_idx : start_idx + (num_char * meta['max_seq_len'])]
+                        pred_ids = torch.round(ch_sc.view(-1, num_char, meta['max_seq_len']) * 32768.0).long()
                         
-                        # 拿着输入的真实 ID 去解出最初的汉字
-                        gt_ids = gt_char_ids[i, col_idx].cpu().tolist()
-                        gt_text = tokenizer.decode(gt_ids, skip_special_tokens=True).replace(" ", "")
-                        if not gt_text: gt_text = "[空]"
-                        
-                        # 拿着模型猜出来的 ID 去解汉字
-                        dec_ids = pred_char_ids[i, col_idx].cpu().tolist()
-                        dec_text = tokenizer.decode(dec_ids, skip_special_tokens=True).replace(" ", "")
-                        if not dec_text: dec_text = "[解析失败/模型猜想为空]"
-                        
-                        char_samples.append((f"[{char_cols[col_idx]}] {gt_text}", f"{dec_text}"))
-                    auditor.render_section(source_name, layer_name, char_samples, mode="text")
+                        correct = (pred_ids == gt_char_ids).float().mean()
+                        res['char_acc'] = correct.item()
+                    layer_stats['cont_acc_sum'] += res['cont_acc']
+                    layer_stats['char_acc_sum'] += res['char_acc']
+                    layer_stats['batch_count'] += 1
 
-    if latent_pool is not None:
-        print("\n🎨 对账完毕，正在渲染极客风报告图表...")
-        plt.style.use('dark_background') 
-        
-        if os.path.exists("train_history.json"):
-            with open("train_history.json", "r") as f: h = json.load(f)
-            plt.figure(figsize=(12, 6))
-            epochs = np.arange(len(h['loss']))
-            losses = np.array(h['loss'])
-            plt.plot(epochs, losses, color='#00ffcc', linewidth=2.5, label='Self-Supervised Reconstruction Loss')
-            plt.fill_between(epochs, losses, color='#00ffcc', alpha=0.15)
-            plt.title("Global Semantic Distillation Convergence", fontsize=18, color='white', pad=20)
-            plt.xlabel("Epochs", fontsize=12, color='lightgray'); plt.ylabel("Loss", fontsize=12, color='lightgray')
-            plt.grid(color='#333333', linestyle='--', linewidth=0.5)
-            plt.legend(loc="upper right", facecolor='#111111', edgecolor='none')
-            plt.savefig("vis_loss_curve.png", dpi=300, facecolor='#111111', bbox_inches='tight')
-
-        plt.figure(figsize=(16, 8))
-        ax = sns.heatmap(latent_pool, cmap='mako', cbar_kws={'label': 'Energy Activation'})
-        plt.title("Multi-Modal Latent Space Cross-Fusion (Batch: 40)", fontsize=18, color='white', pad=20)
-        plt.xlabel(f"Latent Dimensions ({config['truth_dim']} Truth + {config['semantic_dim']} Semantic)", fontsize=12, color='lightgray')
-        plt.ylabel("Batch Samples", fontsize=12, color='lightgray')
-        plt.savefig("vis_latent_space.png", dpi=300, facecolor='#111111', bbox_inches='tight')
-        print("✅ 报告图表已保存: vis_loss_curve.png, vis_latent_space.png")
+                # --- 计算并打印该层平均指标 ---
+                avg_cont_acc = layer_stats['cont_acc_sum'] / layer_stats['batch_count']
+                avg_char_acc = layer_stats['char_acc_sum'] / layer_stats['batch_count']
+                
+                print(f"--- Layer: {layer_name} ---")
+                print(f"  数值还原准确率 (Avg): {avg_cont_acc:.2%}")
+                print(f"  文本还原准确率 (Avg): {avg_char_acc:.2%}")
+                layer_results[layer_name] ={
+                    'latent': torch.cat(layer_latent_list, dim=0),
+                    'meta': meta
+                    } 
+            all_results[source_name] = layer_results
+               
+                 
+    joblib.dump(all_results, os.path.join(args.output_embedding_dir,"encoded_latents.joblib"))
 
 if __name__ == "__main__":
-    evaluate()
+    args = build_arg_parser().parse_args()
+    
+    evaluate(args)
+    

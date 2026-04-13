@@ -1,7 +1,6 @@
 import os
 import sys
 from pathlib import Path
-import torch_musa
 import torch
 import random
 import numpy as np
@@ -10,7 +9,7 @@ import segmentation_models_pytorch as smp
 from torch.utils.data import Subset
 import time
 import yaml
-
+import argparse
 if __package__ in {None, ""}:
     _CURRENT_DIR = Path(__file__).resolve().parent
     _REPO_ROOT = _CURRENT_DIR.parent
@@ -19,9 +18,9 @@ if __package__ in {None, ""}:
 
     import importlib
 
-    V2Dataset = importlib.import_module("downstream_unet.loaders.loader_single").V2Dataset
+    V2Dataset = importlib.import_module("downstream_unet.loaders.loader").V2Dataset
 else:
-    from .loaders.loader_single import V2Dataset
+    from .loaders.loader import V2Dataset
 
 
 def calculate_metrics(pred, target, input_blur, threshold=0.5):
@@ -47,13 +46,21 @@ def calculate_metrics(pred, target, input_blur, threshold=0.5):
     return iou, mse_before, mse_after, wrong_pixels, uncertain_before, uncertain_after
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    """构建南湖平台标准 CLI 解析器"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config_path", type=str, default=None)
+    parser.add_argument("--data_path", type=str, default="") 
+    return parser
+
 def main():
+    args = build_arg_parser().parse_args()
     device = torch.device('musa' if torch.musa.is_available() else 'cpu')
     current_time = time.strftime("%Y%m%d_%H%M%S")
     
     # ========== 1. 路径配置（从 YAML 读取或硬编码） ==========
     # 方式1：从训练配置读取（推荐）
-    config_path = './configs/recons_unet_single.yaml'
+    config_path = args.config_path
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             cfg = yaml.safe_load(f)
@@ -63,12 +70,12 @@ def main():
         model_path = os.path.join(model_dir, 'unet_best.pth')
     else:
         # 方式2：硬编码（根据您的实际路径修改）
-        data_path = './data/unet_dataset_25k.pt'      # 单文件数据
-        indices_path = './data/test_indices_25k.pt'   # 测试集索引
-        model_path = './unet_checkpoints/unet_best.pth'
+        data_path = args.data_path      # 单文件数据
+        indices_path = args.indices_path   # 测试集索引
+        model_path = args.model_path
     
     # 可视化输出目录
-    vis_dir = './vis_results_v2'
+    vis_dir = args.vis_dir
     os.makedirs(vis_dir, exist_ok=True)
     report_path = os.path.join(vis_dir, f'evaluation_report_{current_time}.txt')
     

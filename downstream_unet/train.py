@@ -28,7 +28,7 @@ if __package__ in {None, ""}:
 
     V2Dataset = importlib.import_module("downstream_unet.loaders.loader_single").V2Dataset
 else:
-    from .loaders.loader_single import V2Dataset
+    from .loaders.loader import V2Dataset
 
 
 def calculate_iou(pred, target, threshold=0.5):

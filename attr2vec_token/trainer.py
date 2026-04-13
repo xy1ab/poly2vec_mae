@@ -10,6 +10,17 @@ from models import NaturalResourceFoundationModel
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import joblib
+import argparse
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for batch forward export."""
+    parser = argparse.ArgumentParser(
+        description="Batch forward triangulated polygon shards into embeddings and MAE frequency maps."
+    )
+    parser.add_argument("--cache_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--vocab_size", type=int, default=8192, help="Vocabulary size for the BPE tokenizer (default: 20000).")
+    return parser
 
 def setup_ddp():
     dist.init_process_group(backend="nccl")
@@ -28,15 +39,17 @@ def load_all_caches(cache_files, is_master):
     for file in cache_files:
         if os.path.exists(file):
             if is_master: print(f"📦 正在装载高速缓存: {file} ...")
-            data = torch.load(file, map_location='cpu', weights_only=False)
+            data = joblib.load(file)
             all_layers_data.update(data)
     return all_layers_data
 
 def train():
+    args = build_arg_parser().parse_args()
     local_rank = setup_ddp(); is_master = (dist.get_rank() == 0)
-    
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir, exist_ok=True)
     # 🌟 安全参数升级：词表 20000，批次下调至 2048 防爆
-    config = {'truth_dim': 256, 'semantic_dim': 256, 'vocab_size': 20000}
+    config = {'truth_dim': 256, 'semantic_dim': 256, 'vocab_size': args.vocab_size}
     batch_size, epochs, base_lr, warmup_epochs = 256, 5, 2e-4, 1
     
     model = DDP(NaturalResourceFoundationModel(config).cuda(local_rank), device_ids=[local_rank], find_unused_parameters=False)
@@ -44,7 +57,7 @@ def train():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
     scaler = GradScaler('cuda')
 
-    cache_files = glob.glob("cache_*.pt")
+    cache_files = glob.glob(args.cache_dir + "/*.joblib")
     if is_master: 
         print(f"🧲 共发现 {len(cache_files)} 个张量缓存文件，准备汇入训练池...")
 
@@ -93,8 +106,8 @@ def train():
             print(f"📈 Ep {epoch+1:03d}/{epoch} | Loss: {avg_loss:.6f} | LR: {curr_lr:.2e} | T: {time.time()-start_time:.1f}s")
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                torch.save(model.module.state_dict(), "best_model.pth")
-                with open("train_history.json", "w") as f: json.dump(history, f)
+                torch.save(model.module.state_dict(), os.path.join(args.output_dir,"best_model.pth"))
+                with open(os.path.join(args.output_dir,"train_history.json"), "w") as f: json.dump(history, f)
 
     dist.destroy_process_group()
 

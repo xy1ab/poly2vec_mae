@@ -2,7 +2,7 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 import pyogrio
-import torch
+import joblib
 import os
 import json
 import warnings
@@ -33,14 +33,14 @@ def load_csv_safely(csv_path):
         return None
 
 class NRE_DataPump:
-    def __init__(self, vocab_path='global_vocab_auto.json', max_seq_len=64):
+    def __init__(self, vocab_path, tokenizer_path, max_seq_len=64):
         self.vocab_path = vocab_path
         self.max_seq_len = max_seq_len
         self.vocab = {}
         
         # 🌟 核心修改 1：加载真正的 BPE 智能分词器
-        if os.path.exists("zrzy_tokenizer.json"):
-            self.tokenizer = Tokenizer.from_file("zrzy_tokenizer.json")
+        if os.path.exists(tokenizer_path):
+            self.tokenizer = Tokenizer.from_file(tokenizer_path)
         else:
             print("⚠️ 警告：未找到 zrzy_tokenizer.json，请先运行 train_tokenizer.py！")
             self.tokenizer = None
@@ -202,7 +202,7 @@ class NRE_DataPump:
             except Exception as e:
                 raise ValueError(f"❌ 严重错误：无法解析文件 {file_path}。核心报错: {e}")
                     
-        torch.save(all_layers_data, cache_path)
+        joblib.dump(all_layers_data, cache_path)
         print(f"✅ 编译完成！共收录 {len(all_layers_data)} 个有效图层，张量缓存已保存至 {cache_path}")
         return all_layers_data
 
@@ -214,14 +214,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--vocab_path", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--tokenizer_path", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    
     return parser
 
 if __name__ == "__main__":
     print("=== data_loader.py 全自动张量化流水线启动 ===")
-    pump = NRE_DataPump()
+
     
     args = build_arg_parser().parse_args()
-
+    pump = NRE_DataPump(args.vocab_path, args.tokenizer_path)
     RAW_DATA_DIR = args.data_dir
     output_dir = args.output_dir
     if not os.path.exists(output_dir):
@@ -233,7 +236,7 @@ if __name__ == "__main__":
     for file_path in glob.glob(os.path.join(RAW_DATA_DIR, "*")):
         if file_path.endswith('.csv') or file_path.endswith('.gdb'):
             base_name = os.path.splitext(os.path.basename(file_path))[0]
-            cache_name = os.path.join(output_dir, f"cache_{base_name}.pt")
+            cache_name = os.path.join(output_dir, f"cache_{base_name}.joblib")
             DATA_SOURCES.append({"file": file_path, "cache": cache_name})
             
     print(f"📦 共规划了 {len(DATA_SOURCES)} 个数据源的缓存生成任务。")

@@ -46,6 +46,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing raw data (CSV and GDB).")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the corpus and tokenizer json.")
+    parser.add_argument("--tokenizer_vocab_size", type=int, default=8192, help="Vocabulary size for the BPE tokenizer (default: 20000).")
     return parser
 
 # ==========================================
@@ -56,7 +57,7 @@ def extract_all_texts(data_dir, output_dir):
     corpus = []
     
     # 🌟 核心防御：匹配纯数字、小数、负数。这些即使作为字符串读进来，也不要喂给 Tokenizer 去占用词表名额！
-    pure_number_pattern = re.compile(r'^-?\d+(\.\d+)?$')
+    # pure_number_pattern = re.compile(r'^-?\d+(\.\d+)?$')
     
     # 动态扫荡所有 CSV
     for csv_file in glob.glob(os.path.join(data_dir, "*.csv")):
@@ -68,11 +69,9 @@ def extract_all_texts(data_dir, output_dir):
             for col in df.columns:
                 unique_texts = df[col].dropna().unique()
                 for text in unique_texts:
-                    text = str(text).strip()
-                    # 如果为空，或者完全是纯数字，就直接跳过不放入语料
-                    if not text or pure_number_pattern.match(text):
-                        continue
-                    corpus.append(text)
+                    if isinstance(text, str):
+                        text = text.strip()
+                        corpus.append(text)
                 
     # 动态扫荡所有 GDB
     for gdb_file in glob.glob(os.path.join(data_dir, "*.gdb")):
@@ -87,8 +86,8 @@ def extract_all_texts(data_dir, output_dir):
                             if isinstance(v, str):
                                 text = v.strip()
                                 # GDB里的文本也加上过滤，防患于未然
-                                if text and not pure_number_pattern.match(text):
-                                    corpus.append(text)
+                                # if text and not pure_number_pattern.match(text):
+                                corpus.append(text)
         except Exception as e:
             print(f"❌ 读取 GDB 失败 [{gdb_file}]: {e}")
 
@@ -106,12 +105,12 @@ def extract_all_texts(data_dir, output_dir):
 # ==========================================
 # 2. 训练 BPE 分词器 (自适应路径版)
 # ==========================================
-def train_bpe_tokenizer(corpus_path, output_dir):
-    print("🧠 正在训练自然资源专属 BPE 分词器 (目标词表大小: 20000)...")
+def train_bpe_tokenizer(corpus_path, output_dir,vocab_size=8192):
+
     tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
     tokenizer.pre_tokenizer = Whitespace()
     
-    trainer = BpeTrainer(special_tokens=["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"], vocab_size=20000)
+    trainer = BpeTrainer(special_tokens=["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"], vocab_size=vocab_size)
     
     # 喂入刚生成的语料
     tokenizer.train(files=[corpus_path], trainer=trainer)
@@ -138,4 +137,4 @@ if __name__ == "__main__":
     generated_corpus_path = extract_all_texts(args.data_dir, args.output_dir)
     
     # 2. 训练出炉 Tokenizer
-    train_bpe_tokenizer(generated_corpus_path, args.output_dir)
+    train_bpe_tokenizer(generated_corpus_path, args.output_dir,args.tokenizer_vocab_size)
