@@ -8,10 +8,9 @@
 @Desc    :   None
 '''
 
+from method import run_spatial_filter_ddp,restore_bbox
 import os
-import torch_musa
 import torch
-from method_musa import run_spatial_filter_ddp,restore_bbox
 import torch.distributed as dist
 from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
 import argparse
@@ -26,11 +25,11 @@ def setup_dist():
 
     
     # 设置当前进程对应的 GPU 设备
-    device = torch.device(f"musa:{local_rank}")
-    torch.musa.set_device(device)
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
     if not dist.is_initialized():
         # 大规模集群（128卡）通信握手可能较慢，timeout 设长一点
-        dist.init_process_group(backend="mccl",device_id=device)
+        dist.init_process_group(backend="nccl",device_id=device)
     global_rank = dist.get_rank()
     world_size  = dist.get_world_size() 
     return local_rank, global_rank, world_size, device
