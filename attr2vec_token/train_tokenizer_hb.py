@@ -71,7 +71,11 @@ def extract_all_texts(data_dir, output_dir):
                 for text in unique_texts:
                     if isinstance(text, str):
                         text = text.strip()
+<<<<<<< HEAD
                         corpus.append(text)
+=======
+                    corpus.append(text)
+>>>>>>> a52e8d78d0da8da6ece7f8977c2507145940b726
                 
     # 动态扫荡所有 GDB
     for gdb_file in glob.glob(os.path.join(data_dir, "*.gdb")):
@@ -87,7 +91,12 @@ def extract_all_texts(data_dir, output_dir):
                                 text = v.strip()
                                 # GDB里的文本也加上过滤，防患于未然
                                 # if text and not pure_number_pattern.match(text):
+<<<<<<< HEAD
                                 corpus.append(text)
+=======
+                                if text:
+                                    corpus.append(text)
+>>>>>>> a52e8d78d0da8da6ece7f8977c2507145940b726
         except Exception as e:
             print(f"❌ 读取 GDB 失败 [{gdb_file}]: {e}")
 

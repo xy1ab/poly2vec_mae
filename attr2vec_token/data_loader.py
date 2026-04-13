@@ -128,8 +128,17 @@ class NRE_DataPump:
         word_list = []
         for col in word_cols:
             col_vocab = self.vocab.get(col, {})
-            encoded = df[col].astype(str).map(lambda x: col_vocab.get(x, 0)).fillna(0).values
+            
+            # 🛡️ 终极清洗装甲：去空值、去首尾空格、去幽灵 .0
+            def safe_map(val):
+                if pd.isna(val): return 0
+                s = str(val).strip()
+                if s.endswith('.0'): s = s[:-2]
+                return col_vocab.get(s, 0)
+                
+            encoded = df[col].map(safe_map).fillna(0).values
             word_list.append(encoded)
+            
         word_data = (np.stack(word_list, axis=1).astype(np.float32) / 16384.0) if word_list else np.zeros((len(df), 0), dtype=np.float32)
 
         char_tensors = []
