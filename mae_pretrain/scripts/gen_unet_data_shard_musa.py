@@ -8,6 +8,7 @@ import sys
 import argparse
 from pathlib import Path
 from tqdm import tqdm
+import torch_musa
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -59,7 +60,7 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("musa" if torch.musa.is_available() else "cpu")
     args.precision = normalize_precision(args.precision)
 
     ckpt_path, cfg_path = _resolve_model_paths(args.mae_model_dir)
@@ -159,7 +160,7 @@ def main():
             print(f"\n   💾 已保存分片: {shard_path} ({len(all_samples)} 个样本)")
             all_samples = []
             current_shard += 1
-            torch.cuda.empty_cache()
+            torch.musa.empty_cache()
             gc.collect()
 
         # 更新进度条

@@ -1,47 +1,87 @@
-import faiss
-import numpy as np
+import torch_musa
+import torch
 import time
-# 1. 模拟数据准备
-d = 1024          # 向量维度
-n_data = 100000   # 数据库向量数量
-n_query = 5       # 查询向量数量
+import pandas as pd
 
-# 生成随机数据 (实际使用时替换为你的 embedding)
-xb = np.random.random((n_data, d)).astype('float32')
-xq = np.random.random((n_query, d)).astype('float32')
+# --- 被测函数定义 ---
 
-# 推荐：进行 L2 归一化，这样聚类或搜索就是基于余弦相似度
-faiss.normalize_L2(xb)
-faiss.normalize_L2(xq)
+def musa_knn_search(query, library, k=5):
+    # L2距离：||a-b||^2 = ||a||^2 + ||b||^2 - 2ab'
+    q_norm = torch.sum(query**2, dim=1, keepdim=True)
+    l_norm = torch.sum(library**2, dim=1, keepdim=True)
+    dists = q_norm + l_norm.t() - 2 * torch.matmul(query, library.t())
+    topk_values, topk_indices = torch.topk(dists, k, largest=False)
+    return topk_values, topk_indices
 
-# 2. 配置索引参数
-nlist = 100       # 聚类中心的数量（根据数据量调整，通常为 sqrt(N) 到 10*sqrt(N)）
-m = 64            # 每个向量被分解成的子向量个数 (1024 必须能被 m 整除)
-bits = 8          # 每个子向量量化后的位数（通常选 8）
+def musa_spatial_filter(queries, tree_bboxes):
+    # 空间相交判断 (Overlap Check)
+    # queries/tree_bboxes: [N, 4] -> (minx, miny, maxx, maxy)
+    res_mask = (queries[:, 0:1] < tree_bboxes[:, 2]) & \
+               (queries[:, 2:3] > tree_bboxes[:, 0]) & \
+               (queries[:, 1:2] < tree_bboxes[:, 3]) & \
+               (queries[:, 3:4] > tree_bboxes[:, 1])
+    return res_mask
 
-# 3. 创建索引 (IVFPQ)
-# IndexFlatL2 是基础量化器，用于划分 cell
-quantizer = faiss.IndexFlatL2(d) 
-index = faiss.IndexIVFPQ(quantizer, d, nlist, m, bits)
+# --- 测试框架 ---
 
-# 4. 训练与添加数据
-# IVFPQ 必须先训练才能添加数据
-print("开始训练索引...")
-index.train(xb) 
-print(f"索引是否已训练: {index.is_trained}")
+def benchmark():
+    results = []
+    # 测试规模：1万, 5万, 10万条数据
+    sizes = [10000, 50000, 100000]
+    dim = 256  # 向量维度
+    k = 10
+    
+    print(f"{'Task':<20} | {'Size':<10} | {'Device':<10} | {'Time (ms)':<10}")
+    print("-" * 60)
 
-index.add(xb)
-print(f"索引中的向量总数: {index.ntotal}")
+    for n in sizes:
+        # 1. 数据准备
+        # KNN 数据
+        xq = torch.randn(100, dim)
+        xb = torch.randn(n, dim)
+        # Spatial 数据 (BBox: minx, miny, maxx, maxy)
+        sq = torch.rand(100, 4) * 100
+        sb = torch.rand(n, 4) * 100
 
-# 5. 执行搜索
-k = 4             # 返回最近邻的数量
-index.nprobe = 10 # 搜索时检查的 cell 数量（值越大精度越高但速度越慢）
-t_s = time.time()
-distances, indices = index.search(xq, k)
-t_e = time.time()
-print(f"搜索耗时: {t_e - t_s:.4f} 秒")
-# 6. 结果展示
-print("\n查询结果 (Top 4 索引):")
-print(indices)
-print("\n查询结果 (距离):")
-print(distances)
+        for device_name in ["cpu", "musa"]:
+            device = torch.device(device_name)
+            
+            # 将数据移动到设备
+            xq_d, xb_d = xq.to(device), xb.to(device)
+            sq_d, sb_d = sq.to(device), sb.to(device)
+
+            # --- 测试 KNN ---
+            # 预热 (Warm up)
+            _ = musa_knn_search(xq_d, xb_d, k)
+            torch.musa.synchronize() if device_name == "musa" else None
+            
+            start = time.perf_counter()
+            for _ in range(10): # 运行10次取平均
+                _ = musa_knn_search(xq_d, xb_d, k)
+            if device_name == "musa": torch.musa.synchronize()
+            knn_time = (time.perf_counter() - start) * 1000 / 10
+            
+            # --- 测试 Spatial Filter ---
+            _ = musa_spatial_filter(sq_d, sb_d)
+            torch.musa.synchronize() if device_name == "musa" else None
+
+            start = time.perf_counter()
+            for _ in range(10):
+                _ = musa_spatial_filter(sq_d, sb_d)
+            if device_name == "musa": torch.musa.synchronize()
+            spatial_time = (time.perf_counter() - start) * 1000 / 10
+
+            print(f"{'KNN Search':<20} | {n:<10} | {device_name:<10} | {knn_time:.2f}")
+            print(f"{'Spatial Filter':<20} | {n:<10} | {device_name:<10} | {spatial_time:.2f}")
+            
+            results.append({"task": "KNN", "size": n, "device": device_name, "ms": knn_time})
+            results.append({"task": "Spatial", "size": n, "device": device_name, "ms": spatial_time})
+
+    return results
+
+if __name__ == "__main__":
+    if not torch.musa.is_available():
+        print("错误：未检测到 MUSA 设备，请检查驱动和 torch_musa。")
+    else:
+        res = benchmark()
+        # 这里可以进一步计算加速比 (CPU_ms / MUSA_ms)

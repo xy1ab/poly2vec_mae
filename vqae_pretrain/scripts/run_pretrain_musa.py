@@ -142,7 +142,7 @@ def _is_musa_available() -> bool:
         return False
 
 
-def _get_visible_cuda_device_count() -> int:
+def _get_visible_musa_device_count() -> int:
     """Query the number of MUSA devices visible to current process.
 
     Returns:
@@ -304,13 +304,13 @@ def _build_torchrun_cmd(
 
 def main() -> None:
     """CLI main function for VQAE pretraining launch."""
-    # ensure_cuda_runtime_libs()
+
     project_root = _inject_repo_root()
 
     if __package__ in {None, ""}:
         import importlib
 
-        run_cli = importlib.import_module("vqae_pretrain.src.engine.trainer").run_cli
+        run_cli = importlib.import_module("vqae_pretrain.src.engine.trainer_musa").run_cli
         load_yaml_config = importlib.import_module(
             "vqae_pretrain.src.utils.config"
         ).load_yaml_config
@@ -387,8 +387,8 @@ def main() -> None:
 
     gpu_from_config = str(config.get("gpu", "0"))
     requested_gpu_list = _split_gpu_list(gpu_from_config)
-    cuda_available = _is_musa_available()
-    visible_device_count = _get_visible_cuda_device_count() if cuda_available else 0
+    musa_available = _is_musa_available()
+    visible_device_count = _get_visible_musa_device_count() if musa_available else 0
     gpu_list = _normalize_requested_gpu_list(requested_gpu_list, visible_device_count)
     if gpu_list != requested_gpu_list:
         print(
@@ -398,13 +398,18 @@ def main() -> None:
         )
         config["gpu"] = _normalize_gpu_csv(gpu_list)
 
-    if len(gpu_list) > 1 and "LOCAL_RANK" not in os.environ and not pre_args.no_auto_spawn and cuda_available:
+    if len(gpu_list) > 1 and "LOCAL_RANK" not in os.environ and not pre_args.no_auto_spawn and musa_available:
         visible_gpu_csv = _normalize_gpu_csv(gpu_list)
-        cmd = _build_torchrun_cmd(
-            script_path=Path(__file__).resolve(),
-            nproc_per_node=len(gpu_list),
-            master_port=pre_args.master_port,
-        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--nproc_per_node",
+            str(len(gpu_list)),
+        ]
+        if pre_args.master_port is not None:
+            cmd.extend(["--master_port", str(pre_args.master_port)])
+        cmd.append(str(Path(__file__).resolve()))
         if resolved_resume_dir is not None:
             cmd.extend(["--resume_dir", str(resolved_resume_dir)])
         else:
@@ -415,7 +420,7 @@ def main() -> None:
         cmd.extend(remaining)
         env = dict(os.environ)
         # Ensure torchrun local ranks map strictly to requested GPU subset.
-        env["CUDA_VISIBLE_DEVICES"] = visible_gpu_csv
+        env["MUSA_VISIBLE_DEVICES"] = visible_gpu_csv
         return_code = _run_torchrun_with_signal_guard(cmd=cmd, env=env)
         if return_code == 0:
             return
@@ -427,7 +432,7 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    if len(gpu_list) > 1 and not pre_args.no_auto_spawn and not cuda_available:
+    if len(gpu_list) > 1 and not pre_args.no_auto_spawn and not musa_available:
         print(
             "[WARN] Multiple GPUs configured but MUSA is unavailable in current runtime; "
             "fallback to single-process launch.",

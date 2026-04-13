@@ -1,12 +1,11 @@
 # recons_unet.yaml
 
 data:
-  data_dir: "./data/mask75/train/"         
-  test_dataset: "./data/mask75/test.pt"
-  val_path: "./data/mask75/val.pt"
+  data_path: "./data/unet_dataset_25k.pt"         
+  test_dataset: "./data/test_indices_25k.pt"
 
 training:
-  batch_size: 32
+  batch_size: 12
   epochs: 100
   learning_rate: 2e-4
   num_workers: 0
@@ -24,5 +23,5 @@ loss:
   spec_weight: 0.05
 
 logging:
-  save_dir: "./unet_checkpoints/mask75"
+  save_dir: "./unet_checkpoints"
   save_freq: 20

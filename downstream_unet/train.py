@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from pathlib import Path
+import torch_musa
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
@@ -27,7 +28,7 @@ if __package__ in {None, ""}:
 
     V2Dataset = importlib.import_module("downstream_unet.loaders.loader_single").V2Dataset
 else:
-    from .loaders.loader_single import V2Dataset
+    from .loaders.loader import V2Dataset
 
 
 def calculate_iou(pred, target, threshold=0.5):
@@ -92,12 +93,12 @@ def main():
     if is_ddp:
         dist.init_process_group(backend='nccl')
         local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
+        torch.musa.set_device(local_rank)
+        device = torch.device(f"musa:{local_rank}")
         world_size = dist.get_world_size()
     else:
         local_rank = 0
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device('musa' if torch.musa.is_available() else 'cpu')
         world_size = 1
 
     def print_rank0(*msg):
@@ -207,7 +208,7 @@ def main():
                 pbar.set_postfix({'TotLoss': f"{loss.item():.3f}", 'Dice': f"{l_dice.item():.3f}"})
 
         # 清理 GPU 缓存（每轮结束）
-        torch.cuda.empty_cache()
+        torch.musa.empty_cache()
 
         # --- B. 验证（每 val_freq 轮执行一次）---
         val_loss = 0.0

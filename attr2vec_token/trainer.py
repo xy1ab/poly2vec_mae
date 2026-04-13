@@ -10,6 +10,17 @@ from models import NaturalResourceFoundationModel
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import joblib
+import argparse
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for batch forward export."""
+    parser = argparse.ArgumentParser(
+        description="Batch forward triangulated polygon shards into embeddings and MAE frequency maps."
+    )
+    parser.add_argument("--cache_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--vocab_size", type=int, default=8192, help="Vocabulary size for the BPE tokenizer (default: 20000).")
+    return parser
 
 def setup_ddp():
     dist.init_process_group(backend="nccl")
@@ -27,29 +38,37 @@ def load_all_caches(cache_files, is_master):
     all_layers_data = {}
     for file in cache_files:
         if os.path.exists(file):
-            if is_master: print(f"📦 装载高速缓存: {file}")
-            data = torch.load(file, map_location='cpu', weights_only=False)
+            if is_master: print(f"📦 正在装载高速缓存: {file} ...")
+            data = joblib.load(file)
             all_layers_data.update(data)
     return all_layers_data
 
 def train():
+    args = build_arg_parser().parse_args()
     local_rank = setup_ddp(); is_master = (dist.get_rank() == 0)
-    
-    config = {'vocab_size': 20000}
-    batch_size, epochs, base_lr, warmup_epochs = 1024, 1000, 1.2e-4, 50
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir, exist_ok=True)
+    # 🌟 安全参数升级：词表 20000，批次下调至 2048 防爆
+    config = {'truth_dim': 256, 'semantic_dim': 256, 'vocab_size': args.vocab_size}
+    batch_size, epochs, base_lr, warmup_epochs = 256, 5, 2e-4, 1
     
     model = DDP(NaturalResourceFoundationModel(config).cuda(local_rank), device_ids=[local_rank], find_unused_parameters=False)
     optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
     scaler = GradScaler('cuda')
 
-    cache_files = glob.glob("cache_*.pt")
+    cache_files = glob.glob(args.cache_dir + "/*.joblib")
     if is_master: 
         print(f"🧲 共发现 {len(cache_files)} 个张量缓存文件，准备汇入训练池...")
 
     data_all = load_all_caches(cache_files, is_master)
     layer_names = list(data_all.keys())
     history = {"loss": [], "lr": []}; best_loss = float('inf'); start_time = time.time()
+
+    if is_master:
+        print("="*60)
+        print(f"🚀 [大一统底座] 500 Epochs 任务重燃 | 图层数: {len(layer_names)}")
+        print("="*60)
 
     for epoch in range(epochs):
         model.train(); epoch_loss, total_b = 0.0, 0
@@ -58,13 +77,13 @@ def train():
             for pg in optimizer.param_groups: pg['lr'] = lr
         
         random.shuffle(layer_names)
-        for ln in layer_names:
+        for idx, ln in enumerate(layer_names):
             d = data_all[ln]
             if d['cont_int'].shape[0] < 2: continue
             
             ds = TensorDataset(*[torch.from_numpy(d[k]) for k in ['cont_int','cont_frac_hi','cont_frac_lo','cont_norm','word_data','char_data']])
             sm = DistributedSampler(ds, shuffle=True); sm.set_epoch(epoch)
-            loader = DataLoader(ds, batch_size=batch_size, sampler=sm, num_workers=24, pin_memory=True, persistent_workers=True)
+            loader = DataLoader(ds, batch_size=batch_size, sampler=sm, num_workers=4, pin_memory=True)
             
             for batch in loader:
                 batch = [t.cuda(local_rank, non_blocking=True) for t in batch]
@@ -75,18 +94,20 @@ def train():
                 scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer); scaler.update()
                 epoch_loss += loss.item(); total_b += 1
+            
+            if is_master and (idx + 1) % max(1, len(layer_names)//2) == 0:
+                print(f"   ⌛ Ep {epoch+1} Progress: {idx+1}/{len(layer_names)} Layers...")
 
         if epoch >= warmup_epochs: scheduler.step()
         if is_master and total_b > 0:
-            avg_loss = epoch_loss / total_b; curr_lr = optimizer.param_groups[0]['lr']
+            avg_loss = epoch_loss / total_b
+            curr_lr = optimizer.param_groups[0]['lr']
             history["loss"].append(avg_loss); history["lr"].append(curr_lr)
-            if (epoch + 1) % 5 == 0:
-                save_visuals(history)
-                with open("train_history.json", "w") as f: json.dump(history, f)
+            print(f"📈 Ep {epoch+1:03d}/{epoch} | Loss: {avg_loss:.6f} | LR: {curr_lr:.2e} | T: {time.time()-start_time:.1f}s")
             if avg_loss < best_loss:
-                best_loss = avg_loss; 
-                torch.save(model.module.state_dict(), "best_model.pth")
-            print(f"📈 Ep {epoch+1:04d}/{epochs} | Loss: {avg_loss:.6f} | LR: {curr_lr:.2e} | T: {time.time()-start_time:.1f}s")
+                best_loss = avg_loss
+                torch.save(model.module.state_dict(), os.path.join(args.output_dir,"best_model.pth"))
+                with open(os.path.join(args.output_dir,"train_history.json"), "w") as f: json.dump(history, f)
 
     dist.destroy_process_group()
 

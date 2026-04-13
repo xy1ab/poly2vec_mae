@@ -215,158 +215,146 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import argparse
+from pathlib import Path
+import sys
+from typing import Any
+import re
+import os
+from tqdm import tqdm
+import numpy as np
+from datetime import datetime
+import torch.nn.functional as F
+
+
+def setup_dist(args):
+    """初始化分布式环境"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ["WORLD_SIZE"])
+        args.gpu = int(os.environ["LOCAL_RANK"])
+    else:
+        print("Not running in distributed mode, falling back to single GPU.")
+        args.distributed = False
+        return False
+
+    args.distributed = True
+    torch.cuda.set_device(args.gpu)
+    dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo", init_method="env://")
+    return True
+
 def getdata(args) -> None:
-    """CLI main entrypoint."""
     project_root = _inject_repo_root()
+    
+    # 1. 分布式初始化
+    is_dist = setup_dist(args)
+    rank = args.rank if is_dist else 0
+    world_size = args.world_size if is_dist else 1
+    device = torch.device(f"cuda:{args.gpu}" if is_dist else args.device)
 
-    args.precision = normalize_precision(args.precision)
-    if args.batch_size <= 0:
-        raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
-    if args.max_samples < 0:
-        raise ValueError(f"`max_samples` must be >= 0, got {args.max_samples}")
-
+    # 2. 准备模型和工具
     args.model_dir = str(_resolve_user_path(args.model_dir, project_root))
-    args.data_dir = str(_resolve_user_path(args.data_dir, project_root))
-    output_path = _build_output_path(project_root, args.data_dir, args.output_path or None)
-    ensure_dir(output_path.parent)
-
-    requested_device = args.device or _default_device()
-    if str(requested_device).startswith("musa") and not torch.musa.is_available():
-        print("[WARN] MUSA unavailable, fallback to CPU for forward export.")
-        requested_device = "cpu"
-    device = torch.device(requested_device)
-
-    shard_paths = resolve_triangle_shard_paths(args.data_dir, warn_fn=lambda message: print(message))
-    encoder_weight, config_path, encoder_fallback_to_mae = _resolve_model_artifacts(args.model_dir)
-
+    encoder_weight, config_path, _ = _resolve_model_artifacts(args.model_dir)
     config = load_config_any(config_path)
     geom_type = str(config.get("geom_type", "polygon")).lower()
+    
     codec = get_geometry_codec(geom_type, config, device=str(device))
-
     encoder = load_pretrained_encoder(
         weight_path=encoder_weight,
         config_path=config_path,
         device=device,
         precision=args.precision,
     )
-
     encoder.eval()
-
-
-    metadata: dict[str, Any] = {
-        "schema_version": 1,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "model_dir": str(Path(args.model_dir).expanduser().resolve()),
-        "data_dir": str(Path(args.data_dir).expanduser().resolve()),
-        "config_path": str(Path(config_path).expanduser().resolve()),
-        "encoder_weight": str(Path(encoder_weight).expanduser().resolve()),
-        "precision": args.precision,
-        "device": str(device),
-        "spatial_size": 256,
-        "geom_type": geom_type,
-        "config": dict(config),
-        "shard_paths": [str(path) for path in shard_paths],
-        "processed_shard_count": 0,
-        "sample_count": 0,
-    }
-
-    output_samples: list[dict[str, Any]] = []
-    pending_tris: list[Any] = []
-    exported_count = 0
-    processed_shard_count = 0
-
-    def flush_pending() -> None:
-        """Run one inference batch and append output sample dicts."""
-        nonlocal exported_count
-        if not pending_tris:
-            return
-
-        batch_tris, lengths = pad_triangle_batch(pending_tris, device=device)
-        with torch.no_grad():
-            mag, phase = codec.cft_batch(batch_tris, lengths)
-            imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
-            # true_imag = rasterize_triangles_pytorch(batch_tris)
-            with autocast_context(device, args.precision):
-                encoder_features = encoder(imgs)
-
-            embeddings = encoder_features.float().cpu()
-            # 逆变换出模糊空间图 (通道1)
-            raw_mag = torch.expm1(mag)
-            # F_uv = raw_mag * torch.exp(1j * phase)
-            F_uv_real = raw_mag * torch.cos(phase)
-            F_uv_imag = raw_mag * torch.sin(phase)
-            # x_spatial = engine.icft_2d(F_uv.squeeze(1), spatial_size=cfg.SPATIAL_SIZE)
-            x_spatial = codec.icft_2d(F_uv_real.squeeze(1), F_uv_imag.squeeze(1), spatial_size=256)
-            x_spatial = x_spatial.unsqueeze(1) #[1, 1, 256, 256]
-            
-            # 使用双线性插值, 将频域特征强制缩放到 256x256 (通道2, 通道3)
-            mag_map = F.interpolate(mag, size=(256, 256), mode='bilinear', align_corners=False)
-            phase_map = F.interpolate(phase, size=(256, 256), mode='bilinear', align_corners=False)
-            
-            # 拼接成 3 通道输入
-            x_3channel = torch.cat([x_spatial, mag_map, phase_map], dim=1).squeeze(0).cpu().half() # [3, 256, 256]
-
-
-        start_index = exported_count + 1
-        for offset, tri_np in enumerate(pending_tris):
-            sample_index = start_index + offset
-            output_samples.append(
-                {
-                    "sample_index": int(sample_index),
-                    # "triangles": torch.from_numpy(tri_np.astype("float32", copy=False)),
-                    "embedding": embeddings[offset],
-                    "x_3channel": x_3channel[offset],
-                }
-            )
-
-        exported_count += len(pending_tris)
-        pending_tris.clear()
-
-    for shard_path in tqdm(shard_paths, desc="Reading shards"):
-        processed_shard_count += 1
+    
+    # 如果是分布式，包装模型（虽是推理，DDP 也能统一管理）
+    if is_dist:
+        encoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(encoder)
+        # 推理模式下通常直接用原本模型即可，但为了兼容性可不包 DDP 仅用 .to(device)
+    
+    # 3. 读取数据 (所有进程都会读取，但后续只处理属于自己的部分)
+    shard_paths = resolve_triangle_shard_paths(args.data_dir)
+    all_tris = []
+    if rank == 0:
+        print(f"Loading shards from {args.data_dir}...")
+    
+    for shard_path in shard_paths:
         shard_data = load_triangle_shard(shard_path)
         for sample in shard_data:
-            tri_np = _ensure_numpy_float32(sample)
-            pending_tris.append(tri_np)
-
-            if len(pending_tris) >= args.batch_size:
-                flush_pending()
-
-            if args.max_samples > 0 and exported_count + len(pending_tris) >= args.max_samples:
-                remaining = args.max_samples - exported_count
-                if remaining < len(pending_tris):
-                    pending_tris[:] = pending_tris[:remaining]
-                flush_pending()
+            all_tris.append(_ensure_numpy_float32(sample))
+            if args.max_samples > 0 and len(all_tris) >= args.max_samples:
                 break
-
-        if args.max_samples > 0 and exported_count >= args.max_samples:
+        if args.max_samples > 0 and len(all_tris) >= args.max_samples:
             break
 
-    flush_pending()
+    # 4. 数据分配 (按 Rank 切分数据)
+    # 计算当前进程负责的索引范围
+    total_samples = len(all_tris)
+    samples_per_rank = (total_samples + world_size - 1) // world_size
+    start_idx = rank * samples_per_rank
+    end_idx = min(start_idx + samples_per_rank, total_samples)
+    my_tris = all_tris[start_idx:end_idx]
 
+    # 5. 推理循环
+    local_output_samples = []
+    pbar = tqdm(total=len(my_tris), desc=f"Rank {rank} Inferring") if rank == 0 else None
 
+    for i in range(0, len(my_tris), args.batch_size):
+        batch = my_tris[i : i + args.batch_size]
+        batch_tris, lengths = pad_triangle_batch(batch, device=device)
+        
+        with torch.no_grad():
+            with autocast_context(device, args.precision):
+                mag, phase = codec.cft_batch(batch_tris, lengths)
+                imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
+                encoder_features = encoder(imgs)
+                
 
+            # 存入本地结果
+            embeddings = encoder_features.float().cpu()
+            
+            for j in range(len(batch)):
+                local_output_samples.append({
+                    "sample_index": start_idx + i + j,
+                    "embedding": embeddings[j],
+                })
+        
+        if pbar: pbar.update(len(batch))
 
-    # metadata["processed_shard_count"] = int(processed_shard_count)
-    metadata["sample_count"] = int(len(output_samples))
-    if output_samples:
-        metadata["embedding_dim"] = int(output_samples[0]["embedding"].numel())
-
-    payload = {
-        "metadata": metadata,
-        "samples": output_samples,
-    }
-    torch.save(payload, output_path)
-
-    print(f"[DONE] Saved: {output_path}")
-    print(f"[DONE] Shards read: {processed_shard_count}")
-    print(f"[DONE] Sample count: {len(output_samples)}")
-    if output_samples:
-        print(f"[DONE] Embedding dim: {int(output_samples[0]['embedding'].numel())}")
+    # 6. 聚合结果到 Rank 0
+    if is_dist:
+        # 使用 object 收集，因为包含 Tensor 字典
+        all_gathered_results = [None] * world_size
+        dist.all_gather_object(all_gathered_results, local_output_samples)
+        if rank == 0:
+            final_output_samples = [item for sublist in all_gathered_results for item in sublist]
     else:
-        print("[DONE] No samples exported.")
+        final_output_samples = local_output_samples
 
+    # 7. 保存
+    if rank == 0:
+        output_path = _build_output_path(project_root, args.data_dir, args.output_path or None)
+        ensure_dir(output_path.parent)
+        
+        metadata = {
+            "sample_count": len(final_output_samples),
+            "device": "multi-gpu-dist",
+            "precision": args.precision,
+            # ... 其他 metadata ...
+        }
+        
+        payload = {"metadata": metadata, "samples": final_output_samples}
+        torch.save(payload, output_path)
+        print(f"\n[DONE] All samples gathered and saved to {output_path}")
+
+    if is_dist:
+        dist.destroy_process_group()
 
 if __name__ == '__main__':
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    # 自动获取 local_rank 用于分布式
+    args = parser.parse_args()
     getdata(args)
