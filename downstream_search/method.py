@@ -14,7 +14,7 @@ import torch.distributed as dist
 # from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
 import os
 from tqdm import tqdm
-
+from pathlib import Path
 
 # def ddp_knn_worker(rank, world_size, queries, library,batch_size, k=5):
 #     setup(rank, world_size)
@@ -81,37 +81,83 @@ def restore_bbox(center_data):
     # 堆叠成 [N, 4] 的 BBox 格式
     return torch.stack([minx, miny, maxx, maxy], dim=1)
 
-def run_spatial_filter_ddp(args, small_queries, loader):
+def run_spatial_filter_ddp(args, small_queries, loader, real_data_len, count=True):
     local_hit_indices = []
     pbar = None
     if args.global_rank == 0:
-        pbar = tqdm(total=len(loader), desc="Global Processing", unit="batch")
+        pbar = tqdm(total=real_data_len, desc="Global Processing", unit="sample")
     print(f"[Rank {args.global_rank}] 开始处理...")
 
+    base_num = real_data_len // args.world_size
+    extras = real_data_len % args.world_size
+    # 每个 rank 真正应该负责的数据量
+    # 前 extras 个 rank 多拿一个，后面的拿 base_num 个
+    legit_count = base_num + (1 if args.global_rank < extras else 0)
+    processed_in_rank = 0 # 当前进程已处理的有效数据计数
+    num_queries = small_queries.size(0)
+    global_query_counts = torch.zeros(num_queries, dtype=torch.long, device=args.device)
+    query_chunk_size = 100000
     with torch.inference_mode():
         for (b_batch,) in loader:
-            b_batch = b_batch.to(args.device)
-            # 调用你的空间过滤器方法
-            cross_mask = musa_spatial_filter_kernel(small_queries, b_batch)
-            hit_in_batch = cross_mask.any(dim=0) ## 相加找到总数
-            # 结果回传 CPU 释放显存
-            if hit_in_batch.any():
-                local_hit_indices.append(b_batch[hit_in_batch].cpu())
+            current_batch_size = b_batch.size(0)
+            if processed_in_rank >= legit_count:
+                break # 这个 Batch 里的全是补齐给我的，但我不需要了
+            if processed_in_rank + current_batch_size > legit_count:
+                # 这个 batch 跨界了，截取前半部分
+                actual_needed = legit_count - processed_in_rank
+            else:
+                actual_needed = current_batch_size
+            b_batch = b_batch[:actual_needed].to(args.device, non_blocking=True)
+            for start_idx in range(0, num_queries, query_chunk_size):
+                end_idx = min(start_idx + query_chunk_size, num_queries)
+                
+                # 提取当前块的 Query: [chunk_size, 4]
+                query_chunk = small_queries[start_idx:end_idx]
+                
+                # 计算掩码: [chunk_size, 8068]
+                # 此时显存占用从 7.5GB 降到了 0.75GB 左右
+                cross_mask = musa_spatial_filter_kernel(query_chunk, b_batch)
+                
+                # 累加命中数
+                global_query_counts[start_idx:end_idx] += cross_mask.sum(dim=1)
+                
+                # 强制释放临时中间变量（可选，由 Python GC 处理）
+                del cross_mask
+
+
+            
+            # # 调用你的空间过滤器方法
+            # cross_mask = musa_spatial_filter_kernel(small_queries, b_batch)
+            # # hit_in_batch = cross_mask.any(dim=1) ## 相加找到总数
+            # # hit_in_batch = cross_mask.sum().item()
+            # global_query_counts += cross_mask.sum(dim=1)
+            # if hit_in_batch.any():
+            #     hits = b_batch[hit_in_batch].cpu()
+            #     local_hit_indices.append(hits)
+            processed_in_rank += actual_needed
             # 更新进度条
-            if pbar:
-                pbar.update(1)
+            if args.global_rank == 0 and pbar is not None:
+                pbar.update(actual_needed * args.world_size)
+    if args.global_rank == 0: pbar.close()
     # 合并本地计算结果
-    if local_hit_indices:
-        local_result = torch.cat(local_hit_indices, dim=0)
-    else:
-        local_result = torch.empty((0, 4))
+    # if local_hit_indices:
+    #     local_result = torch.cat(local_hit_indices, dim=0)
+    # else:
+    #     local_result = torch.empty((0, 4))
+    if count:
+        # local_count = torch.tensor([local_result.shape[0]], device=args.device)
+        dist.all_reduce(global_query_counts, op=dist.ReduceOp.SUM)
+        # global_total = global_query_counts.item()
+        if args.global_rank == 0:
+            print(f"📊 汇总统计完成:")
+            print(f"  - 全局命中总数: {global_query_counts.sum()}")
+    # else:
+    #     os.makedirs(args.output_dir, exist_ok=True)
+    #     torch.save(local_result, os.path.join(args.output_dir, f"output_rank_{args.global_rank}.pt"))
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    torch.save(local_result, os.path.join(args.output_dir, f"output_rank_{args.global_rank}.pt"))
-
-    dist.barrier()
-    if args.global_rank == 0:
-        print(f"所有 {args.world_size} 张卡处理完成，结果已保存在 {args.output_dir}")
+    #     dist.barrier()
+    #     if args.global_rank == 0:
+    #         print(f"所有 {args.world_size} 张卡处理完成，结果已保存在 {args.output_dir}")
 
 
 
