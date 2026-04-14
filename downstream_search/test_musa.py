@@ -1,14 +1,4 @@
-#!/usr/bin/env python
-# -*- encoding: utf-8 -*-
-'''
-@File    :   test.py
-@Time    :   2026/04/13 10:58:28
-@Author  :   Hu Bin 
-@Version :   1.0
-@Desc    :   None
-'''
-
-
+import torch_musa
 import torch
 import time
 import pandas as pd
@@ -53,7 +43,7 @@ def benchmark():
         sq = torch.rand(100, 4) * 100
         sb = torch.rand(n, 4) * 100
 
-        for device_name in ["cpu", "cuda"]:
+        for device_name in ["cpu", "musa"]:
             device = torch.device(device_name)
             
             # 将数据移动到设备
@@ -63,22 +53,22 @@ def benchmark():
             # --- 测试 KNN ---
             # 预热 (Warm up)
             _ = musa_knn_search(xq_d, xb_d, k)
-            torch.cuda.synchronize() if device_name == "cuda" else None
+            torch.musa.synchronize() if device_name == "musa" else None
             
             start = time.perf_counter()
             for _ in range(10): # 运行10次取平均
                 _ = musa_knn_search(xq_d, xb_d, k)
-            if device_name == "cuda": torch.cuda.synchronize()
+            if device_name == "musa": torch.musa.synchronize()
             knn_time = (time.perf_counter() - start) * 1000 / 10
             
             # --- 测试 Spatial Filter ---
             _ = musa_spatial_filter(sq_d, sb_d)
-            torch.cuda.synchronize() if device_name == "cuda" else None
+            torch.musa.synchronize() if device_name == "musa" else None
 
             start = time.perf_counter()
             for _ in range(10):
                 _ = musa_spatial_filter(sq_d, sb_d)
-            if device_name == "cuda": torch.cuda.synchronize()
+            if device_name == "musa": torch.musa.synchronize()
             spatial_time = (time.perf_counter() - start) * 1000 / 10
 
             print(f"{'KNN Search':<20} | {n:<10} | {device_name:<10} | {knn_time:.2f}")
@@ -90,8 +80,8 @@ def benchmark():
     return results
 
 if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        print("错误：未检测到 CUDA 设备")
+    if not torch.musa.is_available():
+        print("错误：未检测到 MUSA 设备，请检查驱动和 torch_musa。")
     else:
         res = benchmark()
         # 这里可以进一步计算加速比 (CPU_ms / MUSA_ms)

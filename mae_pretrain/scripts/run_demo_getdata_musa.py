@@ -8,7 +8,7 @@
 @Desc    :   None
 '''
 
-
+import torch_musa
 import torch
 import argparse
 from pathlib import Path
@@ -232,10 +232,10 @@ def setup_dist(args):
         return False
 
     args.distributed = True
-    torch.cuda.set_device(args.gpu)
-    device = torch.device(f"cuda:{args.gpu}")
+    torch.musa.set_device(args.gpu)
+    device = torch.device(f"musa:{args.gpu}")
     dist.init_process_group(
-        backend="nccl", 
+        backend="mccl", 
         init_method="env://",
         world_size=args.world_size,
         rank=args.rank,
@@ -250,7 +250,7 @@ def getdata(args) -> None:
     is_dist = setup_dist(args)
     rank = args.rank if is_dist else 0
     world_size = args.world_size if is_dist else 1
-    device = torch.device(f"cuda:{args.gpu}" if is_dist else args.device)
+    device = torch.device(f"musa:{args.gpu}" if is_dist else args.device)
 
     # 2. 准备模型和工具
     args.model_dir = str(_resolve_user_path(args.model_dir, project_root))
