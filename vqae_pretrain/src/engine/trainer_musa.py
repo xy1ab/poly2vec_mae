@@ -449,6 +449,8 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`lr` must be > 0, got {args.lr}")
     if args.min_lr < 0:
         raise ValueError(f"`min_lr` must be >= 0, got {args.min_lr}")
+    if args.grad_clip_norm < 0:
+        raise ValueError(f"`grad_clip_norm` must be >= 0, got {args.grad_clip_norm}")
     if args.batch_size <= 0:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
     if args.depth <= 0:
@@ -700,6 +702,44 @@ def _all_reduce_with_op(value: torch.Tensor, dist_ctx: DistContext, op: dist.Red
     out = value.clone()
     dist.all_reduce(out, op=op)
     return out
+
+
+def _compute_global_grad_norm(parameters) -> torch.Tensor:
+    """Compute the global L2 norm over all available parameter gradients."""
+    grads = [param.grad.detach() for param in parameters if param.grad is not None]
+    if not grads:
+        return torch.tensor(0.0)
+
+    device = grads[0].device
+    grad_norms = [grad.float().norm(2).to(device) for grad in grads]
+    return torch.stack(grad_norms).norm(2)
+
+
+def _apply_grad_clip_and_debug(model, args) -> tuple[float | None, bool]:
+    """Optionally clip gradients and return the pre-clip global norm."""
+    grad_clip_norm = float(args.grad_clip_norm)
+    if grad_clip_norm <= 0 and not bool(args.grad_debug):
+        return None, False
+
+    try:
+        if grad_clip_norm > 0:
+            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+        else:
+            total_norm = _compute_global_grad_norm(model.parameters())
+        grad_norm = float(total_norm.detach().float().item() if torch.is_tensor(total_norm) else total_norm)
+    except Exception:
+        return None, False
+
+    grad_clipped = bool(grad_clip_norm > 0 and grad_norm > grad_clip_norm)
+    if not math.isfinite(grad_norm):
+        return None, grad_clipped
+    return grad_norm, grad_clipped
+
+
+def _format_grad_debug(grad_norm: float | None, grad_clipped: bool) -> str:
+    """Format the optional gradient diagnostics appended to train step logs."""
+    grad_norm_text = "NA" if grad_norm is None else f"{grad_norm:.4f}"
+    return f", GlobalGradNorm: {grad_norm_text}, GradClip: {grad_clipped}"
 
 
 @torch.no_grad()
@@ -1799,25 +1839,30 @@ def train_main(args) -> None:
                     stage="train_loss",
                 )
                 loss = step_outputs["loss_total"]
+                grad_norm, grad_clipped = None, False
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
+                    grad_norm, grad_clipped = _apply_grad_clip_and_debug(model, args)
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
+                    grad_norm, grad_clipped = _apply_grad_clip_and_debug(model, args)
                     optimizer.step()
 
                 _accumulate_epoch_metrics(train_metric_sums, step_outputs)
                 train_steps += 1
 
                 if is_main_process(dist_ctx) and step % args.log_interval == 0:
+                    grad_debug_suffix = _format_grad_debug(grad_norm, grad_clipped) if args.grad_debug else ""
                     print(
                         f"  -> Step [{step}/{len(train_loader)}], "
                         f"Train Loss: {loss.item():.4f}, VQ: {step_outputs['weighted_vq'].item():.4f}, "
                         f"Perplexity: {step_outputs['outputs'].perplexity.item():.2f}, "
                         f"ActiveCodes: {int(step_outputs['outputs'].active_codes.item())}"
+                        f"{grad_debug_suffix}"
                     )
                 if (
                     args.vq_init_debug
@@ -2168,6 +2213,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--grad_clip_norm", type=float, default=0.0)
+    parser.add_argument("--grad_debug", action="store_true")
     parser.add_argument("--augment_times", type=int, default=10)
 
     parser.add_argument("--precision", type=str, default="bf16")
