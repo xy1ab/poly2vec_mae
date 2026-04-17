@@ -45,21 +45,24 @@ def process_dataframe(df, layer_name, tokenizer, config, schema_registry):
             "metadata_token_len": len(metadata_ids)
         }
 
+    # 记录图层名，用于索引
+    metadata_short = f"[TABLE] {layer_name} [DATA] "
+    metadata_short_ids = tokenizer.encode(metadata_short).ids
     # 🌟 2. 处理数值数据
     N = len(df)
     if len(num_cols) > 0:
         num_data = df[num_cols].values.astype(np.float64)
         int_p, frac_h, frac_l = float64_to_three_float32(num_data)
-        num_features = np.empty((N, len(num_cols) * 3), dtype=np.float32)
+        num_ids = np.empty((N, len(num_cols) * 3), dtype=np.float32)
         for i in range(len(num_cols)):
-            num_features[:, i*3] = int_p[:, i]
-            num_features[:, i*3+1] = frac_h[:, i]
-            num_features[:, i*3+2] = frac_l[:, i]
+            num_ids[:, i*3] = int_p[:, i]
+            num_ids[:, i*3+1] = frac_h[:, i]
+            num_ids[:, i*3+2] = frac_l[:, i]
     else:
-        num_features = np.empty((N, 0), dtype=np.float32)
+        num_ids = np.empty((N, 0), dtype=np.float32)
 
     # 🌟 3. 处理文本数据 最后填PAD
-    seq_ids = np.zeros((N, config.max_seq_len), dtype=np.int64)
+    text_ids = np.zeros((N, config.max_seq_len), dtype=np.int64)
     if len(str_cols) > 0:
         str_data = df[str_cols].fillna("").astype(str)
         # 用 [SEP] 拼接行内不同字段，方便未来无损解码时对号入座
@@ -69,21 +72,21 @@ def process_dataframe(df, layer_name, tokenizer, config, schema_registry):
             ids = enc.ids
             if len(ids) > config.max_seq_len:
                 ids = ids[:config.max_seq_len]
-            seq_ids[i, :len(ids)] = ids
+            text_ids[i, :len(ids)] = ids
 
     # 🌟 4. [最核心：绝对解耦的两套张量生成]
     
     # 轨道 A: 物理无损记忆轨道 (Float32)
-    truth_vector = np.zeros((N, config.truth_dim), dtype=np.float32)
-    num_width = num_features.shape[1]
-    truth_vector[:, :num_width] = num_features
+    input_ids = np.zeros((N, config.truth_dim), dtype=np.float32)
+    input_ids[:,:len(metadata_short_ids)] = metadata_short_ids
+    num_width = num_ids.shape[1]
+    input_ids[:, len(metadata_short_ids):(num_width+len(metadata_short_ids))] = num_ids
     # 把 int64 的 Token IDs 转为 float32 送进去
-    truth_vector[:, num_width : num_width + config.max_seq_len] = seq_ids.astype(np.float32)
+    input_ids[:, (num_width+len(metadata_short_ids)) : (num_width+len(metadata_short_ids) + config.max_seq_len)] = text_ids.astype(np.float32)
     
     # 轨道 B: 语义高保真重建轨道 (Int64)
-    semantic_ids = seq_ids
     
-    return truth_vector, semantic_ids
+    return input_ids
 
 # ========================================================
 # 🚀 针对南湖集群优化的流式落盘张量流水线
@@ -102,31 +105,27 @@ def build_tensors(config_path):
     
     # 【集群优化核心】：内存缓冲池与流式落盘参数
     CHUNK_SIZE = 100000        # 每个 pt 文件的样本数，防止内存溢出
-    truth_buffer = []          
-    semantic_buffer = []       
+    data_buffer = []                 
     buffer_rows = 0            
     chunk_idx = 0              
     total_processed_rows = 0   
 
     def flush_buffer_to_disk(force_all=False):
         """流式落盘触发器：当 buffer 满载或遍历结束时调用"""
-        nonlocal truth_buffer, semantic_buffer, buffer_rows, chunk_idx, total_processed_rows
+        nonlocal data_buffer, buffer_rows, chunk_idx, total_processed_rows
         
         while buffer_rows >= CHUNK_SIZE or (force_all and buffer_rows > 0):
             # 堆叠数据
-            stacked_truth = np.vstack(truth_buffer)
-            stacked_semantic = np.vstack(semantic_buffer)
+            stacked_data = np.vstack(data_buffer)
             
             # 确定切分边界
             rows_to_save = min(CHUNK_SIZE, buffer_rows)
-            chunk_truth = stacked_truth[:rows_to_save]
-            chunk_semantic = stacked_semantic[:rows_to_save]
+            chunk_data = stacked_data[:rows_to_save]
             
             # 安全存盘
             out_path = os.path.join(config.output_dir, f"cache_chunk_{chunk_idx}.pt")
             torch.save({
-                "truth_vector": chunk_truth,
-                "semantic_ids": chunk_semantic
+                "data_ids": chunk_data,
             }, out_path)
             print(f"✅ 流式落盘触发: 成功保存 {out_path} (释放内存: {rows_to_save} 条)")
             
@@ -134,13 +133,11 @@ def build_tensors(config_path):
             total_processed_rows += rows_to_save
             
             # 将剩下的尾巴塞回缓存池
-            if rows_to_save < stacked_truth.shape[0]:
-                truth_buffer = [stacked_truth[rows_to_save:]]
-                semantic_buffer = [stacked_semantic[rows_to_save:]]
-                buffer_rows = truth_buffer[0].shape[0]
+            if rows_to_save < stacked_data.shape[0]:
+                data_buffer = [stacked_data[rows_to_save:]]
+                buffer_rows = data_buffer[0].shape[0]
             else:
-                truth_buffer = []
-                semantic_buffer = []
+                data_buffer = []
                 buffer_rows = 0
 
     # ---------------- 扫描与处理文件流水线 ----------------
@@ -156,11 +153,10 @@ def build_tensors(config_path):
             layer_name = os.path.basename(file_path).split('.')[0]
             df = load_csv_safely(file_path)
             if df is not None:
-                t_vec, s_ids = process_dataframe(df, layer_name, tokenizer, config, schema_registry)
-                if t_vec is not None:
-                    truth_buffer.append(t_vec)
-                    semantic_buffer.append(s_ids)
-                    buffer_rows += t_vec.shape[0]
+                input_ids = process_dataframe(df, layer_name, tokenizer, config, schema_registry)
+                if input_ids is not None:
+                    data_buffer.append(input_ids)
+                    buffer_rows += input_ids.shape[0]
                     flush_buffer_to_disk(force_all=False)
                     
         elif file_path.lower().endswith('.gdb'):
@@ -168,11 +164,10 @@ def build_tensors(config_path):
                 layers = pyogrio.list_layers(file_path)
                 for layer_name, geom_type in layers:
                     df = pyogrio.read_dataframe(file_path, layer=layer_name, read_geometry=False)
-                    t_vec, s_ids = process_dataframe(df, layer_name, tokenizer, config, schema_registry)
-                    if t_vec is not None:
-                        truth_buffer.append(t_vec)
-                        semantic_buffer.append(s_ids)
-                        buffer_rows += t_vec.shape[0]
+                    input_ids = process_dataframe(df, layer_name, tokenizer, config, schema_registry)
+                    if input_ids is not None:
+                        data_buffer.append(input_ids)
+                        buffer_rows += input_ids.shape[0]
                         flush_buffer_to_disk(force_all=False)
             except Exception as e:
                 print(f"❌ 读取 GDB 失败 [{file_path}]: {e}")

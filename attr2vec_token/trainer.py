@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 
 from config import ModelConfig
-from models import NaturalResourceFoundationModel
+from models import Attr2Vec
 
 # ======================================================================
 # 1. 数据集加载器 (直接读取缓存的 PT 文件)
@@ -56,18 +56,12 @@ class NRECacheDataset(Dataset):
 # ======================================================================
 # 2. 分布式环境初始化
 # ======================================================================
-def setup_ddp():
-    if "LOCAL_RANK" not in os.environ:
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        os.environ["RANK"] = "0"
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "29500"
-    
+def setup_ddp():  
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    return local_rank
+    global_rank = dist.get_rank()
+    return local_rank, global_rank
 
 def cleanup_ddp():
     dist.destroy_process_group()
@@ -76,27 +70,23 @@ def cleanup_ddp():
 # 3. 核心训练主循环
 # ======================================================================
 def train():
-    local_rank = setup_ddp()
-    is_master = (dist.get_rank() == 0)
+
     
     # 🌟 1. 启动配置解析 (新增 batch_size 外部调节开关)
     parser = argparse.ArgumentParser(description="ZrZy Foundation Model Training")
-    parser.add_argument("--cache_dir", type=str, required=True, help="存放 cache_*.pt 的目录")
-    parser.add_argument("--output_dir", type=str, required=True, help="模型权重和日志保存目录")
+    parser.add_argument("--config_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/attr/config.json", help="存放 cache_*.pt 的目录")
+    parser.add_argument("--cache_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/attr/", help="存放 cache_*.pt 的目录")
+    parser.add_argument("--output_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/attr", help="模型权重和日志保存目录")
     parser.add_argument("--batch_size", type=int, default=256, help="单卡 Batch Size (降低此值以解决 OOM)")
     args = parser.parse_args()
     
     config = ModelConfig()
-    config_path = os.path.join(args.output_dir, "model_config.json")
-    if os.path.exists(config_path):
-        config.load(config_path)
-    else:
-        raise FileNotFoundError(f"❌ 找不到配置文件 {config_path}，无法获知正确的维度信息！")
+    config.load(args.config_path)
         
     # 🌟 动态覆盖 Batch Size 以防止显存溢出
     config.batch_size = args.batch_size
-
-    if is_master:
+    local_rank, global_rank = setup_ddp()
+    if global_rank == 0:
         print("\n" + "="*60)
         print("🚀 [南湖大一统底座] 物理/语义解耦架构开始训练")
         print(f"👉 物理真值轨道维度: {config.truth_dim} (已冻结梯度)")
@@ -106,7 +96,7 @@ def train():
         print("="*60 + "\n")
 
     # 2. 构建模型与分布式包裹
-    model = NaturalResourceFoundationModel(config).cuda(local_rank)
+    model = Attr2Vec(config).cuda(local_rank)
     # 🌟 开启未使用参数检测，允许 to_semantic 头在预训练时暂不更新
     model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     
@@ -125,7 +115,6 @@ def train():
         sampler=sampler, 
         num_workers=4, 
         pin_memory=True, 
-        drop_last=True
     )
 
     # 4. 开始训练
@@ -158,7 +147,7 @@ def train():
         scheduler.step()
         
         # 5. 日志与模型保存
-        if is_master:
+        if global_rank == 0:
             avg_loss = epoch_loss / len(dataloader)
             elapsed = time.time() - start_time
             print(f"Epoch [{epoch+1}/{config.epochs}] | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | Time: {elapsed:.2f}s")
