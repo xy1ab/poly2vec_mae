@@ -74,17 +74,12 @@ def process_dataframe(df, layer_name, tokenizer, config, schema_registry):
                 ids = ids[:config.max_seq_len]
             text_ids[i, :len(ids)] = ids
 
-    # 🌟 4. [最核心：绝对解耦的两套张量生成]
-    
-    # 轨道 A: 物理无损记忆轨道 (Float32)
     input_ids = np.zeros((N, config.truth_dim), dtype=np.float32)
     input_ids[:,:len(metadata_short_ids)] = metadata_short_ids
     num_width = num_ids.shape[1]
     input_ids[:, len(metadata_short_ids):(num_width+len(metadata_short_ids))] = num_ids
     # 把 int64 的 Token IDs 转为 float32 送进去
     input_ids[:, (num_width+len(metadata_short_ids)) : (num_width+len(metadata_short_ids) + config.max_seq_len)] = text_ids.astype(np.float32)
-    
-    # 轨道 B: 语义高保真重建轨道 (Int64)
     
     return input_ids
 
