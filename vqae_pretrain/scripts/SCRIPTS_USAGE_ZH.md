@@ -10,7 +10,7 @@ cd /home/xiaoyang/workspace/poly2vec_mae/vqae_pretrain
 
 - 入口脚本：`scripts/run_pretrain.py`
 
-- 具体功能：读取 `configs/pretrain_base.yaml` 与命令行覆盖参数，启动 `conv+ViT encoder + EMA VQ + attention+conv decoder` 的 VQAE 训练。训练输出统一写到 `<save_dir>/<run_timestamp>/best` 与 `ckpt`。支持 `--resume_dir` 从同一次 run 目录继续训练。
+- 具体功能：读取 `configs/pretrain_base.yaml` 与命令行覆盖参数，启动 `conv+ViT encoder + EMA VQ + attention+conv decoder` 的 VQAE 训练。训练输出统一写到 `<save_dir>/<run_name>/best` 与 `ckpt`。如果 `ckpt/train_state_a.pth` 或 `ckpt/train_state_b.pth` 已存在，使用同一条命令会自动续训。
 
 - 当前实现说明：
   - encoder token 数由 `stem_strides` 的总下采样倍率决定，不再使用 patchify 作为 token 化入口；
@@ -45,6 +45,7 @@ cd /home/xiaoyang/workspace/poly2vec_mae/vqae_pretrain
 ```bash
 python scripts/run_pretrain.py \
   --config configs/pretrain_base.yaml \
+  --run_name 20260417_run1 \
   --gpu 0 \
   --epochs 200 \
   --batch_size 256 \
@@ -56,7 +57,8 @@ python scripts/run_pretrain.py \
 
 ```bash
 python scripts/run_pretrain.py \
-  --resume_dir ./outputs/ckpt/20260407_1200 \
+  --config configs/pretrain_base.yaml \
+  --run_name 20260417_run1 \
   --epochs 240 \
   --gpu 0 \
   --eval_every 5

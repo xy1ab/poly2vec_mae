@@ -7,7 +7,7 @@ checkpoint export, filesystem helpers, logging, and distributed initialization.
 """
 
 from .config import load_config_any, load_json_config, load_yaml_config
-from .filesystem import ensure_dir, make_timestamped_dir
+from .filesystem import ensure_dir
 from .precision import autocast_context, normalize_precision, precision_to_torch_dtype
 
 __all__ = [
@@ -15,7 +15,6 @@ __all__ = [
     "load_json_config",
     "load_yaml_config",
     "ensure_dir",
-    "make_timestamped_dir",
     "autocast_context",
     "normalize_precision",
     "precision_to_torch_dtype",

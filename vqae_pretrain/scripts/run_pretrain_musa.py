@@ -62,7 +62,7 @@ def _resolve_project_relative_config_paths(config_dict: dict, project_root: Path
         Config copy with normalized path-like values.
     """
     resolved = dict(config_dict)
-    for key in ("data_dir", "data_path", "save_dir", "resume_dir"):
+    for key in ("data_dir", "data_path", "save_dir"):
         value = resolved.get(key)
         if value is None:
             continue
@@ -71,36 +71,6 @@ def _resolve_project_relative_config_paths(config_dict: dict, project_root: Path
         if not path_value.is_absolute():
             resolved[key] = str((project_root / path_value).resolve())
     return resolved
-
-
-def _load_resume_config(resume_dir: str | Path, project_root: Path) -> tuple[dict, Path]:
-    """Load saved training config from one previous run directory.
-
-    Args:
-        resume_dir: Run directory path `<save_dir>/<run_timestamp>`.
-        project_root: `vqae_pretrain` project root.
-
-    Returns:
-        Tuple `(config_dict, resolved_resume_dir)`.
-    """
-    if __package__ in {None, ""}:
-        import importlib
-
-        load_yaml_config = importlib.import_module("vqae_pretrain.src.utils.config").load_yaml_config
-    else:
-        from ..src.utils.config import load_yaml_config
-
-    resolved_resume_dir = Path(resume_dir).expanduser().resolve()
-    config_path = resolved_resume_dir / "ckpt" / "config.yaml"
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Resume config not found: {config_path}")
-
-    config = _resolve_project_relative_config_paths(
-        load_yaml_config(config_path),
-        project_root=project_root,
-    )
-    config["resume_dir"] = str(resolved_resume_dir)
-    return config, resolved_resume_dir
 
 
 def _split_gpu_list(gpu_value: str) -> list[str]:
@@ -346,10 +316,10 @@ def main() -> None:
         help="Optional evaluation-epoch interval override.",
     )
     pre_parser.add_argument(
-        "--resume_dir",
+        "--run_name",
         type=str,
-        default=None,
-        help="Resume from an existing run directory `<save_dir>/<run_timestamp>`.",
+        required=True,
+        help="Stable run directory name under `save_dir`; existing checkpoints auto-resume.",
     )
     pre_parser.add_argument(
         "--vq_init_mode",
@@ -366,23 +336,18 @@ def main() -> None:
     pre_parser.add_argument("--no_auto_spawn", action="store_true")
     pre_args, remaining = pre_parser.parse_known_args()
 
-    if pre_args.resume_dir is not None:
-        config, resolved_resume_dir = _load_resume_config(pre_args.resume_dir, project_root=project_root)
-    else:
-        config = _resolve_project_relative_config_paths(
-            load_yaml_config(pre_args.config),
-            project_root=project_root,
-        )
-        resolved_resume_dir = None
+    config = _resolve_project_relative_config_paths(
+        load_yaml_config(pre_args.config),
+        project_root=project_root,
+    )
     config = _normalize_runtime_config(config)
+    config["run_name"] = str(pre_args.run_name)
 
     # Apply early GPU override so DDP process-count follows CLI user intent.
     if pre_args.gpu is not None:
         config["gpu"] = str(pre_args.gpu)
     if pre_args.eval_every is not None:
         config["eval_every"] = int(pre_args.eval_every)
-    if resolved_resume_dir is not None:
-        config["resume_dir"] = str(resolved_resume_dir)
     if pre_args.vq_init_mode is not None:
         config["vq_init_mode"] = str(pre_args.vq_init_mode)
     if pre_args.vq_init_debug:
@@ -413,13 +378,17 @@ def main() -> None:
         if pre_args.master_port is not None:
             cmd.extend(["--master_port", str(pre_args.master_port)])
         cmd.append(str(Path(__file__).resolve()))
-        if resolved_resume_dir is not None:
-            cmd.extend(["--resume_dir", str(resolved_resume_dir)])
-        else:
-            cmd.extend(["--config", str(pre_args.config)])
+        cmd.extend(["--config", str(pre_args.config)])
         cmd.append("--no_auto_spawn")
+        cmd.extend(["--run_name", str(pre_args.run_name)])
+        if pre_args.gpu is not None:
+            cmd.extend(["--gpu", str(pre_args.gpu)])
         if pre_args.eval_every is not None:
             cmd.extend(["--eval_every", str(pre_args.eval_every)])
+        if pre_args.vq_init_mode is not None:
+            cmd.extend(["--vq_init_mode", str(pre_args.vq_init_mode)])
+        if pre_args.vq_init_debug:
+            cmd.append("--vq_init_debug")
         cmd.extend(remaining)
         env = dict(os.environ)
         # Ensure torchrun local ranks map strictly to requested GPU subset.

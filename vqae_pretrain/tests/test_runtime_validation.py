@@ -14,6 +14,8 @@ def _build_training_args(**overrides):
     payload = {
         "lr": 1e-3,
         "min_lr": 0.0,
+        "run_name": "unit_test_run",
+        "grad_clip_norm": 0.0,
         "batch_size": 8,
         "val_ratio": 0.1,
         "augment_times": 1,

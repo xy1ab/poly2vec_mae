@@ -15,8 +15,7 @@ from typing import Any, Mapping
 
 import torch
 
-from .config import dump_yaml_config
-from .filesystem import copy_if_exists, ensure_dir
+from .filesystem import ensure_dir
 from .precision import normalize_precision, precision_to_torch_dtype
 
 
@@ -162,7 +161,7 @@ def load_training_state(path: str | Path) -> dict[str, Any]:
 
 
 def load_latest_training_state(
-    resume_dir: str | Path,
+    run_dir: str | Path,
     latest_name: str = "train_state_a.pth",
     previous_name: str = "train_state_b.pth",
 ) -> tuple[dict[str, Any], Path]:
@@ -171,14 +170,14 @@ def load_latest_training_state(
     The function tries `a` first and falls back to `b` when necessary.
 
     Args:
-        resume_dir: Run directory that contains `ckpt/`.
+        run_dir: Run directory that contains `ckpt/`.
         latest_name: Filename of the newest checkpoint.
         previous_name: Filename of the previous checkpoint.
 
     Returns:
         Tuple `(state_dict, loaded_path)`.
     """
-    ckpt_dir = Path(resume_dir).expanduser().resolve() / "ckpt"
+    ckpt_dir = Path(run_dir).expanduser().resolve() / "ckpt"
     candidate_paths = [ckpt_dir / latest_name, ckpt_dir / previous_name]
 
     last_error: Exception | None = None
@@ -194,4 +193,3 @@ def load_latest_training_state(
     if last_error is not None:
         raise RuntimeError(f"Failed to load any resume checkpoint under: {ckpt_dir}") from last_error
     raise FileNotFoundError(f"No resume checkpoint found under: {ckpt_dir}")
-

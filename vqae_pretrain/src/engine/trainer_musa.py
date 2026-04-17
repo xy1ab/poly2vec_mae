@@ -46,7 +46,7 @@ from ..utils.checkpoint import (
     save_latest_training_state_pair,
     save_training_state,
 )
-from ..utils.config import dump_yaml_config
+from ..utils.config import dump_yaml_config, load_yaml_config
 from ..utils.dist_musa import (
     DistContext,
     all_reduce_mean,
@@ -55,17 +55,40 @@ from ..utils.dist_musa import (
     init_distributed_musa,
     is_main_process,
 )
-from ..utils.filesystem import ensure_dir, make_timestamped_dir
+from ..utils.filesystem import ensure_dir
 from ..utils.logger import attach_tee_stdout
 from ..utils.precision_musa import autocast_context, build_grad_scaler, normalize_precision
 from ..utils.safe_load import register_numpy_safe_globals
 from ..utils.seed import capture_rng_state, restore_rng_state, set_global_seed
 
 
-_RESUME_LOCKED_KEYS = {
+_RUN_CONFIG_KEYS = (
+    "train_type",
     "geom_type",
     "data_dir",
     "data_path",
+    "load_mode",
+    "save_dir",
+    "run_name",
+    "gpu",
+    "num_workers",
+    "seed",
+    "split_seed",
+    "deterministic",
+    "weight_mag",
+    "weight_mag_hf",
+    "weight_phase",
+    "val_ratio",
+    "warmup_epochs",
+    "vq_warmup_epochs",
+    "vq_beta_warmup_epochs",
+    "min_lr",
+    "pos_freqs",
+    "w_min",
+    "w_max",
+    "freq_type",
+    "cft_triangle_chunk_size",
+    "icft_spatial_chunk_size",
     "stem_channels",
     "stem_strides",
     "embed_dim",
@@ -90,32 +113,36 @@ _RESUME_LOCKED_KEYS = {
     "vq_decay",
     "vq_eps",
     "vq_dead_code_threshold",
-    "vq_warmup_epochs",
-    "vq_beta_warmup_epochs",
     "vq_init_max_vectors",
     "vq_kmeans_iters",
-    "pos_freqs",
-    "w_min",
-    "w_max",
-    "freq_type",
+    "vq_restart_pool_size_per_rank",
+    "vq_init_mode",
+    "epochs",
+    "batch_size",
+    "lr",
+    "weight_decay",
+    "grad_clip_norm",
+    "augment_times",
+    "precision",
+    "checkpoint_dtype",
+    "eval_every",
+    "log_interval",
+)
+
+
+_RESUME_RUNTIME_OVERRIDE_KEYS = {
+    "epochs",
+    "lr",
+    "weight_decay",
+    "grad_clip_norm",
+    "eval_every",
+    "log_interval",
+    "gpu",
+    "num_workers",
 }
 
 
-_DEBUG_ARG_KEYS = {
-    "vq_debug",
-    "vq_debug_interval",
-    "vq_debug_topk",
-    "vq_debug_active_floor",
-    "vq_debug_active_drop_ratio",
-    "vq_debug_top1_ratio",
-    "vq_debug_nearest_check",
-    "vq_debug_nearest_check_size",
-}
-
-
-def _strip_debug_args(config: dict) -> dict:
-    """Remove CLI-only diagnostics from persisted run configuration."""
-    return {key: value for key, value in config.items() if key not in _DEBUG_ARG_KEYS}
+_RESUME_LOCKED_KEYS = set(_RUN_CONFIG_KEYS) - _RESUME_RUNTIME_OVERRIDE_KEYS
 
 
 def mag_phase_to_real_imag(mag_log: torch.Tensor, phase: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -369,6 +396,61 @@ def _build_model_config(args, img_size: tuple[int, int]) -> dict:
     }
 
 
+def _build_run_config(args) -> dict:
+    """Build the canonical config persisted for auto-resume validation."""
+    return {key: getattr(args, key) for key in _RUN_CONFIG_KEYS}
+
+
+def _validate_run_name(run_name: str) -> str:
+    """Validate one stable run directory name."""
+    name = str(run_name).strip()
+    if not name:
+        raise ValueError("`run_name` must be a non-empty directory name")
+    if name in {".", ".."} or "/" in name or "\\" in name or Path(name).is_absolute():
+        raise ValueError(
+            "`run_name` must be a plain directory name under `save_dir`; "
+            f"got {run_name!r}"
+        )
+    return name
+
+
+def _has_latest_training_state(run_dir: Path) -> bool:
+    """Check whether one fixed run directory contains an auto-resume state."""
+    ckpt_dir = run_dir / "ckpt"
+    return any((ckpt_dir / name).is_file() for name in ("train_state_a.pth", "train_state_b.pth"))
+
+
+def _find_existing_run_config(run_dir: Path) -> Path | None:
+    """Find an existing persisted run config for a checkpoint-less run dir."""
+    for config_path in (run_dir / "ckpt" / "config.yaml", run_dir / "best" / "config.yaml"):
+        if config_path.is_file():
+            return config_path
+    return None
+
+
+def _validate_exact_run_config(current_config: dict, saved_config: dict, *, source: Path) -> None:
+    """Require an existing checkpoint-less run directory to match exactly."""
+    current_keys = set(_RUN_CONFIG_KEYS)
+    saved_keys = set(saved_config.keys())
+    unexpected_keys = saved_keys - current_keys
+    missing_keys = current_keys - saved_keys
+    if unexpected_keys or missing_keys:
+        raise ValueError(
+            f"Existing run config is incompatible: source={source}, "
+            f"unexpected={sorted(unexpected_keys)}, missing={sorted(missing_keys)}"
+        )
+
+    for key in _RUN_CONFIG_KEYS:
+        current_value = _normalize_config_value(key, current_config.get(key))
+        saved_value = _normalize_config_value(key, saved_config.get(key))
+        if current_value != saved_value:
+            raise ValueError(
+                f"Existing run config mismatch for `{key}` from {source}: "
+                f"current={current_value}, saved={saved_value}. "
+                "Use a different `run_name` or clean the existing run directory."
+            )
+
+
 def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx: DistContext):
     """Construct VQAE model and optional DDP wrapper.
 
@@ -449,6 +531,7 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`lr` must be > 0, got {args.lr}")
     if args.min_lr < 0:
         raise ValueError(f"`min_lr` must be >= 0, got {args.min_lr}")
+    _validate_run_name(args.run_name)
     if args.grad_clip_norm < 0:
         raise ValueError(f"`grad_clip_norm` must be >= 0, got {args.grad_clip_norm}")
     if args.batch_size <= 0:
@@ -1535,7 +1618,8 @@ def train_main(args) -> None:
     """Main training entrypoint."""
     register_numpy_safe_globals()
     args.load_mode = str(args.load_mode).lower()
-    args.resume_dir = str(Path(args.resume_dir).expanduser().resolve()) if args.resume_dir else None
+    args.save_dir = str(Path(args.save_dir).expanduser().resolve())
+    args.run_name = _validate_run_name(args.run_name)
     args.eval_every = max(1, int(args.eval_every))
     _validate_training_args(args)
 
@@ -1555,25 +1639,26 @@ def train_main(args) -> None:
     resume_path = None
     start_epoch = 0
     best_val_loss = float("inf")
+    run_dir = Path(args.save_dir) / args.run_name
+    run_config = _build_run_config(args)
+    existing_config_path = None
 
-    if args.resume_dir:
-        resume_state, resume_path = load_latest_training_state(args.resume_dir)
+    if _has_latest_training_state(run_dir):
+        resume_state, resume_path = load_latest_training_state(run_dir)
         saved_run_config = dict(resume_state.get("run_config", {}))
         _validate_resume_config(args, saved_run_config)
         start_epoch = int(resume_state.get("completed_epoch", 0))
         best_val_loss = float(resume_state.get("best_val_loss", float("inf")))
-        if args.epochs <= start_epoch:
-            raise ValueError(
-                f"Resume target epochs must exceed completed epochs: completed={start_epoch}, target={args.epochs}"
+    else:
+        existing_config_path = _find_existing_run_config(run_dir)
+        if existing_config_path is not None:
+            _validate_exact_run_config(
+                run_config,
+                load_yaml_config(existing_config_path),
+                source=existing_config_path,
             )
 
     if is_main_process(dist_ctx):
-        if args.resume_dir:
-            run_dir = Path(args.resume_dir)
-            run_timestamp = run_dir.name
-        else:
-            run_dir, run_timestamp = make_timestamped_dir(args.save_dir)
-
         best_dir = ensure_dir(run_dir / "best")
         ckpt_dir = ensure_dir(run_dir / "ckpt")
         viz_dir = ensure_dir(ckpt_dir / "viz")
@@ -1593,9 +1678,14 @@ def train_main(args) -> None:
             "[INFO] Warmups        : "
             f"lr={args.warmup_epochs}, vq={args.vq_warmup_epochs}, beta={args.vq_beta_warmup_epochs}"
         )
-        if args.resume_dir:
-            print(f"[INFO] Resume mode    : dir={args.resume_dir}, checkpoint={resume_path}")
+        if resume_state is not None:
+            print(f"[INFO] Auto resume    : checkpoint={resume_path}")
             print(f"[INFO] Resume state   : completed_epoch={start_epoch}, best_val_loss={best_val_loss:.6f}")
+        elif existing_config_path is not None:
+            print(f"[INFO] Auto resume    : no checkpoint found; config matched {existing_config_path}")
+            print("[INFO] Resume state   : starting from epoch 0")
+        else:
+            print("[INFO] Auto resume    : no checkpoint found; starting a new run")
         if max_train_steps > 0 or max_val_steps > 0:
             print(
                 "[INFO] Debug limits   : "
@@ -1604,17 +1694,25 @@ def train_main(args) -> None:
             )
         print("[INFO] ========================================================\n")
     else:
-        run_dir = Path(args.resume_dir) if args.resume_dir else Path(args.save_dir)
-        run_timestamp = run_dir.name if args.resume_dir else "distributed_worker"
         best_dir = run_dir / "best"
         ckpt_dir = run_dir / "ckpt"
         viz_dir = ckpt_dir / "viz"
+
+    if start_epoch >= args.epochs:
+        if is_main_process(dist_ctx):
+            print(
+                "[INFO] Run already completed: "
+                f"completed_epoch={start_epoch}, target_epochs={args.epochs}"
+            )
+        cleanup_distributed(dist_ctx)
+        if torch.musa.is_available():
+            torch.musa.empty_cache()
+        return
 
     codec = get_geometry_codec(args.geom_type, vars(args), device=str(device))
     converter = codec.converter
     img_size = (converter.U.shape[0], converter.U.shape[1])
     model_config = _build_model_config(args, img_size=img_size)
-    run_config = _strip_debug_args(dict(vars(args)))
 
     if is_main_process(dist_ctx):
         print(f"[INFO] CFT tri chunk   : {converter.triangle_chunk_size}")
@@ -1629,9 +1727,6 @@ def train_main(args) -> None:
     model_config["latent_stride"] = int(model_to_save.encoder.latent_stride)
     model_config["latent_grid_size"] = tuple(int(v) for v in model_to_save.encoder.latent_grid_size)
     model_config["num_latent_tokens"] = int(model_to_save.encoder.num_latent_tokens)
-    run_config["latent_stride"] = model_config["latent_stride"]
-    run_config["latent_grid_size"] = model_config["latent_grid_size"]
-    run_config["num_latent_tokens"] = model_config["num_latent_tokens"]
     if is_main_process(dist_ctx):
         print(f"[INFO] Latent stride  : {model_config['latent_stride']}")
         print(f"[INFO] Latent grid    : {model_config['latent_grid_size']}")
@@ -2102,9 +2197,9 @@ def train_main(args) -> None:
                     "rng_state": capture_rng_state(),
                     "train_indices": train_indices,
                     "val_indices": val_indices,
-                    "run_config": _strip_debug_args(dict(vars(args))),
+                    "run_config": run_config,
                     "model_config": model_config,
-                    "run_timestamp": run_timestamp,
+                    "run_name": args.run_name,
                     "run_dir": str(run_dir),
                     "train_precision": args.precision,
                     "pt_files": [str(path) for path in pt_files],
@@ -2138,7 +2233,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data_path", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--load_mode", type=str, default="eager", choices=("eager", "lazy"))
     parser.add_argument("--save_dir", type=str, default="./outputs/ckpt")
-    parser.add_argument("--resume_dir", type=str, default=None)
+    parser.add_argument("--run_name", type=str, required=True)
 
     parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument("--num_workers", type=int, default=4)

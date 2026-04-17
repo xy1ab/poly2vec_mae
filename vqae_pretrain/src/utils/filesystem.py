@@ -6,7 +6,6 @@ and scripts can stay focused on algorithmic logic.
 
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 
 
@@ -22,21 +21,6 @@ def ensure_dir(path: str | Path) -> Path:
     target = Path(path)
     target.mkdir(parents=True, exist_ok=True)
     return target
-
-
-def make_timestamped_dir(base_dir: str | Path, fmt: str = "%Y%m%d_%H%M") -> tuple[Path, str]:
-    """Create and return a timestamped run directory.
-
-    Args:
-        base_dir: Parent directory in which the run directory will be created.
-        fmt: Datetime format for the run folder name.
-
-    Returns:
-        A tuple of `(run_dir, run_timestamp)`.
-    """
-    run_timestamp = datetime.now().strftime(fmt)
-    run_dir = ensure_dir(Path(base_dir) / run_timestamp)
-    return run_dir, run_timestamp
 
 
 def copy_if_exists(src: str | Path, dst: str | Path) -> bool:
