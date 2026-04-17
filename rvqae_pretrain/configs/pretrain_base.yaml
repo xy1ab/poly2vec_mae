@@ -38,11 +38,11 @@ weight_phase: 1.0
 # 优化与 warmup
 # =========================
 val_ratio: 0.05
-warmup_epochs: 10
+warmup_epochs: 20
 # RVQ warmup 轮数。在这段时期内，模型完全按连续 AE 训练，不启用 residual quantizer。
-vq_warmup_epochs: 10
+vq_warmup_epochs: 30
 # VQ beta warmup 轮数。它在 RVQ warmup 结束后启动，并将 beta 从 0 线性增至 `vq_beta`。
-vq_beta_warmup_epochs: 14
+vq_beta_warmup_epochs: 15
 min_lr: 1.0e-6
 
 # =========================
@@ -59,13 +59,13 @@ icft_spatial_chunk_size: 256
 # 通用 Encoder: optional conv stem + linear patchify + ViT
 # =========================
 # 为空 [] 时表示无卷积 stem，此时模型从 linear patchify 直接进入 ViT。
-enc_conv_channels: [64, 128, 256]
-enc_conv_strides: [2, 2, 1]
+enc_conv_channels: [512]
+enc_conv_strides: [1]
 # latent_stride = product(enc_conv_strides) * patch_size。
-patch_size: 2
+patch_size: 4
 
 embed_dim: 512
-enc_vit_depth: 12
+enc_vit_depth: 16
 enc_vit_head: 8
 enc_vit_mlp_ratio: 4.0
 
@@ -96,7 +96,7 @@ dec_vit_mlp_ratio: 4.0
 
 # [] 表示关闭 full-res residual conv head，并使用 per-pixel Linear output，可实现纯 ViT。
 # 非空时 list 长度表示 full-res residual block 数量，各元素表示对应 block 的通道数。
-full_res_head_channels: [256, 256]
+full_res_head_channels: [256]
 
 # =========================
 # 训练超参数

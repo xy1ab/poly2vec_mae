@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import torch
@@ -194,6 +195,7 @@ class PolyDecoder(nn.Module):
         )
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
         self.apply(self._init_weights)
+        self._init_output_projection()
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -207,6 +209,27 @@ class PolyDecoder(nn.Module):
             nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
+
+    def _init_output_projection(self) -> None:
+        """Keep raw magnitude/phase predictions near a stable initial range."""
+        projections = [
+            module
+            for module in self.output_head.modules()
+            if isinstance(module, (nn.Conv2d, nn.Linear))
+        ]
+        if not projections:
+            return
+
+        output_proj = projections[-1]
+        nn.init.normal_(output_proj.weight, mean=0.0, std=1.0e-3)
+        if output_proj.bias is None:
+            return
+
+        nn.init.constant_(output_proj.bias, 0.0)
+        if output_proj.bias.numel() >= 1:
+            target_mag = 0.05
+            with torch.no_grad():
+                output_proj.bias[0].fill_(math.log(math.expm1(target_mag)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = x.shape
