@@ -42,6 +42,7 @@ def encoder_data(args, model):
     emb = torch.concat(emb_list)
     torch.save(emb, os.path.join(args.output_dir, "attr_emb.pt"))
     schema_path = os.path.join(args.output_dir, "schema_registry.json")
+    torch.save(model.state_dict(), os.path.join(args.output_dir,"attr_model.pth"))
     with open(schema_path, "w", encoding="utf-8") as f:
         json.dump(schema_registry, f, ensure_ascii=False, indent=4)
     print(f"✅ 编码完成，共成功打包 {len(emb_list)} 个图层。")

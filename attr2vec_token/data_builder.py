@@ -102,6 +102,7 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
         str_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in ['geometry', 'shape']]
         # 加入metadata
         metadata_prefix = f"[TABLE] {layer_name} [COLUMN] {' [SEP] '.join(str_cols)} [DATA] "
+        metadata_short = f"[TABLE] {layer_name} [DATA] "
         # 提取语料用于 Tokenizer (包含元数据)
         corpus.append(layer_name)
         corpus.extend(str_cols)
@@ -114,7 +115,7 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
         num_dim = len(num_cols) * 3
         unique_row_strings = []
         if str_cols:
-            unique_row_strings = metadata_prefix + df[str_cols].fillna("").astype(str).agg(' [SEP] '.join, axis=1).unique()
+            unique_row_strings = metadata_short + df[str_cols].fillna("").astype(str).agg(' [SEP] '.join, axis=1).unique()
         
         table_records.append((num_dim, unique_row_strings))
 

@@ -22,6 +22,19 @@ def float64_to_three_float32(arr):
     frac_lo = np.trunc((frac * 10000 - frac_hi) * 10000).astype(np.float32)
     return int_part, frac_hi, frac_lo
 
+import numpy as np
+
+def three_float32_to_float64(p):
+    """
+    [逆向转换逻辑] 将 3 个 Float32 重新组合为 1 个 Float64
+    p[0] int_part: 整数部分
+    p[1] frac_hi: 前 4 位小数 (乘以 1e-4)
+    p[2] frac_lo: 后 4 位小数 (乘以 1e-8)
+    """
+    p = torch.round(p).double()
+    return p[0] + (p[1]/10000.0) + (p[2]/100000000.0)
+
+
 def process_dataframe(df, layer_name, tokenizer, config, schema_registry):
     """处理单一数据表，实现物理真值与语义的彻底解耦，并抓取元数据"""
     if len(df) == 0:
