@@ -1,0 +1,121 @@
+# RVQAE 预训练默认配置（polygon 版本）。
+# 该文件中的字段会直接映射到 `src/engine/trainer.py` / `trainer_musa.py` 参数。
+
+# =========================
+# 任务与几何类型
+# =========================
+train_type: rvqae
+geom_type: polygon
+
+# =========================
+# 数据与输出路径
+# =========================
+data_dir: ./data/processed/hangzhou
+load_mode: eager
+save_dir: ./outputs/ckpt
+
+# =========================
+# 运行环境
+# =========================
+gpu: "0,1,2,3,4,5,6,7"
+num_workers: 4
+
+# =========================
+# 复现性
+# =========================
+seed: 42
+split_seed: 42
+deterministic: false
+
+# =========================
+# 损失项权重
+# =========================
+weight_mag: 5.0
+weight_mag_hf: 1.0
+weight_phase: 1.0
+
+# =========================
+# 优化与 warmup
+# =========================
+val_ratio: 0.05
+warmup_epochs: 10
+# RVQ warmup 轮数。在这段时期内，模型完全按连续 AE 训练，不启用 residual quantizer。
+vq_warmup_epochs: 10
+# VQ beta warmup 轮数。它在 RVQ warmup 结束后启动，并将 beta 从 0 线性增至 `vq_beta`。
+vq_beta_warmup_epochs: 14
+min_lr: 1.0e-6
+
+# =========================
+# Polygon 频域参数
+# =========================
+pos_freqs: 63
+w_min: 0.1
+w_max: 200.0
+freq_type: geometric
+cft_triangle_chunk_size: 256
+icft_spatial_chunk_size: 256
+
+# =========================
+# 通用 Encoder: optional conv stem + linear patchify + ViT
+# =========================
+# 为空 [] 时表示无卷积 stem，此时模型从 linear patchify 直接进入 ViT。
+enc_conv_channels: [64, 128, 256]
+enc_conv_strides: [2, 2, 1]
+# latent_stride = product(enc_conv_strides) * patch_size。
+patch_size: 2
+
+embed_dim: 512
+enc_vit_depth: 12
+enc_vit_head: 8
+enc_vit_mlp_ratio: 4.0
+
+# =========================
+# RVQ 参数
+# =========================
+codebook_size: 8192
+code_dim: 512
+rvq_num_quantizers: 2
+# 长度必须等于 rvq_num_quantizers；浅层权重大时会更强调粗量化能力。
+rvq_loss_weights: [1.0, 0.5]
+
+vq_beta: 0.25
+vq_decay: 0.995
+vq_eps: 1.0e-5
+vq_dead_code_threshold: 0.25
+vq_init_max_vectors: 150000
+vq_kmeans_iters: 12
+vq_restart_pool_size_per_rank: 4096
+
+# =========================
+# 通用 Decoder: ViT + linear unpatchify + symmetric upsampling
+# =========================
+# unpatch 与 upsampling stem 根据 patch_size / enc_conv_strides 自动推导。
+dec_vit_depth: 12
+dec_vit_head: 8
+dec_vit_mlp_ratio: 4.0
+
+# [] 表示关闭 full-res residual conv head，并使用 per-pixel Linear output，可实现纯 ViT。
+# 非空时 list 长度表示 full-res residual block 数量，各元素表示对应 block 的通道数。
+full_res_head_channels: [256, 256]
+
+# =========================
+# 训练超参数
+# =========================
+epochs: 400
+batch_size: 32
+lr: 2.0e-4
+weight_decay: 0.05
+grad_clip_norm: 0.0
+augment_times: 1
+
+# =========================
+# 精度策略
+# =========================
+precision: fp32
+checkpoint_dtype: fp32
+
+# =========================
+# 保存与日志
+# =========================
+eval_every: 5
+log_interval: 50
