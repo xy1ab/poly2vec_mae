@@ -107,7 +107,7 @@ class FTTransformer(nn.Module):
 # ======================================================================
 # 3. 大一统底座总控 (自适应拼接与硬件对齐)
 # ======================================================================
-class NaturalResourceFoundationModel(nn.Module):
+class Attr2Vec(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config

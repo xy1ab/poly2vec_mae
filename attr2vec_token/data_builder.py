@@ -135,6 +135,7 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
                 
                 # 加入metadata
                 metadata_prefix = f"[TABLE] {layer_name} [COLUMN] {' [SEP] '.join(str_cols)} [DATA] "
+                metadata_short = f"[TABLE] {layer_name} [DATA] "
                 corpus.append(layer_name)
                 corpus.extend(str_cols)
                 for col in str_cols:
@@ -144,7 +145,7 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
                 num_dim = len(num_cols) * 3
                 unique_row_strings = []
                 if str_cols:
-                    unique_row_strings = metadata_prefix + df[str_cols].fillna("").astype(str).agg(' [SEP] '.join, axis=1).unique()
+                    unique_row_strings = metadata_short + df[str_cols].fillna("").astype(str).agg(' [SEP] '.join, axis=1).unique()
                 
                 table_records.append((num_dim, unique_row_strings))
         except Exception as e:
@@ -205,7 +206,7 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
         if table_max_dim > max_global_truth_dim:
             max_global_truth_dim = table_max_dim
 
-    print(f"📊 扫描计算完毕！全量数据中，单行所需的【最大总维度】为: {max_global_truth_dim}")
+    print(f"📊 扫描计算完毕！全量数据中，单行所需的【最大总维度:数值+文本】为: {max_global_truth_dim}")
     print(f"   (注: 全局单行最长文本包含的 Token 数为 {max_global_seq_len})")
 
     # ==========================================

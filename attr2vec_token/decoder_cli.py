@@ -3,8 +3,8 @@ import pandas as pd
 import numpy as np
 from tokenizers import Tokenizer
 from config import ModelConfig
-from models import NaturalResourceFoundationModel
-
+from models import Attr2Vec
+import json
 warnings.filterwarnings('ignore')
 
 class DualLogger:
@@ -29,23 +29,25 @@ def get_safe_dtype(csv_path):
     except:
         return None
 
-class FinalAuditor:
+class AttrDecoder_Worker:
     def __init__(self, config_path):
         torch.manual_seed(42)
-        if torch.cuda.is_available(): torch.cuda.manual_seed_all(42)
-        self.config = ModelConfig(); self.config.load(config_path)
+        if torch.cuda.is_available(): 
+            torch.cuda.manual_seed_all(42)
+        self.config = ModelConfig()
+        self.config.load(config_path)
         self.tokenizer = Tokenizer.from_file(self.config.tokenizer_path)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = NaturalResourceFoundationModel(self.config).to(self.device)
+        self.model = Attr2Vec(self.config).to(self.device)
         self.model.eval()
-        self.stats = {"n_h": 0, "n_m": 0, "t_h": 0, "t_m": 0}
 
     def decode_num(self, p):
         p = torch.round(p).double()
         return p[0] + (p[1]/10000.0) + (p[2]/100000000.0)
 
-    def audit(self, bundle_path):
-        bundle = torch.load(bundle_path, weights_only=False)
+    def decoder(self, emb_dir):
+        schema_registry = json.load(os.path.join(emb_dir, "schema_registry.json"))
+        bundle = torch.load(emb_path, weights_only=False)
         v_size = self.tokenizer.get_vocab_size()
         
         for layer in bundle:
@@ -131,10 +133,10 @@ class FinalAuditor:
 if __name__ == "__main__":
     sys.stdout = DualLogger()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--in_bundle", type=str, required=True)
+    parser.add_argument("--config_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/attr/config.json")
+    parser.add_argument("--emb_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/attr/output")
     args = parser.parse_args()
     
-    auditor = FinalAuditor(args.config)
-    auditor.audit(args.in_bundle)
-    auditor.report()
+    decoder_worker = AttrDecoder_Worker(args.config)
+    decoder_worker.decoder(args.emb_dir)
+    
