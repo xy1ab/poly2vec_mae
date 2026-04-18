@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,34 @@ def resolve_runtime_device(requested_device: str) -> str:
         print("[WARN] CUDA is unavailable; falling back to CPU.")
         return "cpu"
     return value
+
+
+def parse_gpu_devices(gpus_csv: str, fallback_device: str = "cuda") -> list[str]:
+    """Parse GPU CSV into runtime device list with CUDA-unavailable fallback."""
+    import torch
+
+    gpus_csv = str(gpus_csv).strip()
+    if not gpus_csv:
+        return [resolve_runtime_device(fallback_device)]
+
+    if not torch.cuda.is_available():
+        print("[WARN] CUDA is unavailable; ignoring `--gpus` and using CPU.")
+        return ["cpu"]
+
+    tokens = [item.strip() for item in gpus_csv.split(",") if item.strip()]
+    if not tokens:
+        return [resolve_runtime_device(fallback_device)]
+
+    device_count = int(torch.cuda.device_count())
+    resolved: list[str] = []
+    for token in tokens:
+        gpu_id = int(token)
+        if gpu_id < 0 or gpu_id >= device_count:
+            raise ValueError(
+                f"Invalid GPU id {gpu_id}; visible CUDA device count is {device_count}."
+            )
+        resolved.append(f"cuda:{gpu_id}")
+    return resolved
 
 
 def resolve_model_paths(model_dir: str | Path) -> tuple[Path, Path]:
@@ -253,6 +282,53 @@ def load_torch_list(path: str | Path) -> list[Any]:
     if not isinstance(payload, list):
         raise TypeError(f"Shard payload must be a list: {shard_path}")
     return payload
+
+
+def build_task_output_path(
+    output_dir: str | Path,
+    task_prefix: str,
+    input_shard_path: str | Path,
+) -> Path:
+    """Build one output shard path with task prefix and input-stem suffix."""
+    output_root = Path(output_dir).expanduser().resolve()
+    in_path = Path(input_shard_path).expanduser().resolve()
+    return output_root / f"{task_prefix}_{in_path.stem}.pt"
+
+
+def clear_task_outputs(output_dir: str | Path, task_prefix: str, manifest_name: str) -> None:
+    """Remove old outputs for one task prefix and manifest file."""
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    pattern = re.compile(rf"^{re.escape(task_prefix)}_.+\.pt$")
+    for path in output_root.glob("*.pt"):
+        if path.is_file() and pattern.match(path.name):
+            path.unlink()
+    manifest_path = output_root / manifest_name
+    if manifest_path.exists():
+        manifest_path.unlink()
+
+
+def write_task_manifest(
+    output_dir: str | Path,
+    manifest_name: str,
+    metadata: dict[str, Any],
+    shard_records: list[dict[str, Any]],
+) -> Path:
+    """Write one task manifest with shard-level metadata."""
+    output_root = Path(output_dir).expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_root / manifest_name
+    total_samples = int(sum(int(record.get("sample_count", 0)) for record in shard_records))
+    manifest = {
+        "serialization": OUTPUT_SERIALIZATION,
+        "num_shards": int(len(shard_records)),
+        "total_samples": total_samples,
+        "shards": shard_records,
+        "metadata": dict(metadata),
+    }
+    with manifest_path.open("w", encoding="utf-8") as fp:
+        json.dump(manifest, fp, ensure_ascii=False, indent=2)
+    return manifest_path
 
 
 def normalize_indices_grid(indices: Any):
