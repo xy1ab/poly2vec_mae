@@ -72,11 +72,11 @@ enc_vit_mlp_ratio: 4.0
 # =========================
 # RVQ 参数
 # =========================
-codebook_size: 8192
+codebook_size: 1024
 code_dim: 512
-rvq_num_quantizers: 2
+rvq_num_quantizers: 3
 # 长度必须等于 rvq_num_quantizers；浅层权重大时会更强调粗量化能力。
-rvq_loss_weights: [1.0, 0.5]
+rvq_loss_weights: [1.0, 0.75, 0.50]
 
 vq_beta: 0.25
 vq_decay: 0.995
@@ -90,13 +90,13 @@ vq_restart_pool_size_per_rank: 4096
 # 通用 Decoder: ViT + linear unpatchify + symmetric upsampling
 # =========================
 # unpatch 与 upsampling stem 根据 patch_size / enc_conv_strides 自动推导。
-dec_vit_depth: 12
+dec_vit_depth: 16
 dec_vit_head: 8
 dec_vit_mlp_ratio: 4.0
 
 # [] 表示关闭 full-res residual conv head，并使用 per-pixel Linear output，可实现纯 ViT。
 # 非空时 list 长度表示 full-res residual block 数量，各元素表示对应 block 的通道数。
-full_res_head_channels: [256]
+full_res_head_channels: [512, 256]
 
 # =========================
 # 训练超参数
