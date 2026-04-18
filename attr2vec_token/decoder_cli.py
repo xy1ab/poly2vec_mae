@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 from collections import defaultdict
-from data_loader import three_float32_to_float64
+
 warnings.filterwarnings('ignore')
 
 
@@ -41,6 +41,10 @@ class AttrDecoder_Worker:
         
         return meta_texts, data_indices
 
+    def decode_num(self, num_ids):
+        num_ids = torch.round(num_ids).double()
+        return num_ids[:,0] + (num_ids[:,1]/10000.0) + (num_ids[:,2]/100000000.0)
+        
     
     # --- 还原文本 (Character-level) ---
     def decode_str(self, batch_size, max_seq_len,data_ids, str_cont, num_cont ):
@@ -72,13 +76,15 @@ class AttrDecoder_Worker:
         with torch.no_grad():
             pbar = tqdm(loader, desc="Decoding Embeddings", unit="batch")
 
-            results = []
+            results = {}
             for (batch,) in pbar:
                 emb_data = self.model.inn_core(batch.to(self.device), reverse=True).cpu()
                 meta_texts, data_indices = self.get_meta_data(emb_data)
                 schema_groups = defaultdict(list)
                 for i, m_text in enumerate(meta_texts):
                     schema_groups[m_text].append(i)
+
+
                 for m_text, indices in schema_groups.items():
                     meta_info = schema_registry.get(m_text)
                     if not meta_info: continue
@@ -87,30 +93,27 @@ class AttrDecoder_Worker:
                     data_ids = emb_data[indices][:,data_pos+1:]
                     
                     num_w = len(n_cols) * 3
-                    dec_n, dec_t = data_ids[:, :num_w], data_ids[:, num_w : num_w + self.config.max_seq_len]
-                    ids = torch.clamp(torch.round(dec_t).to(torch.int64), 0, v_size - 1).cpu().tolist()
-                    ## get num part
-                    for i, col in enumerate(n_cols):
-                        p = dec_n[:, i*3 : i*3+3]
-                        dec_v = three_float32_to_float64(p).item()
-                    ## get str part
-                    raw_decoded = self.tokenizer.decode_batch(ids, skip_special_tokens=False)
-                    clean_line = raw_decoded.replace("[PAD]", "").strip()
-                    dec_parts = [p.replace(" ", "") for p in clean_line.split("[SEP]")]
+                    dec_num, dec_str = data_ids[:, :num_w], data_ids[:, num_w : num_w + self.config.max_seq_len]
+                    ids = torch.clamp(torch.round(dec_str).to(torch.int64), 0, v_size - 1).cpu().tolist()
+                    raw_str = self.tokenizer.decode_batch(ids, skip_special_tokens=False)
+                    clean_str = [[p.replace(" ", "") for p in s.replace("[PAD]", "").strip().split("[SEP]")] for s in raw_str]
 
-                    # for r in range(len(data_ids)):
-                        
-                    #     clean_line = raw_decoded[r].replace("[PAD]", "").replace("[CLS]", "").replace("[MASK]", "").replace("[UNK]", "").strip()
-                    #     dec_parts = [p.replace(" ", "") for p in clean_line.split("[SEP]")]
+                    # 循环构建每一行数据 (Batch 内循环)
+                    for row_idx in range(len(indices)):
+                        row_data = {"layer_name": meta_info}
+                        ## get num part
+                        for i, col in enumerate(n_cols):
+                            p = dec_num[:, i*3 : i*3+3] 
+                            row_data[col] = self.decode_num(p)
 
-                    #     p = dec_n[r, c_idx*3 : c_idx*3+3]
-                    #     dec_v = self.decode_num(p).item()
-                                
-                               
- 
-                    #     d_clean = dec_parts[c_idx] if c_idx < len(dec_parts) else ""
-                                
- 
+                        ## get str part
+                    
+                        for i, col in enumerate(s_cols):
+                            row_data[col] = clean_str[row_idx][i]
+                        results.append(row_data)
+        ## TODO
+        final_df = pd.DataFrame(results)
+        return final_df
     def report(self):
         nt, nh = self.stats["n_h"] + self.stats["n_m"], self.stats["n_h"]
         tt, th = self.stats["t_h"] + self.stats["t_m"], self.stats["t_h"]
