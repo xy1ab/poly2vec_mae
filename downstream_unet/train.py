@@ -25,31 +25,22 @@ import yaml
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 from pytorch_msssim import ssim
 import webdataset as wds
 import glob
 
 
-def load_total_samples(index_file, default_total=32272):
-    if not index_file or not os.path.exists(index_file):
-        return default_total
+def load_samples(index_file):
     with open(index_file, "r") as f:
         index = json.load(f)
-    if isinstance(index, list):
-        return sum(int(item["num_samples"]) for item in index)
-    if isinstance(index, dict) and "num_samples" in index:
-        return int(index["num_samples"])
-    return default_total
+        train_info = index['train']
+        val_info = index['val']        
+    return train_info, val_info
 
 
-def split_train_val_counts(total_samples, train_ratio=0.9):
-    threshold = int(train_ratio * 100)
-    full_cycles, remainder = divmod(total_samples, 100)
-    train_samples = full_cycles * threshold + min(remainder, threshold)
-    return train_samples, total_samples - train_samples
 
-
-def get_wds_loader(url_pattern, batch_size, is_training=True, total_samples=32272, num_workers=4, split_by_rank=True):
+def get_wds_loader(url_pattern, batch_size, total_samples, is_training=True, num_workers=4, split_by_rank=True):
     file_list = sorted(glob.glob(url_pattern))
     
     if dist.is_initialized():
@@ -59,7 +50,7 @@ def get_wds_loader(url_pattern, batch_size, is_training=True, total_samples=3227
         raise FileNotFoundError(f"未找到匹配的文件: {url_pattern}")
 
     # nodesplitter=wds.split_by_node 自动实现 DDP 分片
-    shard_shuffle_buffer = 1000 if is_training else 0
+    shard_shuffle_buffer = 5000 if is_training else 0
     nodesplitter = wds.split_by_node if split_by_rank else None
     dataset = wds.WebDataset(file_list, shardshuffle=shard_shuffle_buffer, nodesplitter=nodesplitter, empty_check=False)
 
@@ -115,12 +106,12 @@ def setup_distributed():
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="downstream_UNet")
     parser.add_argument("--index_file", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset/index_file.json")
-    parser.add_argument("--data_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset")
     parser.add_argument("--save_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_ckpt")
     parser.add_argument("--test_data_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_ckpt")
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--warmup_epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_freq", type=int, default=20)
@@ -135,10 +126,11 @@ def main():
     # ==========================================
     # 📖 读取配置
     # ==========================================
-    data_dir = args.data_dir
+    index_file = args.index_file
     batch_size = int(args.batch_size)
     epochs = int(args.epochs)
     lr = float(args.lr)
+    warmup_epochs = int(args.warmup_epochs)
     num_workers = int(args.num_workers)
     save_dir = args.save_dir
     save_freq = args.save_freq
@@ -157,7 +149,7 @@ def main():
         os.makedirs(save_dir, exist_ok=True)
         print(f"🚀 训练启动！DDP进程数: {world_size}")
         print(f"📋 配置:")
-        print(f"   数据路径: {data_dir}")
+        print(f"   数据路径: {index_file}")
         print(f"   批次大小: {batch_size}")
         print(f"   训练轮数: {epochs}")
         print(f"   学习率: {lr}")
@@ -166,13 +158,13 @@ def main():
     # ==========================================
     # 1. 数据加载
     # ==========================================
-    train_urls = os.path.join(data_dir, "train","train-*.tar")
-    val_urls = os.path.join(data_dir, "val", "val-*.tar")
-    total_samples = load_total_samples(args.index_file)
-    train_samples, val_samples = split_train_val_counts(total_samples)
+
+    train_info, val_info = load_samples(index_file)
     
-    train_loader = get_wds_loader(train_urls, batch_size, is_training=True, total_samples=train_samples, num_workers=num_workers, split_by_rank=True)
-    val_loader = get_wds_loader(val_urls, batch_size, is_training=False, total_samples=val_samples, num_workers=num_workers, split_by_rank=False)
+    train_urls = os.path.join(train_info['path'],"train-*.tar")
+    val_urls = os.path.join(val_info['path'], "val-*.tar") 
+    train_loader = get_wds_loader(train_urls, batch_size, total_samples=train_info['num_samples'], is_training=True, num_workers=num_workers, split_by_rank=True)
+    val_loader = get_wds_loader(val_urls, batch_size, total_samples=val_info['num_samples'], is_training=False, num_workers=num_workers, split_by_rank=False)
     # ==========================================
     # 2. 模型初始化
     # ==========================================
@@ -185,10 +177,18 @@ def main():
     ).to(device)
 
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
+    
     dice_loss = smp.losses.DiceLoss(mode='binary')
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[warmup_epochs]
+    )
     # ==========================================
     # 3. 训练循环
     # ==========================================
@@ -220,7 +220,7 @@ def main():
 
             loss.backward()
             optimizer.step()
-
+            
             train_loss += loss.item()
             train_count += 1
             if local_rank == 0:
@@ -233,6 +233,7 @@ def main():
         dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(train_count)
         avg_train_loss = train_loss_tensor.item() / train_count.item()
+        scheduler.step()
 
         # --- B. 验证（每 eval_every 轮执行一次）---
         avg_val_loss = None

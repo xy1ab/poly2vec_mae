@@ -11,3 +11,5 @@ fiona==1.10.1
 opencv-python==4.11.0.86
 tokenizers==0.22.2
 joblib==1.5.3
+webdataset==1.0.2
+pytorch-msssim==1.0.0

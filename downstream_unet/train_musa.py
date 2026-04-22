@@ -1,14 +1,23 @@
-# torchrun --nproc_per_node=4 train_0409.py --config configs/recons_unet_single.yaml
-# python train_0409.py --config configs/recons_unet_single.yaml  # 单卡
+#!/usr/bin/env python
+# -*- encoding: utf-8 -*-
+'''
+@File    :   train.py
+@Time    :   2026/04/21 13:49:13
+@Author  :   Hu Bin 
+@Version :   1.0
+@Desc    :   None
+'''
 
 import os
 import sys
 import time
+import math
+import json
 from pathlib import Path
 import torch_musa
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import random_split
 from tqdm import tqdm
 import segmentation_models_pytorch as smp
 import numpy as np
@@ -17,19 +26,57 @@ import yaml
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+from pytorch_msssim import ssim
+import webdataset as wds
+import glob
 
-if __package__ in {None, ""}:
-    _CURRENT_DIR = Path(__file__).resolve().parent
-    _REPO_ROOT = _CURRENT_DIR.parent
-    if str(_REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(_REPO_ROOT))
 
-    import importlib
+def load_samples(index_file):
+    with open(index_file, "r") as f:
+        index = json.load(f)
+        train_info = index['train']
+        val_info = index['val']        
+    return train_info, val_info
 
-    V2Dataset = importlib.import_module("downstream_unet.loaders.loader_single").V2Dataset
-else:
-    from .loader import V2Dataset
 
+
+def get_wds_loader(url_pattern, batch_size, total_samples, is_training=True, num_workers=4, split_by_rank=True):
+    file_list = sorted(glob.glob(url_pattern))
+    
+    if dist.is_initialized():
+        print(f"Rank {dist.get_rank()} found {len(file_list)} shards for {url_pattern}")
+        
+    if not file_list:
+        raise FileNotFoundError(f"未找到匹配的文件: {url_pattern}")
+
+    # nodesplitter=wds.split_by_node 自动实现 DDP 分片
+    shard_shuffle_buffer = 5000 if is_training else 0
+    nodesplitter = wds.split_by_node if split_by_rank else None
+    dataset = wds.WebDataset(file_list, shardshuffle=shard_shuffle_buffer, nodesplitter=nodesplitter, empty_check=False)
+
+    dataset = (
+        dataset
+        .decode("torch")
+        .to_tuple("input.npy", "label.npy") # 根据你保存的 key
+        .batched(batch_size, partial=not is_training)
+    )
+
+    epoch_batches = None
+    if dist.is_initialized():
+        world_size = dist.get_world_size() if split_by_rank else 1
+        if is_training:
+            epoch_batches = total_samples // (batch_size * world_size)
+            if epoch_batches < 1:
+                raise ValueError("训练样本数小于全局 batch size，无法在 drop_last=True 下安全启动 DDP")
+        else:
+            epoch_batches = max(1, math.ceil(total_samples / batch_size))
+
+    # WDS 已经完成了 batch 组装，DataLoader 的 batch_size 需设为 None
+    loader = wds.WebLoader(dataset, batch_size=None, num_workers=num_workers, pin_memory=True)
+    if epoch_batches is not None:
+        loader = loader.with_epoch(nbatches=epoch_batches)
+    return loader
 
 def calculate_iou(pred, target, threshold=0.5):
     pred_bin = (pred > threshold).float()
@@ -39,133 +86,110 @@ def calculate_iou(pred, target, threshold=0.5):
     return iou.mean().item()
 
 
-def total_variation_loss(img):
-    pixel_dif1 = img[:, :, 1:, :] - img[:, :, :-1, :]
-    pixel_dif2 = img[:, :, :, 1:] - img[:, :, :, :-1]
-    return torch.mean(torch.abs(pixel_dif1)) + torch.mean(torch.abs(pixel_dif2))
+def ssim_loss(pred, target, data_range=1.0, size_average=True):
+    # ssim 默认返回的是相似度 (0 到 1 之间)，值越大越相似
+    # Loss 需要定义为 1 - similarity
+    return 1 - ssim(pred, target, data_range=data_range, size_average=size_average)
 
-
-def spectral_consistency_loss(pred, target):
+def spectral_loss(pred, target):
     fft_pred = torch.fft.rfft2(pred)
     fft_target = torch.fft.rfft2(target)
     return torch.mean(torch.abs(fft_pred - fft_target))
 
-
+def setup_distributed():        
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    torch.musa.set_device(local_rank)
+    device = torch.device(f"musa:{local_rank}")
+    
+    dist.init_process_group(backend='mccl', device_id=device)
+    return local_rank, world_size, device
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="downstream_UNet")
-    parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
+    parser.add_argument("--index_file", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset/index_file.json")
+    parser.add_argument("--save_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_ckpt")
+    parser.add_argument("--test_data_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_ckpt")
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--warmup_epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--eval_every", type=int, default=5)
+    parser.add_argument("--save_freq", type=int, default=20)
+    parser.add_argument("--dice_weight", type=float, default=1.)
+    parser.add_argument("--ssim_weight", type=float, default=0.5)
+    parser.add_argument("--spec_weight", type=float, default=0.1)
     return parser
-
 
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
-
-    with open(args.config, 'r') as f:
-        cfg = yaml.safe_load(f)
-
     # ==========================================
     # 📖 读取配置
     # ==========================================
-    data_path = cfg['data']['data_path']
-    test_dataset_path = cfg['data']['test_dataset']
-    batch_size = int(cfg['training']['batch_size'])
-    epochs = int(cfg['training']['epochs'])
-    learning_rate = float(cfg['training']['learning_rate'])
-    num_workers = int(cfg['training'].get('num_workers', 4))
-    save_dir = cfg['logging']['save_dir']
-    save_freq = cfg['logging'].get('save_freq', 20)
-    val_freq = cfg['training'].get('val_freq', 1)  # 新增：验证频率
+    index_file = args.index_file
+    batch_size = int(args.batch_size)
+    epochs = int(args.epochs)
+    lr = float(args.lr)
+    warmup_epochs = int(args.warmup_epochs)
+    num_workers = int(args.num_workers)
+    save_dir = args.save_dir
+    save_freq = args.save_freq
+    eval_every = args.eval_every
 
-    dice_weight = float(cfg['loss'].get('dice_weight', 1.0))
-    tv_weight = float(cfg['loss'].get('tv_weight', 0.1))
-    spec_weight = float(cfg['loss'].get('spec_weight', 0.05))
-
-    encoder_name = cfg['model'].get('encoder_name', 'resnet34')
-    encoder_weights = cfg['model'].get('encoder_weights', None)
-    in_channels = cfg['model'].get('in_channels', 3)
-    classes = cfg['model'].get('classes', 1)
+    dice_weight = float(args.dice_weight)
+    ssim_weight = float(args.ssim_weight)
+    spec_weight = float(args.spec_weight)
 
     # ==========================================
     # ⚙️ DDP 初始化
     # ==========================================
-    is_ddp = "LOCAL_RANK" in os.environ
-    if is_ddp:
-        dist.init_process_group(backend='nccl')
-        local_rank = int(os.environ["LOCAL_RANK"])
-        torch.musa.set_device(local_rank)
-        device = torch.device(f"musa:{local_rank}")
-        world_size = dist.get_world_size()
-    else:
-        local_rank = 0
-        device = torch.device('musa' if torch.musa.is_available() else 'cpu')
-        world_size = 1
-
-    def print_rank0(*msg):
-        if local_rank == 0:
-            print(*msg)
+    local_rank, world_size, device = setup_distributed()
 
     if local_rank == 0:
         os.makedirs(save_dir, exist_ok=True)
         print(f"🚀 训练启动！DDP进程数: {world_size}")
         print(f"📋 配置:")
-        print(f"   数据路径: {data_path}")
+        print(f"   数据路径: {index_file}")
         print(f"   批次大小: {batch_size}")
         print(f"   训练轮数: {epochs}")
-        print(f"   学习率: {learning_rate}")
-        print(f"   验证频率: 每 {val_freq} 轮")
+        print(f"   学习率: {lr}")
+        print(f"   验证频率: 每 {eval_every} 轮")
 
     # ==========================================
     # 1. 数据加载
     # ==========================================
-    dataset = V2Dataset(data_path)
-    total_len = len(dataset)
-    if total_len == 0:
-        raise ValueError(f"❌ 找不到数据: {data_path}")
 
-    train_len = int(0.9 * total_len)
-    val_len = int(0.05 * total_len)
-    test_len = total_len - train_len - val_len
-
-    train_set, val_set, test_set = random_split(
-        dataset, [train_len, val_len, test_len],
-        generator=torch.Generator().manual_seed(42)
-    )
-
-    if local_rank == 0:
-        torch.save(test_set.indices, test_dataset_path)
-        print(f"📊 数据切分: 训练({train_len}) | 验证({val_len}) | 测试({test_len} 已封存)")
-
-    if is_ddp:
-        train_sampler = DistributedSampler(train_set)
-        val_sampler = DistributedSampler(val_set, shuffle=False)
-        train_loader = DataLoader(train_set, batch_size=batch_size, sampler=train_sampler,
-                                  num_workers=num_workers, pin_memory=True)
-        val_loader = DataLoader(val_set, batch_size=batch_size, sampler=val_sampler,
-                                num_workers=num_workers, pin_memory=True)
-    else:
-        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                                  num_workers=num_workers, pin_memory=True)
-        val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                                num_workers=num_workers, pin_memory=True)
-
+    train_info, val_info = load_samples(index_file)
+    
+    train_urls = os.path.join(train_info['path'],"train-*.tar")
+    val_urls = os.path.join(val_info['path'], "val-*.tar") 
+    train_loader = get_wds_loader(train_urls, batch_size, total_samples=train_info['num_samples'], is_training=True, num_workers=num_workers, split_by_rank=True)
+    val_loader = get_wds_loader(val_urls, batch_size, total_samples=val_info['num_samples'], is_training=False, num_workers=num_workers, split_by_rank=False)
     # ==========================================
     # 2. 模型初始化
     # ==========================================
     model = smp.Unet(
-        encoder_name=encoder_name,
-        encoder_weights=encoder_weights,
-        in_channels=in_channels,
-        classes=classes,
+        encoder_name="resnet34",
+        encoder_weights=None,
+        in_channels=1,
+        classes=1,
         activation='sigmoid'
     ).to(device)
 
-    if is_ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-    criterion_dice = smp.losses.DiceLoss(mode='binary')
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    
+    dice_loss = smp.losses.DiceLoss(mode='binary')
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, 
+        schedulers=[warmup_scheduler, cosine_scheduler], 
+        milestones=[warmup_epochs]
+    )
     # ==========================================
     # 3. 训练循环
     # ==========================================
@@ -173,93 +197,94 @@ def main():
     start_time_total = time.time()
 
     for epoch in range(epochs):
-        if is_ddp:
-            train_sampler.set_epoch(epoch)
-
         epoch_start = time.time()
-
         # --- A. 训练 ---
         model.train()
         train_loss = 0.0
+        train_count = 0
 
         if local_rank == 0:
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
         else:
             pbar = train_loader
 
-        for x, y in pbar:
-            x, y = x.to(device), y.to(device)
+        for input, label in pbar:
+            input, label = input.to(device), label.float().to(device)
             optimizer.zero_grad()
+            pred = model(input)
 
-            pred = model(x)
+            l_dice = dice_loss(pred, label)
+            l_ssim = ssim_loss(pred, label)
+            l_spec = spectral_loss(pred, label)
 
-            l_dice = criterion_dice(pred, y)
-            l_tv = total_variation_loss(pred)
-            l_spec = spectral_consistency_loss(pred, y)
-
-            loss = dice_weight * l_dice + tv_weight * l_tv + spec_weight * l_spec
+            loss = dice_weight * l_dice + ssim_weight * l_ssim + spec_weight * l_spec
 
             loss.backward()
             optimizer.step()
-
+            
             train_loss += loss.item()
-
+            train_count += 1
             if local_rank == 0:
-                pbar.set_postfix({'TotLoss': f"{loss.item():.3f}", 'Dice': f"{l_dice.item():.3f}"})
+                pbar.set_postfix({"dice_loss": f"{l_dice.item():.3f}"})
+        
+        # 指标同步
+        train_loss_tensor = torch.tensor(train_loss, device=device)
+        train_count = torch.tensor(train_count, device=device)
+        
+        dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(train_count)
+        avg_train_loss = train_loss_tensor.item() / train_count.item()
+        scheduler.step()
 
-        # 清理 GPU 缓存（每轮结束）
-        torch.musa.empty_cache()
-
-        # --- B. 验证（每 val_freq 轮执行一次）---
-        val_loss = 0.0
-        val_iou = 0.0
-
-        if (epoch + 1) % val_freq == 0:
+        # --- B. 验证（每 eval_every 轮执行一次）---
+        avg_val_loss = None
+        avg_val_iou = None
+        if (epoch + 1) % eval_every == 0:
+            val_loss = 0.0
+            val_iou = 0.0
+            val_count = 0
             model.eval()
             with torch.no_grad():
                 if local_rank == 0:
-                    val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val  ]", leave=False)
+                    val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", leave=False)
                 else:
                     val_pbar = val_loader
 
-                for x, y in val_pbar:
-                    x, y = x.to(device), y.to(device)
-                    pred = model(x)
+                for input, label in val_pbar:
+                    input, label = input.to(device), label.float().to(device)
+                    pred = model(input)
 
-                    l_dice = criterion_dice(pred, y)
-                    l_tv = total_variation_loss(pred)
-                    l_spec = spectral_consistency_loss(pred, y)
-                    loss = dice_weight * l_dice + tv_weight * l_tv + spec_weight * l_spec
+                    l_dice = dice_loss(pred, label)
+                    l_ssim = ssim_loss(pred, label)
+                    l_spec = spectral_loss(pred, label)
+                    loss = dice_weight * l_dice + ssim_weight * l_ssim + spec_weight * l_spec
 
                     val_loss += loss.item()
-                    val_iou += calculate_iou(pred, y)
+                    val_iou += calculate_iou(pred, label)
+                    val_count += 1
 
-        # 指标同步
-        train_loss_tensor = torch.tensor(train_loss, device=device)
-        val_loss_tensor = torch.tensor(val_loss, device=device)
-        val_iou_tensor = torch.tensor(val_iou, device=device)
+            val_loss_tensor = torch.tensor(val_loss, device=device)
+            val_iou_tensor = torch.tensor(val_iou, device=device)
+            val_count_tensor = torch.tensor(val_count, device=device)
 
-        if is_ddp:
-            dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
             dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
             dist.all_reduce(val_iou_tensor, op=dist.ReduceOp.SUM)
-
-        global_train_batches = len(train_loader) * world_size
-        global_val_batches = len(val_loader) * world_size
-
-        avg_train_loss = train_loss_tensor.item() / global_train_batches
-        avg_val_loss = val_loss_tensor.item() / global_val_batches if val_loss > 0 else 0
-        avg_val_iou = val_iou_tensor.item() / global_val_batches if val_iou > 0 else 0
+            dist.all_reduce(val_count_tensor, op=dist.ReduceOp.SUM)
+            avg_val_loss = val_loss_tensor.item() / max(val_count_tensor.item(), 1)
+            avg_val_iou = val_iou_tensor.item() / max(val_count_tensor.item(), 1)
 
         # --- C. 输出与保存 ---
         if local_rank == 0:
             epoch_time = time.time() - epoch_start
             print(f"✨ Epoch {epoch+1} 结束 ({epoch_time:.1f}s)")
-            print(f"   Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {avg_val_iou:.4f}")
+            if avg_val_loss is None:
+                print(f"   Train Loss: {avg_train_loss:.4f}")
+            else:
+                print(f"   Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {avg_val_iou:.4f}")
 
-            state_dict = model.module.state_dict() if is_ddp else model.state_dict()
+            state_dict = model.module.state_dict()
 
-            if avg_val_iou > best_iou:
+            if avg_val_iou is not None and avg_val_iou > best_iou:
                 best_iou = avg_val_iou
                 torch.save(state_dict, os.path.join(save_dir, 'unet_best.pth'))
                 print(f"   🏆 发现最佳模型！IoU: {best_iou:.4f}")
@@ -268,13 +293,15 @@ def main():
                 torch.save(state_dict, os.path.join(save_dir, f'unet_epoch_{epoch+1}.pth'))
                 print(f"   💾 已保存 checkpoint")
 
+        dist.barrier()
+
     # 结束
     if local_rank == 0:
         total_h = (time.time() - start_time_total) / 3600.0
         print(f"\n🎉 训练完成！最佳 IoU: {best_iou:.4f} | 总耗时: {total_h:.2f}h")
 
-    if is_ddp:
-        dist.destroy_process_group()
+    
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':
