@@ -11,10 +11,12 @@
 import os
 import sys
 import time
+import math
+import json
 from pathlib import Path
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import random_split
 from tqdm import tqdm
 import segmentation_models_pytorch as smp
 import numpy as np
@@ -28,7 +30,26 @@ import webdataset as wds
 import glob
 
 
-def get_wds_loader(url_pattern, batch_size, is_training=True,total_samples=32272):
+def load_total_samples(index_file, default_total=32272):
+    if not index_file or not os.path.exists(index_file):
+        return default_total
+    with open(index_file, "r") as f:
+        index = json.load(f)
+    if isinstance(index, list):
+        return sum(int(item["num_samples"]) for item in index)
+    if isinstance(index, dict) and "num_samples" in index:
+        return int(index["num_samples"])
+    return default_total
+
+
+def split_train_val_counts(total_samples, train_ratio=0.9):
+    threshold = int(train_ratio * 100)
+    full_cycles, remainder = divmod(total_samples, 100)
+    train_samples = full_cycles * threshold + min(remainder, threshold)
+    return train_samples, total_samples - train_samples
+
+
+def get_wds_loader(url_pattern, batch_size, is_training=True, total_samples=32272, num_workers=4, split_by_rank=True):
     file_list = sorted(glob.glob(url_pattern))
     
     if dist.is_initialized():
@@ -39,16 +60,31 @@ def get_wds_loader(url_pattern, batch_size, is_training=True,total_samples=32272
 
     # nodesplitter=wds.split_by_node 自动实现 DDP 分片
     shard_shuffle_buffer = 1000 if is_training else 0
-    dataset = wds.WebDataset(file_list, shardshuffle=shard_shuffle_buffer, nodesplitter=wds.split_by_node,empty_check=False)#.with_epoch(total_samples // (dist.get_world_size() if dist.is_initialized() else 1))
+    nodesplitter = wds.split_by_node if split_by_rank else None
+    dataset = wds.WebDataset(file_list, shardshuffle=shard_shuffle_buffer, nodesplitter=nodesplitter, empty_check=False)
 
     dataset = (
         dataset
         .decode("torch")
         .to_tuple("input.npy", "label.npy") # 根据你保存的 key
-        .batched(batch_size)
+        .batched(batch_size, partial=not is_training)
     )
+
+    epoch_batches = None
+    if dist.is_initialized():
+        world_size = dist.get_world_size() if split_by_rank else 1
+        if is_training:
+            epoch_batches = total_samples // (batch_size * world_size)
+            if epoch_batches < 1:
+                raise ValueError("训练样本数小于全局 batch size，无法在 drop_last=True 下安全启动 DDP")
+        else:
+            epoch_batches = max(1, math.ceil(total_samples / batch_size))
+
     # WDS 已经完成了 batch 组装，DataLoader 的 batch_size 需设为 None
-    return DataLoader(dataset, batch_size=None, num_workers=4, pin_memory=True)
+    loader = wds.WebLoader(dataset, batch_size=None, num_workers=num_workers, pin_memory=True)
+    if epoch_batches is not None:
+        loader = loader.with_epoch(nbatches=epoch_batches)
+    return loader
 
 def calculate_iou(pred, target, threshold=0.5):
     pred_bin = (pred > threshold).float()
@@ -85,6 +121,7 @@ def build_arg_parser():
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_freq", type=int, default=20)
     parser.add_argument("--dice_weight", type=float, default=1.)
@@ -102,6 +139,7 @@ def main():
     batch_size = int(args.batch_size)
     epochs = int(args.epochs)
     lr = float(args.lr)
+    num_workers = int(args.num_workers)
     save_dir = args.save_dir
     save_freq = args.save_freq
     eval_every = args.eval_every
@@ -130,9 +168,11 @@ def main():
     # ==========================================
     train_urls = os.path.join(data_dir, "train","train-*.tar")
     val_urls = os.path.join(data_dir, "val", "val-*.tar")
+    total_samples = load_total_samples(args.index_file)
+    train_samples, val_samples = split_train_val_counts(total_samples)
     
-    train_loader = get_wds_loader(train_urls, batch_size, is_training=True, total_samples=int(32272*0.9))
-    val_loader = get_wds_loader(val_urls, batch_size, is_training=False, total_samples = 32272-int(32272*0.9))
+    train_loader = get_wds_loader(train_urls, batch_size, is_training=True, total_samples=train_samples, num_workers=num_workers, split_by_rank=True)
+    val_loader = get_wds_loader(val_urls, batch_size, is_training=False, total_samples=val_samples, num_workers=num_workers, split_by_rank=False)
     # ==========================================
     # 2. 模型初始化
     # ==========================================
@@ -195,58 +235,63 @@ def main():
         avg_train_loss = train_loss_tensor.item() / train_count.item()
 
         # --- B. 验证（每 eval_every 轮执行一次）---
-        if local_rank == 0:
-            if (epoch + 1) % eval_every == 0:
-                val_loss = 0.0
-                val_iou = 0.0
-                val_count = 0
-                model.eval()
-                with torch.no_grad():
-                    # if local_rank == 0:
+        avg_val_loss = None
+        avg_val_iou = None
+        if (epoch + 1) % eval_every == 0:
+            val_loss = 0.0
+            val_iou = 0.0
+            val_count = 0
+            model.eval()
+            with torch.no_grad():
+                if local_rank == 0:
                     val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", leave=False)
-                    # else:
-                    #     val_pbar = val_loader
+                else:
+                    val_pbar = val_loader
 
-                    for input, label in val_pbar:
-                        input, label = input.to(device), label.float().to(device)
-                        pred = model(input)
+                for input, label in val_pbar:
+                    input, label = input.to(device), label.float().to(device)
+                    pred = model(input)
 
-                        l_dice = dice_loss(pred, label)
-                        l_ssim = ssim_loss(pred, label)
-                        l_spec = spectral_loss(pred, label)
-                        loss = dice_weight * l_dice + ssim_weight * l_ssim + spec_weight * l_spec
+                    l_dice = dice_loss(pred, label)
+                    l_ssim = ssim_loss(pred, label)
+                    l_spec = spectral_loss(pred, label)
+                    loss = dice_weight * l_dice + ssim_weight * l_ssim + spec_weight * l_spec
 
-                        val_loss += loss.item()
-                        val_iou += calculate_iou(pred, label) 
-                        val_count += 1
-                    avg_val_loss = val_loss / val_count
-                    avg_val_iou = val_iou / val_count
-                # val_loss_tensor = torch.tensor(val_loss, device=device)
-                # val_iou_tensor = torch.tensor(val_iou, device=device)
-                # val_count = torch.tensor(val_count, device=device)
-                
-                # dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
-                # dist.all_reduce(val_iou_tensor, op=dist.ReduceOp.SUM)
-                # dist.all_reduce(val_count)
-                # avg_val_loss = val_loss_tensor.item() / val_count
-                # avg_val_iou = val_iou_tensor.item() / val_count
+                    val_loss += loss.item()
+                    val_iou += calculate_iou(pred, label)
+                    val_count += 1
 
-            # --- C. 输出与保存 ---
-            if local_rank == 0:
-                epoch_time = time.time() - epoch_start
-                print(f"✨ Epoch {epoch+1} 结束 ({epoch_time:.1f}s)")
+            val_loss_tensor = torch.tensor(val_loss, device=device)
+            val_iou_tensor = torch.tensor(val_iou, device=device)
+            val_count_tensor = torch.tensor(val_count, device=device)
+
+            dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_iou_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(val_count_tensor, op=dist.ReduceOp.SUM)
+            avg_val_loss = val_loss_tensor.item() / max(val_count_tensor.item(), 1)
+            avg_val_iou = val_iou_tensor.item() / max(val_count_tensor.item(), 1)
+
+        # --- C. 输出与保存 ---
+        if local_rank == 0:
+            epoch_time = time.time() - epoch_start
+            print(f"✨ Epoch {epoch+1} 结束 ({epoch_time:.1f}s)")
+            if avg_val_loss is None:
+                print(f"   Train Loss: {avg_train_loss:.4f}")
+            else:
                 print(f"   Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val IoU: {avg_val_iou:.4f}")
 
-                state_dict = model.module.state_dict()
+            state_dict = model.module.state_dict()
 
-                if avg_val_iou > best_iou:
-                    best_iou = avg_val_iou
-                    torch.save(state_dict, os.path.join(save_dir, 'unet_best.pth'))
-                    print(f"   🏆 发现最佳模型！IoU: {best_iou:.4f}")
+            if avg_val_iou is not None and avg_val_iou > best_iou:
+                best_iou = avg_val_iou
+                torch.save(state_dict, os.path.join(save_dir, 'unet_best.pth'))
+                print(f"   🏆 发现最佳模型！IoU: {best_iou:.4f}")
 
-                if (epoch + 1) % save_freq == 0:
-                    torch.save(state_dict, os.path.join(save_dir, f'unet_epoch_{epoch+1}.pth'))
-                    print(f"   💾 已保存 checkpoint")
+            if (epoch + 1) % save_freq == 0:
+                torch.save(state_dict, os.path.join(save_dir, f'unet_epoch_{epoch+1}.pth'))
+                print(f"   💾 已保存 checkpoint")
+
+        dist.barrier()
 
     # 结束
     if local_rank == 0:
