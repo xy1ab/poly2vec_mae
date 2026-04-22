@@ -9,23 +9,19 @@
 '''
 
 import os
-import sys
 import time
-import math
 import json
-from pathlib import Path
+import hashlib
+from functools import partial
 import torch
 import torch.optim as optim
-from torch.utils.data import random_split
+import torch.nn as nn
 from tqdm import tqdm
 import segmentation_models_pytorch as smp
-import numpy as np
 import argparse
-import yaml
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
+from torch.optim.lr_scheduler import LinearLR
 from pytorch_msssim import ssim
 import webdataset as wds
 import glob
@@ -40,7 +36,16 @@ def load_samples(index_file):
 
 
 
-def get_wds_loader(url_pattern, batch_size, total_samples, is_training=True, num_workers=4, split_by_rank=True):
+def sample_belongs_to_rank(sample, rank, world_size):
+    key = sample["__key__"]
+    if not isinstance(key, str):
+        key = key.decode("utf-8")
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    sample_rank = int.from_bytes(digest, "little") % world_size
+    return sample_rank == rank
+
+
+def get_wds_loader(url_pattern, batch_size, total_samples, is_training=True, num_workers=4, split_by_rank=True, split_samples_by_rank=False):
     file_list = sorted(glob.glob(url_pattern))
     
     if dist.is_initialized():
@@ -54,6 +59,11 @@ def get_wds_loader(url_pattern, batch_size, total_samples, is_training=True, num
     nodesplitter = wds.split_by_node if split_by_rank else None
     dataset = wds.WebDataset(file_list, shardshuffle=shard_shuffle_buffer, nodesplitter=nodesplitter, empty_check=False)
 
+    if dist.is_initialized() and split_samples_by_rank:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        dataset = dataset.select(partial(sample_belongs_to_rank, rank=rank, world_size=world_size))
+
     dataset = (
         dataset
         .decode("torch")
@@ -62,14 +72,11 @@ def get_wds_loader(url_pattern, batch_size, total_samples, is_training=True, num
     )
 
     epoch_batches = None
-    if dist.is_initialized():
+    if dist.is_initialized() and is_training:
         world_size = dist.get_world_size() if split_by_rank else 1
-        if is_training:
-            epoch_batches = total_samples // (batch_size * world_size)
-            if epoch_batches < 1:
-                raise ValueError("训练样本数小于全局 batch size，无法在 drop_last=True 下安全启动 DDP")
-        else:
-            epoch_batches = max(1, math.ceil(total_samples / batch_size))
+        epoch_batches = total_samples // (batch_size * world_size)
+        if epoch_batches < 1:
+            raise ValueError("训练样本数小于全局 batch size，无法在 drop_last=True 下安全启动 DDP")
 
     # WDS 已经完成了 batch 组装，DataLoader 的 batch_size 需设为 None
     loader = wds.WebLoader(dataset, batch_size=None, num_workers=num_workers, pin_memory=True)
@@ -89,11 +96,6 @@ def ssim_loss(pred, target, data_range=1.0, size_average=True):
     # ssim 默认返回的是相似度 (0 到 1 之间)，值越大越相似
     # Loss 需要定义为 1 - similarity
     return 1 - ssim(pred, target, data_range=data_range, size_average=size_average)
-
-def spectral_loss(pred, target):
-    fft_pred = torch.fft.rfft2(pred)
-    fft_target = torch.fft.rfft2(target)
-    return torch.mean(torch.abs(fft_pred - fft_target))
 
 def setup_distributed():        
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -116,8 +118,8 @@ def build_arg_parser():
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_freq", type=int, default=20)
     parser.add_argument("--dice_weight", type=float, default=1.)
-    parser.add_argument("--ssim_weight", type=float, default=0.5)
-    parser.add_argument("--spec_weight", type=float, default=0.1)
+    parser.add_argument("--bce_weight", type=float, default=1.)
+    parser.add_argument("--ssim_weight", type=float, default=0.3)
     return parser
 
 def main():
@@ -137,8 +139,8 @@ def main():
     eval_every = args.eval_every
 
     dice_weight = float(args.dice_weight)
+    bce_weight = float(args.bce_weight)
     ssim_weight = float(args.ssim_weight)
-    spec_weight = float(args.spec_weight)
 
     # ==========================================
     # ⚙️ DDP 初始化
@@ -164,7 +166,7 @@ def main():
     train_urls = os.path.join(train_info['path'],"train-*.tar")
     val_urls = os.path.join(val_info['path'], "val-*.tar") 
     train_loader = get_wds_loader(train_urls, batch_size, total_samples=train_info['num_samples'], is_training=True, num_workers=num_workers, split_by_rank=True)
-    val_loader = get_wds_loader(val_urls, batch_size, total_samples=val_info['num_samples'], is_training=False, num_workers=num_workers, split_by_rank=False)
+    val_loader = get_wds_loader(val_urls, batch_size, total_samples=val_info['num_samples'], is_training=False, num_workers=num_workers, split_by_rank=False, split_samples_by_rank=True)
     # ==========================================
     # 2. 模型初始化
     # ==========================================
@@ -173,12 +175,13 @@ def main():
         encoder_weights=None,
         in_channels=1,
         classes=1,
-        activation='sigmoid'
+        activation=None
     ).to(device)
 
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     
     dice_loss = smp.losses.DiceLoss(mode='binary')
+    bce_loss = nn.BCEWithLogitsLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -210,21 +213,23 @@ def main():
         for input, label in pbar:
             input, label = input.to(device), label.float().to(device)
             optimizer.zero_grad()
-            pred = model(input)
+            logits = model(input)
+            pred = torch.sigmoid(logits)
 
-            l_dice = dice_loss(pred, label)
+            l_dice = dice_loss(logits, label)
+            l_bce = bce_loss(logits, label)
             l_ssim = ssim_loss(pred, label)
-            l_spec = spectral_loss(pred, label)
 
-            loss = dice_weight * l_dice + ssim_weight * l_ssim + spec_weight * l_spec
+            loss = dice_weight * l_dice + bce_weight * l_bce + ssim_weight * l_ssim
 
             loss.backward()
             optimizer.step()
             
-            train_loss += loss.item()
-            train_count += 1
+            batch_samples = input.size(0)
+            train_loss += loss.item() * batch_samples
+            train_count += batch_samples
             if local_rank == 0:
-                pbar.set_postfix({"dice_loss": f"{l_dice.item():.3f}"})
+                pbar.set_postfix({"dice_loss": f"{l_dice.item():.3f}", "bce_loss": f"{l_bce.item():.3f}"})
         
         # 指标同步
         train_loss_tensor = torch.tensor(train_loss, device=device)
@@ -243,6 +248,7 @@ def main():
             val_iou = 0.0
             val_count = 0
             model.eval()
+            eval_model = model.module
             with torch.no_grad():
                 if local_rank == 0:
                     val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", leave=False)
@@ -251,16 +257,18 @@ def main():
 
                 for input, label in val_pbar:
                     input, label = input.to(device), label.float().to(device)
-                    pred = model(input)
+                    logits = eval_model(input)
+                    pred = torch.sigmoid(logits)
 
-                    l_dice = dice_loss(pred, label)
+                    l_dice = dice_loss(logits, label)
+                    l_bce = bce_loss(logits, label)
                     l_ssim = ssim_loss(pred, label)
-                    l_spec = spectral_loss(pred, label)
-                    loss = dice_weight * l_dice + ssim_weight * l_ssim + spec_weight * l_spec
+                    loss = dice_weight * l_dice + bce_weight * l_bce + ssim_weight * l_ssim
 
-                    val_loss += loss.item()
-                    val_iou += calculate_iou(pred, label)
-                    val_count += 1
+                    batch_samples = input.size(0)
+                    val_loss += loss.item() * batch_samples
+                    val_iou += calculate_iou(pred, label) * batch_samples
+                    val_count += batch_samples
 
             val_loss_tensor = torch.tensor(val_loss, device=device)
             val_iou_tensor = torch.tensor(val_iou, device=device)
