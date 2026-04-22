@@ -20,7 +20,7 @@ if __package__ in {None, ""}:
 
     V2Dataset = importlib.import_module("downstream_unet.loaders.loader").V2Dataset
 else:
-    from .loaders.loader import V2Dataset
+    from .loader import V2Dataset
 
 
 def calculate_metrics(pred, target, input_blur, threshold=0.5):
