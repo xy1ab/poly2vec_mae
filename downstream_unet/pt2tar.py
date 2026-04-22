@@ -19,11 +19,6 @@ import torch
 import webdataset as wds
 from tqdm import tqdm
 
-
-DEFAULT_INPUT_DIR = "/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset"
-DEFAULT_OUTPUT_DIR = "/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset"
-
-
 def _value_nbytes(value):
     if isinstance(value, torch.Tensor):
         return value.numel() * value.element_size()
@@ -253,8 +248,8 @@ def convert_pt_to_tar(
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Convert pt files to WebDataset tar shards with CPU multiprocessing.")
-    parser.add_argument("--input_dir", type=str, default=DEFAULT_INPUT_DIR)
-    parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--input_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset")
+    parser.add_argument("--output_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset")
     parser.add_argument("--train_ratio", type=float, default=0.9)
     parser.add_argument("--max_size_gb", type=float, default=1.0)
     parser.add_argument("--max_size_bytes", type=int, default=None)
