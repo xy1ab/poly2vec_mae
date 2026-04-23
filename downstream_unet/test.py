@@ -27,7 +27,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import torch
-import webdataset as wds
 from tqdm import tqdm
 
 def _value_nbytes(value):
@@ -46,23 +45,7 @@ def _to_numpy(value):
     return np.asarray(value)
 
 
-def _write_tar_task(task):
-    output_path = task["output_path"]
-    samples = task["samples"]
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with wds.TarWriter(output_path) as sink:
-        for sample in samples:
-            sink.write(sample)
-
-    return {
-        "split": task["split"],
-        "path": os.path.abspath(output_path),
-        "num_samples": len(samples),
-        "payload_bytes": task["payload_bytes"],
-        "first_key": samples[0]["__key__"] if samples else None,
-        "last_key": samples[-1]["__key__"] if samples else None,
-    }
 
 
 def _check_output_dir(output_dir):
