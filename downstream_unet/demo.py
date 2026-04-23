@@ -10,22 +10,29 @@ import cv2  # 引入 OpenCV
 import segmentation_models_pytorch as smp
 from tqdm import tqdm
 
-def setup_ddp():
-    """初始化 DDP 环境"""
-    if "RANK" not in os.environ or "LOCAL_RANK" not in os.environ:
-        raise RuntimeError("请使用 torchrun 启动脚本以启用 DDP。")
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    global_rank = int(os.environ["RANK"])
-    torch.cuda.set_device(local_rank)
-    return local_rank, global_rank
+def _setup_distributed(args, helpers):
+    import torch
+    import torch.distributed as dist
+
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    device = f"cuda:{local_rank}"
+    torch.cuda.set_device(torch.device(device))
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}")
+    )   
+    return rank, local_rank, world_size, device
 
 def cleanup():
-    dist.destroy_process_group()
+    
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="High-Performance DDP Inference with OpenCV")
-    parser.add_argument("--data_path", type=str, default='/mnt/git-data/HB/poly2vec_mae/mae_pretrain/outputs/forward_batch/processed_forward_batch_20260409_142724.pt')
+    parser.add_argument("--emb_dir", type=str, default='/mnt/git-data/HB/poly2vec_mae/mae_pretrain/outputs/forward_batch/processed_forward_batch_20260409_142724.pt')
+    parser.add_argument("--ae_model_dir", type=str, default='/mnt/git-data/HB/poly2vec_mae/outputs/unet_checkpoints/v2_unet_epoch_20.pth')
     parser.add_argument("--model_path", type=str, default='/mnt/git-data/HB/poly2vec_mae/outputs/unet_checkpoints/v2_unet_epoch_20.pth')
     parser.add_argument("--save_dir", type=str, default="./data/unet_dataset")
     parser.add_argument("--batch_size", type=int, default=32) # 使用 OpenCV 后可以尝试调大 batch_size
@@ -197,24 +204,12 @@ def main():
     if is_master:
         print(f"\n✅ 图片保存完成，耗时: {time.time() - start_time:.1f}s")
         print("📊 正在收集推理矩阵...")
-    
-    # 注意：这里我们重新运行模型一次来聚合所有结果是不划算的。
-    # 正确的做法应该是在上面的循环中把结果收集起来，但这需要小心显存。
-    # 由于上面的循环重点在保存图片，我们将预测结果保留在 CPU list 中。
-    # [已经在 all_preds.append(pred_cpu) 中隐含了，这里假设你在循环里加了这行]
-    
-    # 为了演示完整性，我假设你在循环中也收集了 CPU 预测结果：
-    # local_preds = torch.from_numpy(np.concatenate(all_preds_cpu_list, axis=0))
-    # world_size = dist.get_world_size()
-    # gathered_preds = [torch.zeros_like(local_preds) for _ in range(world_size)]
-    # dist.all_gather(gathered_preds, local_preds)
-    # ... (PT 保存逻辑与之前一致)
 
     if is_master:
         print(f"🏁 DDP 全量图片保存任务完成！")
         print(f"⏱️ 总耗时: {time.time() - start_time:.2f}s")
 
-    cleanup()
+    dist.destroy_process_group()
 
 if __name__ == '__main__':
     # OpenCV 不需要 switch backend，它天然支持多进程

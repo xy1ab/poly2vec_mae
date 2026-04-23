@@ -10,17 +10,7 @@ from torch.utils.data import Subset
 import time
 import yaml
 import argparse
-if __package__ in {None, ""}:
-    _CURRENT_DIR = Path(__file__).resolve().parent
-    _REPO_ROOT = _CURRENT_DIR.parent
-    if str(_REPO_ROOT) not in sys.path:
-        sys.path.insert(0, str(_REPO_ROOT))
 
-    import importlib
-
-    V2Dataset = importlib.import_module("downstream_unet.loaders.loader").V2Dataset
-else:
-    from .loader import V2Dataset
 
 
 def calculate_metrics(pred, target, input_blur, threshold=0.5):

@@ -110,11 +110,11 @@ def build_arg_parser():
     parser.add_argument("--index_file", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset/index_file.json")
     parser.add_argument("--save_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_ckpt")
     parser.add_argument("--test_data_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_ckpt")
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--warmup_epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--warmup_epochs", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1.5e-4)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_freq", type=int, default=20)
     parser.add_argument("--dice_weight", type=float, default=1.)
@@ -167,6 +167,7 @@ def main():
     val_urls = os.path.join(val_info['path'], "val-*.tar") 
     train_loader = get_wds_loader(train_urls, batch_size, total_samples=train_info['num_samples'], is_training=True, num_workers=num_workers, split_by_rank=True)
     val_loader = get_wds_loader(val_urls, batch_size, total_samples=val_info['num_samples'], is_training=False, num_workers=num_workers, split_by_rank=False, split_samples_by_rank=True)
+    log_interval = train_info['num_samples'] // 5
     # ==========================================
     # 2. 模型初始化
     # ==========================================
@@ -228,8 +229,8 @@ def main():
             batch_samples = input.size(0)
             train_loss += loss.item() * batch_samples
             train_count += batch_samples
-            if local_rank == 0:
-                pbar.set_postfix({"dice_loss": f"{l_dice.item():.3f}", "bce_loss": f"{l_bce.item():.3f}"})
+            if local_rank == 0 and train_count % log_interval == 0:
+                print(f"dice_loss: {l_dice.item():.3f}, bce_loss: {l_bce.item():.3f}")
         
         # 指标同步
         train_loss_tensor = torch.tensor(train_loss, device=device)

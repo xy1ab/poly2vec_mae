@@ -52,16 +52,6 @@ def _preflight_validate_index_shards(ind_shards: list[Path], helpers_module) -> 
     return total_samples
 
 
-def _broadcast_object(value, enabled: bool, rank: int):
-    import torch.distributed as dist
-
-    if not enabled:
-        return value
-    payload = [value if rank == 0 else None]
-    dist.broadcast_object_list(payload, src=0)
-    return payload[0]
-
-
 def _setup_distributed(args, helpers):
     import torch
     import torch.distributed as dist
@@ -69,54 +59,14 @@ def _setup_distributed(args, helpers):
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    distributed = world_size > 1
 
-    if not distributed:
-        if str(args.gpus).strip():
-            worker_devices = helpers.parse_gpu_devices(args.gpus, fallback_device=args.device)
-            device = worker_devices[0]
-        else:
-            device = helpers.resolve_runtime_device(args.device)
-        return rank, local_rank, world_size, distributed, device
-
-    requested_device = str(args.device).strip().lower()
-    if requested_device.startswith("cuda"):
-        if not torch.cuda.is_available():
-            raise RuntimeError("Torchrun mode requested CUDA, but `torch.cuda.is_available()` is False.")
-        if str(args.gpus).strip():
-            worker_devices = helpers.parse_gpu_devices(args.gpus, fallback_device=args.device)
-            if local_rank >= len(worker_devices):
-                raise ValueError(
-                    f"`--gpus` does not cover LOCAL_RANK={local_rank}: "
-                    f"parsed devices={worker_devices}"
-                )
-            device = worker_devices[local_rank]
-        else:
-            device = f"cuda:{local_rank}"
-        torch.cuda.set_device(torch.device(device))
-        backend = "nccl"
-    else:
-        device = "cpu"
-        backend = "gloo"
-
-    if backend == "nccl":
-        dist.init_process_group(backend=backend, device_id=torch.device(device))
-    else:
-        dist.init_process_group(backend=backend)
-    return rank, local_rank, world_size, distributed, device
-
-
-def _barrier(enabled: bool, device: str) -> None:
-    if not enabled:
-        return
-    import torch
-    import torch.distributed as dist
-
-    if str(device).startswith("cuda"):
-        dist.barrier(device_ids=[torch.device(device).index])
-    else:
-        dist.barrier()
-
+    device = f"cuda:{local_rank}"
+    torch.cuda.set_device(torch.device(device))
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}")
+    )   
+    return rank, local_rank, world_size, device
 
 def _build_rank_output_path(output_dir: str, input_shard_path: Path, rank: int) -> Path:
     output_root = Path(output_dir).expanduser().resolve()
@@ -181,10 +131,10 @@ def _process_one_batch(pipeline, helpers, start_index: int, batch_samples, nicft
     for sample_offset in range(len(batch_samples)):
         record = {
             "sample_index": int(batch_sample_indices[sample_offset]),
-            "indices": indices_batch_u16[sample_offset].cpu(),
-            "meta": torch.as_tensor(batch_meta[sample_offset], dtype=torch.float32).cpu(),
-            "real": real_batch[sample_offset].float().cpu(),
-            "imag": imag_batch[sample_offset].float().cpu(),
+            # "indices": indices_batch_u16[sample_offset].cpu(),
+            # "meta": torch.as_tensor(batch_meta[sample_offset], dtype=torch.float32).cpu(),
+            # "real": real_batch[sample_offset].float().cpu(),
+            # "imag": imag_batch[sample_offset].float().cpu(),
         }
         if icft_batch is not None:
             record["icft"] = icft_batch[sample_offset].float().cpu()
@@ -216,15 +166,9 @@ def main() -> None:
     parser.add_argument("--ind_dir", type=str, required=True, help="Directory containing tri2ind shard files.")
     parser.add_argument("--model_dir", type=str, required=True, help="Training `best` directory or its parent.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for ind2img shards.")
-    parser.add_argument("--nicft", type=int, default=0, help="ICFT output size. <=0 disables ICFT export.")
-    parser.add_argument("--batch_size", type=int, default=64, help="Per-rank inference micro-batch size.")
+    parser.add_argument("--nicft", type=int, default=256, help="ICFT output size. <=0 disables ICFT export.")
+    parser.add_argument("--batch_size", type=int, default=512, help="Per-rank inference micro-batch size.")
     parser.add_argument("--device", type=str, default="cuda", help="Runtime device type, usually `cuda`.")
-    parser.add_argument(
-        "--gpus",
-        type=str,
-        default="",
-        help="GPU id CSV for this node.",
-    )
     args = parser.parse_args()
 
     if args.batch_size <= 0:
@@ -234,12 +178,11 @@ def main() -> None:
 
     rank = 0
     world_size = 1
-    distributed = False
     shard_records = []
     total_progress = None
 
     try:
-        rank, local_rank, world_size, distributed, device = _setup_distributed(args, helpers)
+        rank, local_rank, world_size, device = _setup_distributed(args, helpers)
         is_rank0 = rank == 0
 
         decoder_path, quantizer_path, config_path = helpers.resolve_decode_paths(args.model_dir)
@@ -257,8 +200,8 @@ def main() -> None:
                 task_prefix="ind2img",
                 manifest_name="ind2img.manifest.json",
             )
-        total_samples = int(_broadcast_object(total_samples, distributed, rank))
-        _barrier(distributed, device)
+
+        dist.barrier(device_ids=[torch.device(device).index])
 
         pipeline = pipeline_module.PolyRvqDecodePipeline(
             decoder_path=str(decoder_path),
@@ -337,7 +280,7 @@ def main() -> None:
             )
             torch.save(rank_outputs, output_path)
 
-            _barrier(distributed, device)
+            dist.barrier(device_ids=[torch.device(device).index])
 
             if is_rank0:
                 for part_rank in range(world_size):
@@ -364,7 +307,7 @@ def main() -> None:
                 )
                 shard_progress.close()
 
-            _barrier(distributed, device)
+            dist.barrier(device_ids=[torch.device(device).index])
 
         if is_rank0:
             total_progress.close()
@@ -380,7 +323,6 @@ def main() -> None:
                     "config_path": str(config_path),
                     "batch_size": int(args.batch_size),
                     "device": str(args.device),
-                    "gpus": str(args.gpus),
                     "world_size": int(world_size),
                     "output_mode": "rank_part",
                     "nicft": int(args.nicft),
@@ -394,8 +336,8 @@ def main() -> None:
     finally:
         if total_progress is not None:
             total_progress.close()
-        if distributed and dist.is_available() and dist.is_initialized():
-            dist.destroy_process_group()
+
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
