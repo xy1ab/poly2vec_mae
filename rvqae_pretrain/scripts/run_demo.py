@@ -159,19 +159,19 @@ def _process_one_batch(pipeline, ds_model, helpers, start_index: int, batch_samp
     for sample_offset in range(len(batch_samples)):
         record = {
             "sample_index": int(batch_sample_indices[sample_offset]),
+            "meta_data": batch_meta[sample_offset],
             "pred_bin": pred_bin[sample_offset]
         }
         records.append(record)
 
     return {
-        "start_index": int(start_index),
-        "sample_count": int(len(records)),
         "records": records,
     }
 
 ## TODO
-def get_index_require(sample_index_list, shard_dir):
+def research_index_require(sample_index_list, shard_dir):
     pass
+
 
 def main():
 
