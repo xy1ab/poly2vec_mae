@@ -41,7 +41,21 @@ else:
     from ..src.engine import pipeline as pipeline_module
 
 
+def _setup_distributed():
+    import torch
+    import torch.distributed as dist
 
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    device = f"cuda:{local_rank}"
+    torch.cuda.set_device(torch.device(device))
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}")
+    )   
+    return rank, local_rank, world_size, device
 
 def post_process_results(sigmoid_output, original_sizes, threshold=0.5):
     """
@@ -168,45 +182,10 @@ def _parse_sample_index_file(path: str | Path) -> list[int]:
     return values
 
 
-def research_index_require(sample_index_list, shard_dir, helpers, device, show_progress=True):
-    """Build a GPU index pool from all shards, then return requested samples in input order."""
-    import torch
-
-    required_indices = [int(item) for item in sample_index_list]
-    ind_shards = helpers.resolve_ind_shards(shard_dir)
-
-    index_pool = {}
-    for shard_path in tqdm(ind_shards, desc="Loading index pool", unit="shard", disable=not show_progress):
-        samples = helpers.load_torch_list(shard_path)
-        for local_index, sample in enumerate(samples):
-            if not isinstance(sample, dict):
-                raise TypeError(f"Index shard sample must be dict: {shard_path}#{local_index}")
-            if "sample_index" not in sample:
-                raise KeyError(f"Index shard sample missing `sample_index`: {shard_path}#{local_index}")
-            if "indices" not in sample or "meta" not in sample:
-                raise KeyError(f"Index shard sample missing `indices`/`meta`: {shard_path}#{local_index}")
-
-            sample_index = int(sample["sample_index"])
-            if sample_index in index_pool:
-                raise ValueError(f"Duplicate sample_index found in index pool: {sample_index}")
-
-            index_pool[sample_index] = {
-                "sample_index": sample_index,
-                "indices": helpers.normalize_indices_grid(sample["indices"]).to(device=device, dtype=torch.long),
-                "meta": sample["meta"],
-            }
-
-    missing = [sample_index for sample_index in required_indices if sample_index not in index_pool]
-    if missing:
-        preview = missing[:20]
-        raise KeyError(f"Requested sample_index not found in index pool: {preview}")
-
-    return [index_pool[sample_index] for sample_index in required_indices]
-
 class demo():
-    def __init__(self, args):
+    def __init__(self, args,rank, world_size, device):
         self.args = args
-        self.rank, self.local_rank, self.world_size, self.device = self._setup_distributed()
+        self.rank, self.world_size, self.device = rank, world_size, device
 
         is_rank0 = self.rank == 0
 
@@ -219,23 +198,16 @@ class demo():
         self.run_dir = Path(run_dir_obj[0])
 
         dist.barrier(device_ids=[torch.device(self.device).index])
-        self.pipeline, self.ds_model = self.init()
 
-    def _setup_distributed(self):
-        import torch
-        import torch.distributed as dist
+        self.pipeline, self.ds_model, self.index_pool= self.init()
 
-        rank = int(os.environ.get("RANK", "0"))
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-        device = f"cuda:{local_rank}"
-        torch.cuda.set_device(torch.device(device))
-        dist.init_process_group(
-            backend="nccl",
-            device_id=torch.device(f"cuda:{local_rank}")
-        )   
-        return rank, local_rank, world_size, device
+        ## warm_up
+        sample_index_list = [i for i in range(1000)]#_parse_sample_index_file(args.sample_index_file)
+
+        self.eval(sample_index_list=sample_index_list,save_flag=False)
+        if is_rank0:
+            print("initial finish")
 
     def init(self):
         ## 加载模型
@@ -258,18 +230,38 @@ class demo():
         ds_model.load_state_dict(torch.load(self.args.downstream_model_path, map_location=self.device))
         ds_model.eval()
 
-        return pipeline, ds_model
+        ind_shards = helpers.resolve_ind_shards(self.args.ind_dir)
+
+        index_pool = {}
+        for shard_path in tqdm(ind_shards, desc="Loading index pool", unit="shard"):
+            samples = helpers.load_torch_list(shard_path)
+            for local_index, sample in enumerate(samples):
+                if not isinstance(sample, dict):
+                    raise TypeError(f"Index shard sample must be dict: {shard_path}#{local_index}")
+                if "sample_index" not in sample:
+                    raise KeyError(f"Index shard sample missing `sample_index`: {shard_path}#{local_index}")
+                if "indices" not in sample or "meta" not in sample:
+                    raise KeyError(f"Index shard sample missing `indices`/`meta`: {shard_path}#{local_index}")
+
+                sample_index = int(sample["sample_index"])
+                if sample_index in index_pool:
+                    raise ValueError(f"Duplicate sample_index found in index pool: {sample_index}")
+
+                index_pool[sample_index] = {
+                    "sample_index": sample_index,
+                    "indices": helpers.normalize_indices_grid(sample["indices"]).to(device=self.device, dtype=torch.long),
+                    "meta": sample["meta"],
+                }
+
+        return pipeline, ds_model, index_pool
 
 
-    def eval(self, sample_index_list):
+    def eval(self, sample_index_list, save_flag=True):
         is_rank0 = self.rank == 0
-        requested_samples = research_index_require(
-            sample_index_list=sample_index_list,
-            shard_dir=self.args.ind_dir,
-            helpers=helpers,
-            device=self.device,
-            show_progress=is_rank0,
-        )
+
+        required_indices = [int(item) for item in sample_index_list]
+        requested_samples = [self.index_pool[sample_index] for sample_index in required_indices]
+ 
         requested_count = len(requested_samples)
         
         if is_rank0:
@@ -310,9 +302,10 @@ class demo():
                     round_sample_count += end_index - start_index
                 total_progress.update(round_sample_count)
 
-        output_path = self.run_dir / f"demo_rank{self.rank:03d}.pt"
-        torch.save(rank_outputs, output_path)
-        print(f"[RANK {self.rank}] Saved demo part: {output_path.name} ({rank_sample_count} samples)", flush=True)
+        if save_flag:
+            output_path = self.run_dir / f"demo_rank{self.rank:03d}.pt"
+            torch.save(rank_outputs, output_path)
+            print(f"[RANK {self.rank}] Saved demo part: {output_path.name} ({rank_sample_count} samples)", flush=True)
 
         # dist.barrier(device_ids=[torch.device(self.device).index])
 
@@ -360,7 +353,7 @@ class demo():
             # print(f"[INFO] Manifest: {manifest_path}")
 
         # dist.barrier(device_ids=[torch.device(self.device).index])
-
+import time
 def main():
     ensure_cuda_runtime_libs()
 
@@ -370,22 +363,21 @@ def main():
     parser.add_argument("--model_dir", type=str, required=True, help="Training `best` directory or its parent.")
     parser.add_argument("--downstream_model_path", type=str, required=True, help="Path to downstream UNet checkpoint.")
     parser.add_argument("--output_dir", type=str, required=True, help="Root output directory for timestamped demo results.")
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--resolution", type=int, default=5)
     args = parser.parse_args()
     if args.batch_size <= 0:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
     if args.resolution <= 0:
         raise ValueError(f"`resolution` must be > 0, got {args.resolution}")
-    
-    demo_test = demo(args)
-    demo_test.init()
+    rank, local_rank, world_size, device = _setup_distributed()
+    demo_test = demo(args,rank, world_size, device)
 
     ## get index request
-    sample_index_list = [i for i in range(100)]#_parse_sample_index_file(args.sample_index_file)
-
+    sample_index_list = [i for i in range(10000)]#_parse_sample_index_file(args.sample_index_file)
+    t_s = time.time()
     demo_test.eval(sample_index_list=sample_index_list)
-
+    print(time.time() - t_s)
 
     dist.destroy_process_group()
 
