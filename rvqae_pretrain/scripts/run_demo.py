@@ -18,6 +18,10 @@ import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 import sys
+import torch
+import torch.distributed as dist
+import segmentation_models_pytorch as smp
+
 if __package__ in {None, ""}:
     _CURRENT_DIR = Path(__file__).resolve().parent
     _PROJECT_ROOT = _CURRENT_DIR.parent
@@ -26,14 +30,18 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(_REPO_ROOT))
 
     import importlib
-
+    helpers = importlib.import_module("rvqae_pretrain.scripts.batch_infer_common")
+    pipeline_module = importlib.import_module("rvqae_pretrain.src.engine.pipeline")
     ensure_cuda_runtime_libs = importlib.import_module(
         "rvqae_pretrain.scripts.runtime_bootstrap"
     ).ensure_cuda_runtime_libs
 else:
     from .runtime_bootstrap import ensure_cuda_runtime_libs
+    from . import batch_infer_common as helpers
+    from ..src.engine import pipeline as pipeline_module
 
-def _setup_distributed(args, helpers):
+
+def _setup_distributed():
     import torch
     import torch.distributed as dist
 
@@ -174,208 +182,203 @@ def _parse_sample_index_file(path: str | Path) -> list[int]:
     return values
 
 
-def research_index_require(sample_index_list, shard_dir, helpers, device, show_progress=True):
-    """Build a GPU index pool from all shards, then return requested samples in input order."""
-    import torch
+class demo():
+    def __init__(self, args,rank, world_size, device):
+        self.args = args
+        self.rank, self.world_size, self.device = rank, world_size, device
 
-    required_indices = [int(item) for item in sample_index_list]
-    ind_shards = helpers.resolve_ind_shards(shard_dir)
+        is_rank0 = self.rank == 0
 
-    index_pool = {}
-    for shard_path in tqdm(ind_shards, desc="Loading index pool", unit="shard", disable=not show_progress):
-        samples = helpers.load_torch_list(shard_path)
-        for local_index, sample in enumerate(samples):
-            if not isinstance(sample, dict):
-                raise TypeError(f"Index shard sample must be dict: {shard_path}#{local_index}")
-            if "sample_index" not in sample:
-                raise KeyError(f"Index shard sample missing `sample_index`: {shard_path}#{local_index}")
-            if "indices" not in sample or "meta" not in sample:
-                raise KeyError(f"Index shard sample missing `indices`/`meta`: {shard_path}#{local_index}")
+        self.decoder_path, self.quantizer_path, self.config_path = helpers.resolve_decode_paths(self.args.model_dir)
+        run_dir_obj = [None]
+        if is_rank0:
+            print(f"world_size={self.world_size}, device={self.device}, output_dir={self.args.output_dir}")
+        run_dir_obj[0] = str(self.args.output_dir)
+        dist.broadcast_object_list(run_dir_obj, src=0)
+        self.run_dir = Path(run_dir_obj[0])
 
-            sample_index = int(sample["sample_index"])
-            if sample_index in index_pool:
-                raise ValueError(f"Duplicate sample_index found in index pool: {sample_index}")
+        dist.barrier(device_ids=[torch.device(self.device).index])
 
-            index_pool[sample_index] = {
-                "sample_index": sample_index,
-                "indices": helpers.normalize_indices_grid(sample["indices"]).to(device=device, dtype=torch.long),
-                "meta": sample["meta"],
-            }
-
-    missing = [sample_index for sample_index in required_indices if sample_index not in index_pool]
-    if missing:
-        preview = missing[:20]
-        raise KeyError(f"Requested sample_index not found in index pool: {preview}")
-
-    return [index_pool[sample_index] for sample_index in required_indices]
+        self.pipeline, self.ds_model, self.index_pool= self.init()
 
 
+        ## warm_up
+        sample_index_list = [i for i in range(1000)]#_parse_sample_index_file(args.sample_index_file)
+
+        self.eval(sample_index_list=sample_index_list,save_flag=False)
+        if is_rank0:
+            print("initial finish")
+
+    def init(self):
+        ## 加载模型
+        pipeline = pipeline_module.PolyRvqDecodePipeline(
+            decoder_path=str(self.decoder_path),
+            quantizer_path=str(self.quantizer_path),
+            config_path=str(self.config_path),
+            device=str(self.device),
+            precision="fp32",
+        )
+
+        ds_model = smp.Unet(
+            encoder_name="resnet34",
+            encoder_weights=None,
+            in_channels=1,
+            classes=1,
+            activation=None
+        ).to(self.device)
+        
+        ds_model.load_state_dict(torch.load(self.args.downstream_model_path, map_location=self.device))
+        ds_model.eval()
+
+        ind_shards = helpers.resolve_ind_shards(self.args.ind_dir)
+
+        index_pool = {}
+        for shard_path in tqdm(ind_shards, desc="Loading index pool", unit="shard"):
+            samples = helpers.load_torch_list(shard_path)
+            for local_index, sample in enumerate(samples):
+                if not isinstance(sample, dict):
+                    raise TypeError(f"Index shard sample must be dict: {shard_path}#{local_index}")
+                if "sample_index" not in sample:
+                    raise KeyError(f"Index shard sample missing `sample_index`: {shard_path}#{local_index}")
+                if "indices" not in sample or "meta" not in sample:
+                    raise KeyError(f"Index shard sample missing `indices`/`meta`: {shard_path}#{local_index}")
+
+                sample_index = int(sample["sample_index"])
+                if sample_index in index_pool:
+                    raise ValueError(f"Duplicate sample_index found in index pool: {sample_index}")
+
+                index_pool[sample_index] = {
+                    "sample_index": sample_index,
+                    "indices": helpers.normalize_indices_grid(sample["indices"]).to(device=self.device, dtype=torch.long),
+                    "meta": sample["meta"],
+                }
+
+        return pipeline, ds_model, index_pool
+
+
+    def eval(self, sample_index_list, save_flag=True):
+        is_rank0 = self.rank == 0
+
+        required_indices = [int(item) for item in sample_index_list]
+        requested_samples = [self.index_pool[sample_index] for sample_index in required_indices]
+ 
+        requested_count = len(requested_samples)
+        
+        if is_rank0:
+            total_progress = tqdm(total=requested_count, desc="demo total", unit="sample", position=0)
+        else:
+            total_progress = None
+
+        rank_outputs = []
+        rank_sample_count = 0
+        num_batches = (requested_count + self.args.batch_size - 1) // self.args.batch_size
+        for round_start in range(0, num_batches, self.world_size):
+            batch_index = round_start + self.rank
+            if batch_index < num_batches:
+                start = batch_index * self.args.batch_size
+                end = min(start + self.args.batch_size, requested_count)
+                local_payload = _process_one_batch(
+                    pipeline=self.pipeline,
+                    ds_model=self.ds_model,
+                    helpers=helpers,
+                    start_index=int(start),
+                    batch_samples=requested_samples[start:end],
+                    resolution=int(self.args.resolution),
+                )
+                records = list(local_payload["records"])
+                if len(records) != int(local_payload["sample_count"]):
+                    raise RuntimeError("Local demo batch result length is inconsistent.")
+                rank_outputs.extend(records)
+                rank_sample_count += len(records)
+
+            if is_rank0:
+                round_sample_count = 0
+                for round_rank in range(self.world_size):
+                    round_batch_index = round_start + round_rank
+                    if round_batch_index >= num_batches:
+                        continue
+                    start_index = round_batch_index * self.args.batch_size
+                    end_index = min(start_index + self.args.batch_size, requested_count)
+                    round_sample_count += end_index - start_index
+                total_progress.update(round_sample_count)
+
+        if save_flag:
+            output_path = self.run_dir / f"demo_rank{self.rank:03d}.pt"
+            torch.save(rank_outputs, output_path)
+            print(f"[RANK {self.rank}] Saved demo part: {output_path.name} ({rank_sample_count} samples)", flush=True)
+
+        # dist.barrier(device_ids=[torch.device(self.device).index])
+
+        # if is_rank0:
+        #     total_progress.close()
+        #     part_records = []
+        #     for part_rank in range(self.world_size):
+        #         part_path = self.run_dir / f"demo_rank{part_rank:03d}.pt"
+        #         if not part_path.is_file():
+        #             raise FileNotFoundError(f"Missing rank output part: {part_path}")
+        #         part_samples = 0
+        #         for batch_index in range(part_rank, num_batches, self.world_size):
+        #             start = batch_index * args.batch_size
+        #             end = min(start + args.batch_size, requested_count)
+        #             part_samples += end - start
+        #         part_records.append(
+        #             {
+        #                 "path": str(part_path.resolve()),
+        #                 "rank": int(part_rank),
+        #                 "sample_count": int(part_samples),
+        #                 "size_bytes": int(part_path.stat().st_size),
+        #             }
+        #         )
+            # manifest_path = helpers.write_task_manifest(
+            #     output_dir=self.run_dir,
+            #     manifest_name="demo.manifest.json",
+            #     metadata={
+            #         "created_at": datetime.now().isoformat(timespec="seconds"),
+            #         "ind_dir": str(Path(args.ind_dir).expanduser().resolve()),
+            #         # "sample_index_file": str(Path(args.sample_index_file).expanduser().resolve()),
+            #         "model_dir": str(Path(args.model_dir).expanduser().resolve()),
+            #         "downstream_model_path": str(Path(args.downstream_model_path).expanduser().resolve()),
+            #         "decoder_path": str(decoder_path),
+            #         "quantizer_path": str(quantizer_path),
+            #         "config_path": str(config_path),
+            #         "batch_size": int(args.batch_size),
+            #         "resolution": int(args.resolution),
+            #         "world_size": int(world_size),
+            #         "requested_sample_indices": [int(item) for item in sample_index_list],
+            #         "output_mode": "rank_part",
+            #     },
+            #     shard_records=part_records,
+            # )
+            # print(f"[INFO] Saved demo results to: {self.run_dir}")
+            # print(f"[INFO] Manifest: {manifest_path}")
+
+        # dist.barrier(device_ids=[torch.device(self.device).index])
+import time
 def main():
     ensure_cuda_runtime_libs()
-    import torch
-    import torch.distributed as dist
-    import segmentation_models_pytorch as smp
-
-    if __package__ in {None, ""}:
-        import importlib
-
-        helpers = importlib.import_module("rvqae_pretrain.scripts.batch_infer_common")
-        pipeline_module = importlib.import_module("rvqae_pretrain.src.engine.pipeline")
-    else:
-        from . import batch_infer_common as helpers
-        from ..src.engine import pipeline as pipeline_module
 
     parser = argparse.ArgumentParser(description="Retrieve RVQ indices by sample_index and run RVQAE+UNet demo inference.")
     parser.add_argument("--ind_dir", type=str, required=True, help="Directory containing tri2ind shard files.")
-    parser.add_argument("--sample_index_file", type=str, required=True, help="Text file containing requested sample_index values.")
+    # parser.add_argument("--sample_index_file", type=str, required=True, help="Text file containing requested sample_index values.")
     parser.add_argument("--model_dir", type=str, required=True, help="Training `best` directory or its parent.")
     parser.add_argument("--downstream_model_path", type=str, required=True, help="Path to downstream UNet checkpoint.")
     parser.add_argument("--output_dir", type=str, required=True, help="Root output directory for timestamped demo results.")
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--resolution", type=int, default=5)
     args = parser.parse_args()
     if args.batch_size <= 0:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
     if args.resolution <= 0:
         raise ValueError(f"`resolution` must be > 0, got {args.resolution}")
-    
-    rank, local_rank, world_size, device = _setup_distributed(args, helpers)
-    is_rank0 = rank == 0
-    decoder_path, quantizer_path, config_path = helpers.resolve_decode_paths(args.model_dir)
-    sample_index_list = _parse_sample_index_file(args.sample_index_file)
+    rank, local_rank, world_size, device = _setup_distributed()
+    demo_test = demo(args,rank, world_size, device)
 
-    run_dir_obj = [None]
-    if is_rank0:
-        run_dir = Path(args.output_dir).expanduser().resolve() / f"demo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        run_dir.mkdir(parents=True, exist_ok=False)
-        run_dir_obj[0] = str(run_dir)
-        print(
-            f"[INFO] Demo request loaded: requested_samples={len(sample_index_list)}, "
-            f"world_size={world_size}, device={device}, output_dir={run_dir}"
-        )
-    dist.broadcast_object_list(run_dir_obj, src=0)
-    run_dir = Path(run_dir_obj[0])
+    ## get index request
+    sample_index_list = [i for i in range(10000)]#_parse_sample_index_file(args.sample_index_file)
+    t_s = time.time()
+    demo_test.eval(sample_index_list=sample_index_list)
+    print(time.time() - t_s)
 
-    dist.barrier(device_ids=[torch.device(device).index])
-
-
-    ## 加载模型
-    pipeline = pipeline_module.PolyRvqDecodePipeline(
-        decoder_path=str(decoder_path),
-        quantizer_path=str(quantizer_path),
-        config_path=str(config_path),
-        device=str(device),
-        precision="fp32",
-    )
-
-    ds_model = smp.Unet(
-        encoder_name="resnet34",
-        encoder_weights=None,
-        in_channels=1,
-        classes=1,
-        activation=None
-    ).to(device)
-    
-    ds_model.load_state_dict(torch.load(args.downstream_model_path, map_location=device))
-    ds_model.eval()
-
-    requested_samples = research_index_require(
-        sample_index_list=sample_index_list,
-        shard_dir=args.ind_dir,
-        helpers=helpers,
-        device=device,
-        show_progress=is_rank0,
-    )
-    requested_count = len(requested_samples)
-
-    if is_rank0:
-        total_progress = tqdm(total=requested_count, desc="demo total", unit="sample", position=0)
-    else:
-        total_progress = None
-
-    rank_outputs = []
-    rank_sample_count = 0
-    num_batches = (requested_count + args.batch_size - 1) // args.batch_size
-    for round_start in range(0, num_batches, world_size):
-        batch_index = round_start + rank
-        if batch_index < num_batches:
-            start = batch_index * args.batch_size
-            end = min(start + args.batch_size, requested_count)
-            local_payload = _process_one_batch(
-                pipeline=pipeline,
-                ds_model=ds_model,
-                helpers=helpers,
-                start_index=int(start),
-                batch_samples=requested_samples[start:end],
-                resolution=int(args.resolution),
-            )
-            records = list(local_payload["records"])
-            if len(records) != int(local_payload["sample_count"]):
-                raise RuntimeError("Local demo batch result length is inconsistent.")
-            rank_outputs.extend(records)
-            rank_sample_count += len(records)
-
-        if is_rank0:
-            round_sample_count = 0
-            for round_rank in range(world_size):
-                round_batch_index = round_start + round_rank
-                if round_batch_index >= num_batches:
-                    continue
-                start_index = round_batch_index * args.batch_size
-                end_index = min(start_index + args.batch_size, requested_count)
-                round_sample_count += end_index - start_index
-            total_progress.update(round_sample_count)
-
-    output_path = run_dir / f"demo_rank{rank:03d}.pt"
-    torch.save(rank_outputs, output_path)
-    print(f"[RANK {rank}] Saved demo part: {output_path.name} ({rank_sample_count} samples)", flush=True)
-
-    dist.barrier(device_ids=[torch.device(device).index])
-
-    if is_rank0:
-        total_progress.close()
-        part_records = []
-        for part_rank in range(world_size):
-            part_path = run_dir / f"demo_rank{part_rank:03d}.pt"
-            if not part_path.is_file():
-                raise FileNotFoundError(f"Missing rank output part: {part_path}")
-            part_samples = 0
-            for batch_index in range(part_rank, num_batches, world_size):
-                start = batch_index * args.batch_size
-                end = min(start + args.batch_size, requested_count)
-                part_samples += end - start
-            part_records.append(
-                {
-                    "path": str(part_path.resolve()),
-                    "rank": int(part_rank),
-                    "sample_count": int(part_samples),
-                    "size_bytes": int(part_path.stat().st_size),
-                }
-            )
-        manifest_path = helpers.write_task_manifest(
-            output_dir=run_dir,
-            manifest_name="demo.manifest.json",
-            metadata={
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-                "ind_dir": str(Path(args.ind_dir).expanduser().resolve()),
-                "sample_index_file": str(Path(args.sample_index_file).expanduser().resolve()),
-                "model_dir": str(Path(args.model_dir).expanduser().resolve()),
-                "downstream_model_path": str(Path(args.downstream_model_path).expanduser().resolve()),
-                "decoder_path": str(decoder_path),
-                "quantizer_path": str(quantizer_path),
-                "config_path": str(config_path),
-                "batch_size": int(args.batch_size),
-                "resolution": int(args.resolution),
-                "world_size": int(world_size),
-                "requested_sample_indices": [int(item) for item in sample_index_list],
-                "output_mode": "rank_part",
-            },
-            shard_records=part_records,
-        )
-        print(f"[INFO] Saved demo results to: {run_dir}")
-        print(f"[INFO] Manifest: {manifest_path}")
-
-    dist.barrier(device_ids=[torch.device(device).index])
     dist.destroy_process_group()
 
 if __name__ == '__main__':
