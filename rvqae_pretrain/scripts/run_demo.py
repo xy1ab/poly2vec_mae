@@ -238,8 +238,8 @@ class demo():
             for local_index, sample in enumerate(samples):
                 if not isinstance(sample, dict):
                     raise TypeError(f"Index shard sample must be dict: {shard_path}#{local_index}")
-                if "sample_index" not in sample:
-                    raise KeyError(f"Index shard sample missing `sample_index`: {shard_path}#{local_index}")
+                if "gid" not in sample:
+                    raise KeyError(f"Index shard sample missing `gid`: {shard_path}#{local_index}")
                 if "indices" not in sample or "meta" not in sample:
                     raise KeyError(f"Index shard sample missing `indices`/`meta`: {shard_path}#{local_index}")
 
@@ -248,7 +248,7 @@ class demo():
                     raise ValueError(f"Duplicate sample_index found in index pool: {sample_index}")
 
                 index_pool[sample_index] = {
-                    "sample_index": sample_index,
+                    "gid": sample_index,
                     "indices": helpers.normalize_indices_grid(sample["indices"]).to(device=self.device, dtype=torch.long),
                     "meta": sample["meta"],
                 }
