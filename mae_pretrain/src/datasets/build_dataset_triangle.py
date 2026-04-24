@@ -446,6 +446,51 @@ def _build_row_meta4(geom) -> np.ndarray:
     )
 
 
+def _json_safe_gid_value(raw_gid: Any) -> int | float | str | None:
+    """Convert a raw gid value into a JSON-serializable scalar."""
+    if raw_gid is None:
+        return None
+    if isinstance(raw_gid, np.generic):
+        raw_gid = raw_gid.item()
+    if isinstance(raw_gid, (int, np.integer)):
+        return int(raw_gid)
+    if isinstance(raw_gid, (float, np.floating)):
+        if np.isnan(float(raw_gid)):
+            return None
+        return float(raw_gid)
+    return str(raw_gid)
+
+
+def _coerce_gid_uint64(raw_gid: Any, gid_field: str) -> int:
+    """Validate and convert one gid value into a uint64-compatible Python int."""
+    if raw_gid is None:
+        raise ValueError(f"Missing gid value in field {gid_field!r}.")
+
+    if isinstance(raw_gid, np.generic):
+        raw_gid = raw_gid.item()
+
+    if isinstance(raw_gid, (float, np.floating)):
+        gid_float = float(raw_gid)
+        if np.isnan(gid_float):
+            raise ValueError(f"NaN gid value in field {gid_field!r}.")
+        if not gid_float.is_integer():
+            raise ValueError(f"Non-integer gid value in field {gid_field!r}: {gid_float!r}")
+        raw_gid = int(gid_float)
+
+    if isinstance(raw_gid, (int, np.integer)):
+        gid_int = int(raw_gid)
+    else:
+        raise ValueError(
+            f"Unsupported gid value type in field {gid_field!r}: {type(raw_gid).__name__}"
+        )
+
+    if gid_int < 0:
+        raise ValueError(f"Negative gid value in field {gid_field!r}: {gid_int}")
+    if gid_int > np.iinfo(np.uint64).max:
+        raise ValueError(f"gid value exceeds uint64 range in field {gid_field!r}: {gid_int}")
+    return gid_int
+
+
 def _build_special_row_log_record(
     *,
     file_path: str,
@@ -461,6 +506,7 @@ def _build_special_row_log_record(
     filtered_triangle_count: int,
     kept_triangle_count: int,
     degenerated: bool,
+    gid: Any = None,
 ) -> dict[str, Any]:
     """Build one detailed row log record for MultiPolygon / hole rows."""
     return {
@@ -483,6 +529,7 @@ def _build_special_row_log_record(
         "filtered_part_count": int(filtered_part_count),
         "filtered_triangle_count": int(filtered_triangle_count),
         "kept_triangle_count": int(kept_triangle_count),
+        "gid": _json_safe_gid_value(gid),
     }
 
 
@@ -512,6 +559,7 @@ def _build_failed_row_record(
     error_type: str,
     error_message: str,
     sample_count: int,
+    gid: Any = None,
 ) -> dict[str, Any]:
     """Build one row-level failure record for unexpected exceptions."""
     return {
@@ -529,6 +577,7 @@ def _build_failed_row_record(
         "sample_count": int(sample_count),
         "error_type": str(error_type),
         "error_message": str(error_message),
+        "gid": _json_safe_gid_value(gid),
     }
 
 
@@ -542,6 +591,7 @@ def _build_chunk_failure_record(
     source_type: str,
     error_type: str,
     error_message: str,
+    gids: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Build one chunk-level failure record for worker crashes."""
     return {
@@ -553,6 +603,7 @@ def _build_chunk_failure_record(
         "row_sample_count": int(row_sample_count),
         "error_type": str(error_type),
         "error_message": str(error_message),
+        "gids": [_json_safe_gid_value(gid) for gid in (gids or [])],
     }
 
 
@@ -1281,6 +1332,7 @@ def _init_result_counters() -> dict[str, Any]:
     return {
         "triangles": [],
         "meta": [],
+        "gid": [],
         "triangulated_output_count": 0,
         "total_rows": 0,
         "degenerate_row_count": 0,
@@ -1312,6 +1364,7 @@ def _merge_result_counters(target: dict[str, Any], partial: dict[str, Any]) -> N
     """
     target["triangles"].extend(list(partial.get("triangles", [])))
     target["meta"].extend(list(partial.get("meta", [])))
+    target["gid"].extend(list(partial.get("gid", [])))
     target["triangulated_output_count"] += int(partial.get("triangulated_output_count", 0))
     target["total_rows"] += int(partial.get("total_rows", 0))
     target["degenerate_row_count"] += int(partial.get("degenerate_row_count", 0))
@@ -1352,6 +1405,7 @@ def _count_geometry_samples(geom) -> int:
 def _triangulate_row_geometry(
     row_idx: int,
     geom,
+    raw_gid: Any,
     file_path: str,
     layer_name: str | None,
     source_type: str,
@@ -1365,6 +1419,7 @@ def _triangulate_row_geometry(
     timeout_safe: float,
     norm_max: float,
     enable_log: bool,
+    gid_field: str,
 ) -> dict[str, Any]:
     """Triangulate one geometry row and collect row-level counters.
 
@@ -1390,6 +1445,10 @@ def _triangulate_row_geometry(
     """
     row_out = _init_result_counters()
     row_out["total_rows"] = 1
+
+    gid_value: int | None = None
+    if gid_field:
+        gid_value = _coerce_gid_uint64(raw_gid, gid_field)
 
     if geom is None or geom.is_empty or geom.geom_type not in {"Polygon", "MultiPolygon"}:
         row_out["dropped_row_count"] = 1
@@ -1427,6 +1486,7 @@ def _triangulate_row_geometry(
             filtered_triangle_count=int(filtered_triangle_count),
             kept_triangle_count=int(kept_triangle_count),
             degenerated=bool(degenerated),
+            gid=gid_value,
         )
         if is_multipolygon:
             row_out["multipolygon_records"].append(record)
@@ -1528,6 +1588,8 @@ def _triangulate_row_geometry(
 
     row_out["triangles"].append(triangles.astype(np.float32))
     row_out["meta"].append(_build_row_meta4(geom))
+    if gid_value is not None:
+        row_out["gid"].append(np.uint64(gid_value))
     row_out["triangulated_output_count"] = 1
     row_out["triangulated_multipolygon_row_count"] = int(is_multipolygon)
     row_out["triangulated_hole_row_count"] = int(has_holes)
@@ -1552,6 +1614,7 @@ def _triangulate_row_geometry(
                     "filtered_part_count": int(row_result.get("filtered_part_count", 0)),
                     "filtered_triangle_count": int(filtered_triangle_count),
                     "kept_triangle_count": int(triangles.shape[0]),
+                    "gid": int(gid_value) if gid_value is not None else None,
                 }
             )
     append_special_log(
@@ -1569,7 +1632,7 @@ def _triangulate_row_geometry(
 
 def _triangulate_chunk_worker(
     chunk_index: int,
-    row_payloads: list[tuple[int, Any]],
+    row_payloads: list[tuple[int, Any, Any]],
     file_path: str,
     layer_name: str | None,
     source_type: str,
@@ -1583,6 +1646,7 @@ def _triangulate_chunk_worker(
     timeout_safe: float,
     norm_max: float,
     enable_log: bool,
+    gid_field: str,
 ) -> dict[str, Any]:
     """Worker function for one row-chunk in task-internal parallelization.
 
@@ -1608,11 +1672,12 @@ def _triangulate_chunk_worker(
     """
     chunk_out = _init_result_counters()
     row_sample_count = int(sum(_count_geometry_samples(payload[1]) for payload in row_payloads))
-    for row_idx, geom in row_payloads:
+    for row_idx, geom, raw_gid in row_payloads:
         try:
             row_out = _triangulate_row_geometry(
                 row_idx=int(row_idx),
                 geom=geom,
+                raw_gid=raw_gid,
                 file_path=file_path,
                 layer_name=layer_name,
                 source_type=source_type,
@@ -1626,6 +1691,7 @@ def _triangulate_chunk_worker(
                 timeout_safe=float(timeout_safe),
                 norm_max=float(norm_max),
                 enable_log=enable_log,
+                gid_field=str(gid_field),
             )
         except Exception as exc:
             row_profile = _safe_row_profile_for_failure(geom)
@@ -1651,6 +1717,7 @@ def _triangulate_chunk_worker(
                     error_type=type(exc).__name__,
                     error_message=str(exc),
                     sample_count=int(sample_count),
+                    gid=raw_gid,
                 )
             )
         _merge_result_counters(chunk_out, row_out)
@@ -1675,6 +1742,7 @@ def _build_chunk_failure_result(
     source_type: str,
     error_type: str,
     error_message: str,
+    gids: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Build one synthetic chunk result when chunk execution itself fails."""
     failure_out = _init_result_counters()
@@ -1691,6 +1759,7 @@ def _build_chunk_failure_result(
             source_type=source_type,
             error_type=error_type,
             error_message=error_message,
+            gids=gids,
         )
     )
     return {
@@ -1722,6 +1791,7 @@ def _triangulate_task_worker(
     timeout_safe: float,
     norm_max: float,
     enable_log: bool,
+    gid_field: str,
     writer: "_ShardWriter | None" = None,
 ) -> dict[str, Any]:
     """Triangulate one input task with task-serial and chunk-internal parallelism.
@@ -1769,10 +1839,39 @@ def _triangulate_task_worker(
             **_init_result_counters(),
         }
 
+    gid_field = str(gid_field).strip()
+    raw_gid_values: list[Any]
+    if gid_field:
+        if str(source_type).strip().lower() != "shp":
+            return {
+                "index": int(task_index),
+                "file_path": file_path,
+                "layer_name": layer_name,
+                "source_type": source_type,
+                "ok": False,
+                "error": f"--gid_field is supported for shp only, got source_type={source_type!r}.",
+                "source_geometry_count": 0,
+                **_init_result_counters(),
+            }
+        if gid_field not in gdf.columns:
+            return {
+                "index": int(task_index),
+                "file_path": file_path,
+                "layer_name": layer_name,
+                "source_type": source_type,
+                "ok": False,
+                "error": f"Missing gid field {gid_field!r} in source file.",
+                "source_geometry_count": int(len(gdf.geometry)),
+                **_init_result_counters(),
+            }
+        raw_gid_values = list(gdf[gid_field])
+    else:
+        raw_gid_values = [None] * int(len(gdf.geometry))
+
     source_geometry_count = int(len(gdf.geometry))
-    row_payloads: list[tuple[int, Any]] = []
-    for row_idx, geom in enumerate(gdf.geometry):
-        row_payloads.append((int(row_idx), geom))
+    row_payloads: list[tuple[int, Any, Any]] = []
+    for row_idx, (geom, raw_gid) in enumerate(zip(gdf.geometry, raw_gid_values)):
+        row_payloads.append((int(row_idx), geom, raw_gid))
 
     chunk_size = max(1, int(rows_per_chunk))
     chunks = [row_payloads[i : i + chunk_size] for i in range(0, len(row_payloads), chunk_size)]
@@ -1823,6 +1922,7 @@ def _triangulate_task_worker(
                         timeout_safe=float(timeout_safe),
                         norm_max=float(norm_max),
                         enable_log=enable_log,
+                        gid_field=str(gid_field),
                     )
                 except Exception as exc:
                     chunk_result = _build_chunk_failure_result(
@@ -1834,6 +1934,7 @@ def _triangulate_task_worker(
                         source_type=source_type,
                         error_type=type(exc).__name__,
                         error_message=str(exc),
+                        gids=[payload[2] for payload in chunk_payload],
                     )
                 row_pbar.update(int(chunk_result.get("row_count", len(chunk_payload))))
 
@@ -1845,10 +1946,18 @@ def _triangulate_task_worker(
                     _merge_result_counters(task_out, chunk_result)
                 else:
                     chunk_triangles = list(chunk_result.get("triangles", []))
+                    chunk_meta = list(chunk_result.get("meta", []))
+                    chunk_gid = list(chunk_result.get("gid", []))
                     if writer is not None and chunk_triangles:
-                        writer.add_many(chunk_triangles)
+                        writer.add_many(
+                            chunk_triangles,
+                            chunk_meta if writer.with_meta else None,
+                            chunk_gid if writer.with_gid else None,
+                        )
                         chunk_result = dict(chunk_result)
                         chunk_result["triangles"] = []
+                        chunk_result["meta"] = []
+                        chunk_result["gid"] = []
                     task_output_sample_count += int(len(chunk_triangles))
                     _merge_result_counters(task_out, chunk_result)
 
@@ -1882,6 +1991,7 @@ def _triangulate_task_worker(
                         float(timeout_safe),
                         float(norm_max),
                         bool(enable_log),
+                        str(gid_field),
                     ): (chunk_index, int(len(chunk_payload)), int(sum(_count_geometry_samples(p[1]) for p in chunk_payload)))
                     for chunk_index, chunk_payload in enumerate(chunks)
                 }
@@ -1903,6 +2013,7 @@ def _triangulate_task_worker(
                             source_type=source_type,
                             error_type=type(exc).__name__,
                             error_message=str(exc),
+                            gids=[payload[2] for payload in chunks[chunk_index]],
                         )
 
                     row_pbar.update(int(chunk_result.get("row_count", row_count)))
@@ -1920,11 +2031,17 @@ def _triangulate_task_worker(
                         else:
                             chunk_triangles = list(ordered_chunk.get("triangles", []))
                             chunk_meta = list(ordered_chunk.get("meta", []))
+                            chunk_gid = list(ordered_chunk.get("gid", []))
                             if writer is not None and chunk_triangles:
-                                writer.add_many(chunk_triangles, chunk_meta if writer.with_meta else None)
+                                writer.add_many(
+                                    chunk_triangles,
+                                    chunk_meta if writer.with_meta else None,
+                                    chunk_gid if writer.with_gid else None,
+                                )
                                 ordered_chunk = dict(ordered_chunk)
                                 ordered_chunk["triangles"] = []
                                 ordered_chunk["meta"] = []
+                                ordered_chunk["gid"] = []
                             task_output_sample_count += int(len(chunk_triangles))
                             _merge_result_counters(task_out, ordered_chunk)
 
@@ -1994,6 +2111,17 @@ def _build_meta_output_path(base_output_path: Path) -> Path:
     return base_output_path.with_name(f"{meta_stem}{suffix}")
 
 
+def _build_gid_output_path(base_output_path: Path) -> Path:
+    """Build paired gid output path from one triangle output base path."""
+    suffix = base_output_path.suffix if base_output_path.suffix else ".pt"
+    stem = base_output_path.stem
+    if stem.endswith("_tri"):
+        gid_stem = f"{stem[:-4]}_gid"
+    else:
+        gid_stem = f"{stem}_gid"
+    return base_output_path.with_name(f"{gid_stem}{suffix}")
+
+
 def _default_log_path(output_path: Path) -> Path:
     """Build default triangulation-log path beside output `.pt` base file.
 
@@ -2014,33 +2142,45 @@ def _default_row_failures_path(output_path: Path) -> Path:
 class _ShardWriter:
     """Incremental writer that flushes samples to `.pt` shards by size estimate."""
 
-    def __init__(self, output_path: Path, shard_size_mb: float, with_meta: bool):
+    def __init__(self, output_path: Path, shard_size_mb: float, with_meta: bool, with_gid: bool):
         """Initialize shard writer.
 
         Args:
             output_path: Base output path.
             shard_size_mb: Target shard size in MB. `<=0` means single-file output.
             with_meta: Whether to write paired meta shards.
+            with_gid: Whether to write paired gid shards.
         """
         self.output_path = output_path
         self.shard_size_bytes = int(max(0.0, float(shard_size_mb)) * 1024.0 * 1024.0)
         self.with_meta = bool(with_meta)
+        self.with_gid = bool(with_gid)
         self.meta_output_path = _build_meta_output_path(output_path) if self.with_meta else None
+        self.gid_output_path = _build_gid_output_path(output_path) if self.with_gid else None
         self._buffer: list[np.ndarray] = []
         self._meta_buffer: list[np.ndarray] = []
+        self._gid_buffer: list[np.uint64] = []
         self._buffer_estimated_bytes = 0
 
         self.shard_paths: list[Path] = []
         self.shard_sample_counts: list[int] = []
         self.meta_shard_paths: list[Path] = []
         self.meta_shard_sample_counts: list[int] = []
+        self.gid_shard_paths: list[Path] = []
+        self.gid_shard_sample_counts: list[int] = []
 
-    def add_many(self, samples: list[np.ndarray], meta: list[np.ndarray] | None = None) -> None:
+    def add_many(
+        self,
+        samples: list[np.ndarray],
+        meta: list[np.ndarray] | None = None,
+        gids: list[Any] | None = None,
+    ) -> None:
         """Add multiple samples into current shard buffer.
 
         Args:
             samples: Triangle sample list.
             meta: Optional meta sample list aligned with `samples`.
+            gids: Optional gid sample list aligned with `samples`.
         """
         if self.with_meta:
             if meta is None:
@@ -2048,6 +2188,13 @@ class _ShardWriter:
             if len(samples) != len(meta):
                 raise ValueError(
                     f"Sample/meta length mismatch: triangles={len(samples)}, meta={len(meta)}"
+                )
+        if self.with_gid:
+            if gids is None:
+                raise ValueError("gid payload is required when with_gid=True.")
+            if len(samples) != len(gids):
+                raise ValueError(
+                    f"Sample/gid length mismatch: triangles={len(samples)}, gid={len(gids)}"
                 )
 
         for idx, sample in enumerate(samples):
@@ -2062,6 +2209,9 @@ class _ShardWriter:
                 if meta_sample.shape != (6,):
                     raise ValueError(f"Meta sample must have shape (6,), got {meta_sample.shape}")
                 self._meta_buffer.append(meta_sample)
+            if self.with_gid:
+                assert gids is not None
+                self._gid_buffer.append(np.uint64(gids[idx]))
 
     def flush(self) -> Path | None:
         """Flush current buffer to disk as one `.pt` file.
@@ -2098,8 +2248,25 @@ class _ShardWriter:
             self.meta_shard_paths.append(written_meta_path)
             self.meta_shard_sample_counts.append(len(self._meta_buffer))
 
+        if self.with_gid:
+            if self.gid_output_path is None:
+                raise RuntimeError("gid_output_path is missing while with_gid=True.")
+            if len(self._gid_buffer) != len(self._buffer):
+                raise RuntimeError(
+                    "gid buffer and triangle buffer length mismatch before flush: "
+                    f"gid={len(self._gid_buffer)}, tri={len(self._buffer)}"
+                )
+            if self.shard_size_bytes > 0:
+                gid_output_file = _build_shard_path(self.gid_output_path, len(self.gid_shard_paths) + 1)
+            else:
+                gid_output_file = self.gid_output_path
+            written_gid_path = save_triangle_shard(gid_output_file, self._gid_buffer)
+            self.gid_shard_paths.append(written_gid_path)
+            self.gid_shard_sample_counts.append(len(self._gid_buffer))
+
         self._buffer = []
         self._meta_buffer = []
+        self._gid_buffer = []
         self._buffer_estimated_bytes = 0
         return output_file
 
@@ -2148,6 +2315,29 @@ class _ShardWriter:
                     "size_bytes": int(path.stat().st_size) if path.exists() else -1,
                 }
                 for path, sample_count in zip(self.meta_shard_paths, self.meta_shard_sample_counts)
+            ]
+
+        if self.with_gid:
+            if self.gid_output_path is None:
+                raise RuntimeError("gid_output_path is missing while with_gid=True.")
+            if len(self.gid_shard_paths) != len(self.shard_paths):
+                raise RuntimeError(
+                    "Triangle/gid shard count mismatch: "
+                    f"tri={len(self.shard_paths)}, gid={len(self.gid_shard_paths)}"
+                )
+            if self.gid_shard_sample_counts != self.shard_sample_counts:
+                raise RuntimeError(
+                    "Triangle/gid shard sample-count mismatch: "
+                    f"tri={self.shard_sample_counts}, gid={self.gid_shard_sample_counts}"
+                )
+            manifest["gid_base_output_path"] = str(self.gid_output_path)
+            manifest["gid_shards"] = [
+                {
+                    "path": str(path),
+                    "sample_count": int(sample_count),
+                    "size_bytes": int(path.stat().st_size) if path.exists() else -1,
+                }
+                for path, sample_count in zip(self.gid_shard_paths, self.gid_shard_sample_counts)
             ]
 
         with manifest_path.open("w", encoding="utf-8") as fp:
@@ -2225,7 +2415,12 @@ def _consume_worker_result(result: dict[str, Any], writer: _ShardWriter) -> dict
 
     triangles = list(result.get("triangles", []))
     meta = list(result.get("meta", []))
-    writer.add_many(triangles, meta if writer.with_meta else None)
+    gids = list(result.get("gid", []))
+    writer.add_many(
+        triangles,
+        meta if writer.with_meta else None,
+        gids if writer.with_gid else None,
+    )
     return stats
 
 
@@ -2249,6 +2444,7 @@ def process_and_save(
     norm_max: float = 1.0,
     log: bool = False,
     with_meta: bool = True,
+    gid_field: str = "",
 ) -> None:
     """Build triangulated polygon dataset and save to disk.
 
@@ -2272,6 +2468,7 @@ def process_and_save(
         norm_max: Maximum absolute normalized coordinate.
         log: Whether to save triangulation audit log JSON.
         with_meta: Whether to export one paired `*_meta*.pt` stream.
+        gid_field: Optional source attribute field exported as paired `*_gid*.pt`.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2301,10 +2498,13 @@ def process_and_save(
     timeout_safe = float(timeout_safe)
     norm_max = float(norm_max)
     with_meta = bool(with_meta)
+    gid_field = str(gid_field).strip()
     if norm_max <= 0.0:
         raise ValueError("--norm_max must be > 0.")
     if timeout_safe <= 0.0:
         raise ValueError("--timeout_safe must be > 0.")
+    if gid_field and canonical_file_type != "shp":
+        raise ValueError("--gid_field is supported only when --file_type=shp.")
 
     print(f"[INFO] Input file_type         : {canonical_file_type}")
     if canonical_file_type == "gdb":
@@ -2324,12 +2524,20 @@ def process_and_save(
     )
     print(f"[INFO] Row normalization max  : {norm_max:.3f}")
     print(f"[INFO] Write paired meta      : {with_meta}")
+    print(f"[INFO] Write paired gid       : {bool(gid_field)}")
+    if gid_field:
+        print(f"[INFO] gid field             : {gid_field}")
     if shard_size_mb > 0:
         print(f"[INFO] Sharding enabled: target {shard_size_mb:.2f} MB per output .pt")
     else:
         print("[WARN] Sharding disabled: single output .pt keeps all triangulated samples buffered until finalize().")
 
-    writer = _ShardWriter(output_path=output_path, shard_size_mb=shard_size_mb, with_meta=with_meta)
+    writer = _ShardWriter(
+        output_path=output_path,
+        shard_size_mb=shard_size_mb,
+        with_meta=with_meta,
+        with_gid=bool(gid_field),
+    )
 
     files_ok = 0
     files_failed = 0
@@ -2418,6 +2626,7 @@ def process_and_save(
                 timeout_safe=float(timeout_safe),
                 norm_max=float(norm_max),
                 enable_log=bool(log),
+                gid_field=str(gid_field),
                 writer=writer,
             )
             consume_and_merge(result)
@@ -2436,6 +2645,7 @@ def process_and_save(
             "input_file_type": canonical_file_type,
             "input_layer_selector": str(layer),
             "safe_mode": str(safe_mode),
+            "gid_field": gid_field if gid_field else None,
             "failed_row_count": int(failed_rows),
             "failed_sample_count": int(failed_samples),
             "chunk_failure_count": int(chunk_failures),
@@ -2453,6 +2663,7 @@ def process_and_save(
             "input_file_type": canonical_file_type,
             "input_layer_selector": str(layer),
             "safe_mode": str(safe_mode),
+            "gid_field": gid_field if gid_field else None,
             "part_safe": int(part_safe),
             "node_safe": int(node_safe),
             "hole_safe": int(hole_safe),
@@ -2512,11 +2723,18 @@ def process_and_save(
             for meta_shard_path in writer.meta_shard_paths:
                 meta_size_mb = meta_shard_path.stat().st_size / (1024.0 * 1024.0)
                 print(f"[INFO]   - {meta_shard_path} ({meta_size_mb:.2f} MB)")
+        if writer.with_gid and writer.gid_shard_paths:
+            print(f"[INFO] gid shards              : {len(writer.gid_shard_paths)}")
+            for gid_shard_path in writer.gid_shard_paths:
+                gid_size_mb = gid_shard_path.stat().st_size / (1024.0 * 1024.0)
+                print(f"[INFO]   - {gid_shard_path} ({gid_size_mb:.2f} MB)")
     else:
         if shard_paths:
             print(f"[INFO] Saved output           : {shard_paths[0]}")
         if with_meta and writer.meta_shard_paths:
             print(f"[INFO] Saved meta output      : {writer.meta_shard_paths[0]}")
+        if writer.with_gid and writer.gid_shard_paths:
+            print(f"[INFO] Saved gid output       : {writer.gid_shard_paths[0]}")
 
     if manifest_path is not None:
         print(f"[INFO] Shard manifest         : {manifest_path}")

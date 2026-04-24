@@ -185,6 +185,12 @@ def main() -> None:
         default=True,
         help="Whether to write paired row-meta shards (`*_meta*.pt`) alongside triangle shards.",
     )
+    parser.add_argument(
+        "--gid_field",
+        type=str,
+        default="",
+        help="Optional source attribute field to export as paired `*_gid*.pt` shards. Supported for shp only.",
+    )
     args = parser.parse_args()
     if args.file_type != "gdb" and str(args.layer).strip().lower() != "all":
         print(f"[WARN] --layer is ignored when --file_type={args.file_type}.")
@@ -231,6 +237,7 @@ def main() -> None:
         norm_max=args.norm_max,
         log=args.log,
         with_meta=args.with_meta,
+        gid_field=args.gid_field,
     )
 
 

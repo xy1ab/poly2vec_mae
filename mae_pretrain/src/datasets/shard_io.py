@@ -67,6 +67,24 @@ def load_triangle_shard(path: str | Path) -> list[Any]:
     return shard_data
 
 
+def load_gid_shard(path: str | Path) -> list[int]:
+    """Load one gid shard and validate uint64-compatible scalar payloads."""
+    shard_data = load_triangle_shard(path)
+    gid_list: list[int] = []
+    for index, value in enumerate(shard_data):
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except Exception:
+                pass
+        if not isinstance(value, int):
+            raise TypeError(f"gid shard item at index {index} is not an integer: {type(value).__name__}")
+        if value < 0:
+            raise ValueError(f"gid shard item at index {index} is negative: {value}")
+        gid_list.append(int(value))
+    return gid_list
+
+
 def _resolve_manifest_shard_paths(
     manifest_path: Path,
     data_dir: Path,
