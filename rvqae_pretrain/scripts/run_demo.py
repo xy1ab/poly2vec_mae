@@ -199,19 +199,20 @@ class demo():
         dist.broadcast_object_list(run_dir_obj, src=0)
         self.run_dir = Path(run_dir_obj[0])
 
-        dist.barrier(device_ids=[torch.device(self.device).index])
-
+        
         self.pipeline, self.ds_model, self.index_pool= self.init()
 
+        dist.barrier(device_ids=[torch.device(self.device).index])
 
         ## warm_up
-        gid_list = [i for i in range(1000)]#_parse_gid_file(args.gid_file)
+        gid_list = [i for i in range(1, 1000)]#_parse_gid_file(args.gid_file)
 
         self.eval(gid_list=gid_list,save_flag=False)
         if is_rank0:
             print("initial finish")
 
     def init(self):
+        
         ## 加载模型
         pipeline = pipeline_module.PolyRvqDecodePipeline(
             decoder_path=str(self.decoder_path),
@@ -309,52 +310,6 @@ class demo():
             torch.save(rank_outputs, output_path)
             print(f"[RANK {self.rank}] Saved demo part: {output_path.name} ({rank_sample_count} samples)", flush=True)
 
-        # dist.barrier(device_ids=[torch.device(self.device).index])
-
-        # if is_rank0:
-        #     total_progress.close()
-        #     part_records = []
-        #     for part_rank in range(self.world_size):
-        #         part_path = self.run_dir / f"demo_rank{part_rank:03d}.pt"
-        #         if not part_path.is_file():
-        #             raise FileNotFoundError(f"Missing rank output part: {part_path}")
-        #         part_samples = 0
-        #         for batch_index in range(part_rank, num_batches, self.world_size):
-        #             start = batch_index * args.batch_size
-        #             end = min(start + args.batch_size, requested_count)
-        #             part_samples += end - start
-        #         part_records.append(
-        #             {
-        #                 "path": str(part_path.resolve()),
-        #                 "rank": int(part_rank),
-        #                 "sample_count": int(part_samples),
-        #                 "size_bytes": int(part_path.stat().st_size),
-        #             }
-        #         )
-            # manifest_path = helpers.write_task_manifest(
-            #     output_dir=self.run_dir,
-            #     manifest_name="demo.manifest.json",
-            #     metadata={
-            #         "created_at": datetime.now().isoformat(timespec="seconds"),
-            #         "ind_dir": str(Path(args.ind_dir).expanduser().resolve()),
-            #         # "gid_file": str(Path(args.gid_file).expanduser().resolve()),
-            #         "model_dir": str(Path(args.model_dir).expanduser().resolve()),
-            #         "downstream_model_path": str(Path(args.downstream_model_path).expanduser().resolve()),
-            #         "decoder_path": str(decoder_path),
-            #         "quantizer_path": str(quantizer_path),
-            #         "config_path": str(config_path),
-            #         "batch_size": int(args.batch_size),
-            #         "resolution": int(args.resolution),
-            #         "world_size": int(world_size),
-            #         "requested_gids": [int(item) for item in gid_list],
-            #         "output_mode": "rank_part",
-            #     },
-            #     shard_records=part_records,
-            # )
-            # print(f"[INFO] Saved demo results to: {self.run_dir}")
-            # print(f"[INFO] Manifest: {manifest_path}")
-
-        # dist.barrier(device_ids=[torch.device(self.device).index])
 import time
 def main():
     ensure_cuda_runtime_libs()
@@ -376,7 +331,7 @@ def main():
     demo_test = demo(args,rank, world_size, device)
 
     ## get index request
-    gid_list = [i for i in range(10000)]#_parse_gid_file(args.gid_file)
+    gid_list = [i for i in range(1, 10000)]#_parse_gid_file(args.gid_file)
     t_s = time.time()
     demo_test.eval(gid_list=gid_list)
     print(time.time() - t_s)
