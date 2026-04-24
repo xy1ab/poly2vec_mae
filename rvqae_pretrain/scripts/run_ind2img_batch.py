@@ -42,11 +42,11 @@ def _preflight_validate_index_shards(ind_shards: list[Path], helpers_module) -> 
     total_samples = 0
     for shard_path in ind_shards:
         samples = helpers_module.load_torch_list(shard_path)
-        for sample_index, sample in enumerate(samples):
+        for sample_offset, sample in enumerate(samples):
             if not isinstance(sample, dict):
-                raise TypeError(f"Index shard sample must be dict: {shard_path}#{sample_index}")
-            if "indices" not in sample or "meta" not in sample:
-                raise KeyError(f"Index shard sample missing `indices`/`meta`: {shard_path}#{sample_index}")
+                raise TypeError(f"Index shard sample must be dict: {shard_path}#{sample_offset}")
+            if "indices" not in sample or "meta" not in sample or "gid" not in sample:
+                raise KeyError(f"Index shard sample missing `indices`/`meta`/`gid`: {shard_path}#{sample_offset}")
             helpers_module.normalize_indices_grid(sample["indices"])
         total_samples += len(samples)
     return total_samples
@@ -75,21 +75,21 @@ def _build_rank_output_path(output_dir: str, input_shard_path: Path, rank: int) 
     return stem_path.with_name(f"{stem_path.stem}_rank{rank:03d}{stem_path.suffix}")
 
 
-def _process_one_batch(pipeline, helpers, start_index: int, batch_samples, nicft: int):
-    """Process one index batch and return output records with global start index."""
+def _process_one_batch(pipeline, helpers, batch_samples, nicft: int):
+    """Process one index batch and return output records with gid."""
     import torch
 
     batch_indices = []
     batch_meta = []
-    batch_sample_indices = []
+    batch_gids = []
     for local_index, sample in enumerate(batch_samples):
         if not isinstance(sample, dict):
             raise TypeError(f"Index batch sample must be dict: local#{local_index}")
-        if "indices" not in sample or "meta" not in sample:
-            raise KeyError(f"Index batch sample missing `indices`/`meta`: local#{local_index}")
+        if "indices" not in sample or "meta" not in sample or "gid" not in sample:
+            raise KeyError(f"Index batch sample missing `indices`/`meta`/`gid`: local#{local_index}")
         batch_indices.append(helpers.normalize_indices_grid(sample["indices"]))
         batch_meta.append(sample["meta"])
-        batch_sample_indices.append(int(sample.get("sample_index", start_index + local_index)))
+        batch_gids.append(int(sample["gid"]))
 
     indices_batch = torch.stack(batch_indices, dim=0)
     indices_batch_u16 = helpers.to_uint16_indices(indices_batch, context="ind2img")
@@ -130,7 +130,7 @@ def _process_one_batch(pipeline, helpers, start_index: int, batch_samples, nicft
     records = []
     for sample_offset in range(len(batch_samples)):
         record = {
-            "sample_index": int(batch_sample_indices[sample_offset]),
+            "gid": int(batch_gids[sample_offset]),
             # "indices": indices_batch_u16[sample_offset].cpu(),
             # "meta": torch.as_tensor(batch_meta[sample_offset], dtype=torch.float32).cpu(),
             # "real": real_batch[sample_offset].float().cpu(),
@@ -141,7 +141,6 @@ def _process_one_batch(pipeline, helpers, start_index: int, batch_samples, nicft
         records.append(record)
 
     return {
-        "start_index": int(start_index),
         "sample_count": int(len(records)),
         "records": records,
     }
@@ -249,7 +248,6 @@ def main() -> None:
                     local_payload = _process_one_batch(
                         pipeline=pipeline,
                         helpers=helpers,
-                        start_index=int(start),
                         batch_samples=batch_samples,
                         nicft=int(args.nicft),
                     )
@@ -315,6 +313,7 @@ def main() -> None:
                 output_dir=args.output_dir,
                 manifest_name="ind2img.manifest.json",
                 metadata={
+                    "id_field": "gid",
                     "created_at": datetime.now().isoformat(timespec="seconds"),
                     "ind_dir": str(Path(args.ind_dir).expanduser().resolve()),
                     "model_dir": str(Path(args.model_dir).expanduser().resolve()),

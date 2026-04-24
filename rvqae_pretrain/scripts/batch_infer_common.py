@@ -22,6 +22,16 @@ class TriMetaShardPair:
     sample_count: int | None
 
 
+@dataclass(frozen=True)
+class TriMetaGidShardTriplet:
+    """One paired triangle/meta/gid shard descriptor."""
+
+    tri_path: Path
+    meta_path: Path
+    gid_path: Path
+    sample_count: int | None
+
+
 def resolve_runtime_device(requested_device: str) -> str:
     """Resolve runtime device with CUDA-unavailable fallback."""
     import torch
@@ -146,6 +156,16 @@ def _expected_meta_path_from_tri(tri_path: Path) -> Path:
     return tri_path.with_name(f"{meta_stem}{tri_path.suffix}")
 
 
+def _expected_gid_path_from_tri(tri_path: Path) -> Path:
+    """Infer paired gid shard path from one triangle shard path."""
+    stem = tri_path.stem
+    if "_tri" in stem:
+        gid_stem = stem.replace("_tri", "_gid", 1)
+    else:
+        gid_stem = f"{stem}_gid"
+    return tri_path.with_name(f"{gid_stem}{tri_path.suffix}")
+
+
 def resolve_tri_meta_pairs(tri_dir: str | Path) -> list[TriMetaShardPair]:
     """Resolve paired triangle/meta shards from input directory."""
     base = Path(tri_dir).expanduser().resolve()
@@ -219,6 +239,115 @@ def resolve_tri_meta_pairs(tri_dir: str | Path) -> list[TriMetaShardPair]:
     return pairs
 
 
+def resolve_tri_meta_gid_triplets(tri_dir: str | Path) -> list[TriMetaGidShardTriplet]:
+    """Resolve paired triangle/meta/gid shards from input directory."""
+    base = Path(tri_dir).expanduser().resolve()
+    if not base.is_dir():
+        raise NotADirectoryError(f"`tri_dir` is not a directory: {base}")
+
+    manifest_files = sorted(path.resolve() for path in base.glob("*.manifest.json") if path.is_file())
+    if len(manifest_files) == 1:
+        manifest_path = manifest_files[0]
+        payload = _load_manifest(manifest_path)
+        tri_entries = payload.get("shards")
+        meta_entries = payload.get("meta_shards")
+        gid_entries = payload.get("gid_shards")
+        if isinstance(tri_entries, list) and isinstance(meta_entries, list) and isinstance(gid_entries, list):
+            if len(tri_entries) != len(meta_entries) or len(tri_entries) != len(gid_entries):
+                raise ValueError(
+                    "Manifest triangle/meta/gid shard count mismatch: "
+                    f"tri={len(tri_entries)}, meta={len(meta_entries)}, gid={len(gid_entries)}"
+                )
+            if not tri_entries:
+                raise ValueError(f"Manifest shard lists are empty: {manifest_path}")
+
+            triplets: list[TriMetaGidShardTriplet] = []
+            for tri_entry, meta_entry, gid_entry in zip(tri_entries, meta_entries, gid_entries):
+                if not isinstance(tri_entry, dict) or not isinstance(meta_entry, dict) or not isinstance(gid_entry, dict):
+                    raise ValueError(f"Manifest shard entries must be objects: {manifest_path}")
+                tri_raw = tri_entry.get("path")
+                meta_raw = meta_entry.get("path")
+                gid_raw = gid_entry.get("path")
+                if not tri_raw or not meta_raw or not gid_raw:
+                    raise ValueError(f"Manifest shard entry missing `path`: {manifest_path}")
+
+                tri_path = _resolve_manifest_entry_path(tri_raw, manifest_path)
+                meta_path = _resolve_manifest_entry_path(meta_raw, manifest_path)
+                gid_path = _resolve_manifest_entry_path(gid_raw, manifest_path)
+                if not tri_path.is_file():
+                    raise FileNotFoundError(f"Triangle shard listed in manifest does not exist: {tri_path}")
+                if not meta_path.is_file():
+                    raise FileNotFoundError(f"Meta shard listed in manifest does not exist: {meta_path}")
+                if not gid_path.is_file():
+                    raise FileNotFoundError(f"gid shard listed in manifest does not exist: {gid_path}")
+
+                tri_count = _extract_sample_count(tri_entry)
+                meta_count = _extract_sample_count(meta_entry)
+                gid_count = _extract_sample_count(gid_entry)
+                known_counts = [count for count in (tri_count, meta_count, gid_count) if count is not None]
+                if known_counts and len(set(known_counts)) != 1:
+                    raise ValueError(
+                        "Manifest sample_count mismatch for triplet "
+                        f"tri={tri_path.name}, meta={meta_path.name}, gid={gid_path.name}: "
+                        f"{tri_count}, {meta_count}, {gid_count}"
+                    )
+                sample_count = known_counts[0] if known_counts else None
+                triplets.append(
+                    TriMetaGidShardTriplet(
+                        tri_path=tri_path,
+                        meta_path=meta_path,
+                        gid_path=gid_path,
+                        sample_count=sample_count,
+                    )
+                )
+
+            return triplets
+
+    tri_files = sorted(path.resolve() for path in base.glob("*.pt") if path.is_file() and "_meta" not in path.stem and "_gid" not in path.stem)
+    meta_files = sorted(path.resolve() for path in base.glob("*_meta*.pt") if path.is_file())
+    gid_files = sorted(path.resolve() for path in base.glob("*_gid*.pt") if path.is_file())
+    if not tri_files:
+        raise FileNotFoundError(f"No triangle shard `.pt` files found under: {base}")
+    if not meta_files:
+        raise FileNotFoundError(f"No meta shard `.pt` files found under: {base}")
+    if not gid_files:
+        raise FileNotFoundError(f"No gid shard `.pt` files found under: {base}")
+
+    matched_meta: set[Path] = set()
+    matched_gid: set[Path] = set()
+    triplets: list[TriMetaGidShardTriplet] = []
+    for tri_path in tri_files:
+        meta_path = _expected_meta_path_from_tri(tri_path).resolve()
+        gid_path = _expected_gid_path_from_tri(tri_path).resolve()
+        if not meta_path.is_file():
+            raise FileNotFoundError(f"Failed to locate paired meta shard for {tri_path.name}: expected {meta_path.name}")
+        if not gid_path.is_file():
+            raise FileNotFoundError(f"Failed to locate paired gid shard for {tri_path.name}: expected {gid_path.name}")
+        matched_meta.add(meta_path)
+        matched_gid.add(gid_path)
+        triplets.append(
+            TriMetaGidShardTriplet(
+                tri_path=tri_path,
+                meta_path=meta_path,
+                gid_path=gid_path,
+                sample_count=None,
+            )
+        )
+
+    extra_meta = [path for path in meta_files if path not in matched_meta]
+    if extra_meta:
+        raise ValueError(
+            f"Found meta shard(s) without paired triangle shards: {[path.name for path in extra_meta[:5]]}"
+        )
+    extra_gid = [path for path in gid_files if path not in matched_gid]
+    if extra_gid:
+        raise ValueError(
+            f"Found gid shard(s) without paired triangle shards: {[path.name for path in extra_gid[:5]]}"
+        )
+
+    return triplets
+
+
 def preflight_validate_tri_meta_pairs(pairs: list[TriMetaShardPair]) -> int:
     """Validate triangle/meta sample-count consistency before inference starts."""
     total_samples = 0
@@ -233,6 +362,27 @@ def preflight_validate_tri_meta_pairs(pairs: list[TriMetaShardPair]) -> int:
             raise ValueError(
                 f"Triangle/meta sample count mismatch for {pair.tri_path.name} and {pair.meta_path.name}: "
                 f"{len(tri_samples)} vs {len(meta_samples)}"
+            )
+        total_samples += len(tri_samples)
+    return total_samples
+
+
+def preflight_validate_tri_meta_gid_triplets(triplets: list[TriMetaGidShardTriplet]) -> int:
+    """Validate triangle/meta/gid sample-count consistency before inference starts."""
+    total_samples = 0
+    for triplet in triplets:
+        if triplet.sample_count is not None:
+            total_samples += int(triplet.sample_count)
+            continue
+
+        tri_samples = load_torch_list(triplet.tri_path)
+        meta_samples = load_torch_list(triplet.meta_path)
+        gid_samples = load_torch_list(triplet.gid_path)
+        if len(tri_samples) != len(meta_samples) or len(tri_samples) != len(gid_samples):
+            raise ValueError(
+                "Triangle/meta/gid sample count mismatch for "
+                f"{triplet.tri_path.name}, {triplet.meta_path.name}, {triplet.gid_path.name}: "
+                f"{len(tri_samples)}, {len(meta_samples)}, {len(gid_samples)}"
             )
         total_samples += len(tri_samples)
     return total_samples

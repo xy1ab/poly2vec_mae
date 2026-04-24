@@ -72,14 +72,14 @@ def rasterize_triangles(tris_batch, sample_nicfts) -> list[np.ndarray]:
 def _process_one_batch(
     pipeline,
     helpers,
-    start_index: int,
     tri_batch,
     meta_batch,
+    gid_batch,
     nicft: int,
     resolution: int,
     rec_flag: bool,
 ):
-    """Process one triangle batch and return output records with global start index."""
+    """Process one triangle batch and return output records with gid."""
     import torch
 
     imgs = pipeline.triangles_to_images(tri_batch)
@@ -143,7 +143,7 @@ def _process_one_batch(
     records = []
     for sample_offset in range(len(tri_batch)):
         record = {
-            "sample_index": int(start_index + sample_offset),
+            "gid": int(gid_batch[sample_offset]),
             "indices": indices_batch_u16[sample_offset].cpu(),
             "meta": torch.as_tensor(meta_batch[sample_offset], dtype=torch.float32).cpu().numpy(),
             "real": real_batch[sample_offset].float().cpu().numpy(),
@@ -156,7 +156,6 @@ def _process_one_batch(
         records.append(record)
 
     return {
-        "start_index": int(start_index),
         "sample_count": int(len(records)),
         "records": records,
     }
@@ -212,14 +211,14 @@ def main() -> None:
         is_rank0 = rank == 0
 
         checkpoint_path, config_path = helpers.resolve_model_paths(args.model_dir)
-        tri_meta_pairs = helpers.resolve_tri_meta_pairs(args.tri_dir)
+        tri_meta_gid_triplets = helpers.resolve_tri_meta_gid_triplets(args.tri_dir)
 
         total_samples = 0
         if is_rank0:
             print("[INFO] Preflight started.", flush=True)
-            total_samples = helpers.preflight_validate_tri_meta_pairs(tri_meta_pairs)
+            total_samples = helpers.preflight_validate_tri_meta_gid_triplets(tri_meta_gid_triplets)
             print(
-                f"[INFO] Tri/meta preflight passed: {len(tri_meta_pairs)} shard pairs, "
+                f"[INFO] Tri/meta/gid preflight passed: {len(tri_meta_gid_triplets)} shard triplets, "
                 f"total_samples={total_samples}, world_size={world_size}, device={device}",
                 flush=True,
             )
@@ -245,22 +244,24 @@ def main() -> None:
         if is_rank0:
             total_progress = tqdm(total=total_samples, desc="tri_forward total", unit="sample", position=0)
 
-        for shard_index, pair in enumerate(tri_meta_pairs, start=1):
+        for shard_index, pair in enumerate(tri_meta_gid_triplets, start=1):
             if is_rank0:
-                print(f"[INFO] Loading shard {shard_index}/{len(tri_meta_pairs)}: {pair.tri_path.name}", flush=True)
+                print(f"[INFO] Loading shard {shard_index}/{len(tri_meta_gid_triplets)}: {pair.tri_path.name}", flush=True)
             tri_samples = helpers.load_torch_list(pair.tri_path)
             meta_samples = helpers.load_torch_list(pair.meta_path)
-            if len(tri_samples) != len(meta_samples):
+            gid_samples = helpers.load_torch_list(pair.gid_path)
+            if len(tri_samples) != len(meta_samples) or len(tri_samples) != len(gid_samples):
                 raise ValueError(
-                    f"Triangle/meta sample count mismatch for {pair.tri_path.name} and {pair.meta_path.name}: "
-                    f"{len(tri_samples)} vs {len(meta_samples)}"
+                    "Triangle/meta/gid sample count mismatch for "
+                    f"{pair.tri_path.name}, {pair.meta_path.name}, {pair.gid_path.name}: "
+                    f"{len(tri_samples)}, {len(meta_samples)}, {len(gid_samples)}"
                 )
 
             shard_size = len(tri_samples)
             shard_progress = (
                 tqdm(
                     total=shard_size,
-                    desc=f"tri_forward shard {shard_index}/{len(tri_meta_pairs)}",
+                    desc=f"tri_forward shard {shard_index}/{len(tri_meta_gid_triplets)}",
                     unit="sample",
                     leave=False,
                     position=1,
@@ -274,7 +275,7 @@ def main() -> None:
             rank_sample_count = 0
             if is_rank0:
                 print(
-                    f"[INFO] Processing shard {shard_index}/{len(tri_meta_pairs)}: "
+                    f"[INFO] Processing shard {shard_index}/{len(tri_meta_gid_triplets)}: "
                     f"samples={shard_size}, batches={num_batches}, world_size={world_size}, "
                     f"nicft={int(args.nicft)}, resolution={int(args.resolution)}, "
                     f"rec_flag={bool(args.rec_flag)}, output_mode=rank_part",
@@ -294,12 +295,13 @@ def main() -> None:
                         )
                     tri_batch = [np.asarray(sample, dtype=np.float32) for sample in tri_samples[start:end]]
                     meta_batch = meta_samples[start:end]
+                    gid_batch = gid_samples[start:end]
                     local_payload = _process_one_batch(
                         pipeline=pipeline,
                         helpers=helpers,
-                        start_index=int(start),
                         tri_batch=tri_batch,
                         meta_batch=meta_batch,
+                        gid_batch=gid_batch,
                         nicft=int(args.nicft),
                         resolution=int(args.resolution),
                         rec_flag=bool(args.rec_flag),
@@ -327,7 +329,7 @@ def main() -> None:
             output_path = _build_rank_output_path(args.output_dir, pair.tri_path, rank)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             print(
-                f"[RANK {rank}] Saving part shard {shard_index}/{len(tri_meta_pairs)}: "
+                f"[RANK {rank}] Saving part shard {shard_index}/{len(tri_meta_gid_triplets)}: "
                 f"{output_path.name} ({rank_sample_count} samples)",
                 flush=True,
             )
@@ -352,10 +354,11 @@ def main() -> None:
                             "size_bytes": int(part_path.stat().st_size),
                             "input_tri_path": str(pair.tri_path),
                             "input_meta_path": str(pair.meta_path),
+                            "input_gid_path": str(pair.gid_path),
                         }
                     )
                 print(
-                    f"[INFO] Forwarded shard {shard_index}/{len(tri_meta_pairs)}: {pair.tri_path.name} "
+                    f"[INFO] Forwarded shard {shard_index}/{len(tri_meta_gid_triplets)}: {pair.tri_path.name} "
                     f"-> {world_size} rank part files"
                 )
                 shard_progress.close()
@@ -368,6 +371,7 @@ def main() -> None:
                 output_dir=args.output_dir,
                 manifest_name="tri_forward.manifest.json",
                 metadata={
+                    "id_field": "gid",
                     "created_at": datetime.now().isoformat(timespec="seconds"),
                     "tri_dir": str(Path(args.tri_dir).expanduser().resolve()),
                     "model_dir": str(Path(args.model_dir).expanduser().resolve()),
