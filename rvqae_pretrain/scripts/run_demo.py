@@ -83,20 +83,22 @@ def post_process_results(sigmoid_output, original_sizes, threshold=0.5):
     return final_masks
 
 def _process_one_batch(pipeline, ds_model, helpers, start_index: int, batch_samples, resolution:int=5, nicft: int=256):
-    """Process one index batch and return output records with global start index."""
+    """Process one index batch and return output records with gid."""
     import torch
 
     batch_indices = []
     batch_meta = []
-    batch_sample_indices = []
+    batch_gids = []
     for local_index, sample in enumerate(batch_samples):
         if not isinstance(sample, dict):
             raise TypeError(f"Index batch sample must be dict: local#{local_index}")
         if "indices" not in sample or "meta" not in sample:
             raise KeyError(f"Index batch sample missing `indices`/`meta`: local#{local_index}")
+        if "gid" not in sample:
+            raise KeyError(f"Index batch sample missing `gid`: local#{local_index}")
         batch_indices.append(helpers.normalize_indices_grid(sample["indices"]))
         batch_meta.append(sample["meta"])
-        batch_sample_indices.append(int(sample.get("sample_index", start_index + local_index)))
+        batch_gids.append(int(sample["gid"]))
 
     indices_batch = torch.stack(batch_indices, dim=0)
     # indices_batch_u16 = helpers.to_uint16_indices(indices_batch, context="ind2img")
@@ -147,7 +149,7 @@ def _process_one_batch(pipeline, ds_model, helpers, start_index: int, batch_samp
     for sample_offset in range(len(batch_samples)):
         record = {
             "request_position": int(start_index + sample_offset),
-            "sample_index": int(batch_sample_indices[sample_offset]),
+            "gid": int(batch_gids[sample_offset]),
             "meta_data": batch_meta[sample_offset],
             "pred_bin": pred_bin[sample_offset]
         }
@@ -158,10 +160,10 @@ def _process_one_batch(pipeline, ds_model, helpers, start_index: int, batch_samp
         "records": records,
     }
 
-def _parse_sample_index_file(path: str | Path) -> list[int]:
+def _parse_gid_file(path: str | Path) -> list[int]:
     index_path = Path(path).expanduser().resolve()
     if not index_path.is_file():
-        raise FileNotFoundError(f"`sample_index_file` does not exist: {index_path}")
+        raise FileNotFoundError(f"`gid_file` does not exist: {index_path}")
 
     values: list[int] = []
     with index_path.open("r", encoding="utf-8") as fp:
@@ -175,10 +177,10 @@ def _parse_sample_index_file(path: str | Path) -> list[int]:
                         values.append(int(token))
                     except ValueError as exc:
                         raise ValueError(
-                            f"Invalid sample index `{token}` at {index_path}:{line_number}"
+                            f"Invalid gid `{token}` at {index_path}:{line_number}"
                         ) from exc
     if not values:
-        raise ValueError(f"`sample_index_file` contains no sample indices: {index_path}")
+        raise ValueError(f"`gid_file` contains no gid values: {index_path}")
     return values
 
 
@@ -203,9 +205,9 @@ class demo():
 
 
         ## warm_up
-        sample_index_list = [i for i in range(1000)]#_parse_sample_index_file(args.sample_index_file)
+        gid_list = [i for i in range(1000)]#_parse_gid_file(args.gid_file)
 
-        self.eval(sample_index_list=sample_index_list,save_flag=False)
+        self.eval(gid_list=gid_list,save_flag=False)
         if is_rank0:
             print("initial finish")
 
@@ -238,17 +240,17 @@ class demo():
             for local_index, sample in enumerate(samples):
                 if not isinstance(sample, dict):
                     raise TypeError(f"Index shard sample must be dict: {shard_path}#{local_index}")
-                if "sample_index" not in sample:
-                    raise KeyError(f"Index shard sample missing `sample_index`: {shard_path}#{local_index}")
+                if "gid" not in sample:
+                    raise KeyError(f"Index shard sample missing `gid`: {shard_path}#{local_index}")
                 if "indices" not in sample or "meta" not in sample:
                     raise KeyError(f"Index shard sample missing `indices`/`meta`: {shard_path}#{local_index}")
 
-                sample_index = int(sample["sample_index"])
-                if sample_index in index_pool:
-                    raise ValueError(f"Duplicate sample_index found in index pool: {sample_index}")
+                gid = int(sample["gid"])
+                if gid in index_pool:
+                    raise ValueError(f"Duplicate gid found in index pool: {gid}")
 
-                index_pool[sample_index] = {
-                    "sample_index": sample_index,
+                index_pool[gid] = {
+                    "gid": gid,
                     "indices": helpers.normalize_indices_grid(sample["indices"]).to(device=self.device, dtype=torch.long),
                     "meta": sample["meta"],
                 }
@@ -256,11 +258,11 @@ class demo():
         return pipeline, ds_model, index_pool
 
 
-    def eval(self, sample_index_list, save_flag=True):
+    def eval(self, gid_list, save_flag=True):
         is_rank0 = self.rank == 0
 
-        required_indices = [int(item) for item in sample_index_list]
-        requested_samples = [self.index_pool[sample_index] for sample_index in required_indices]
+        required_gids = [int(item) for item in gid_list]
+        requested_samples = [self.index_pool[gid] for gid in required_gids]
  
         requested_count = len(requested_samples)
         
@@ -335,7 +337,7 @@ class demo():
             #     metadata={
             #         "created_at": datetime.now().isoformat(timespec="seconds"),
             #         "ind_dir": str(Path(args.ind_dir).expanduser().resolve()),
-            #         # "sample_index_file": str(Path(args.sample_index_file).expanduser().resolve()),
+            #         # "gid_file": str(Path(args.gid_file).expanduser().resolve()),
             #         "model_dir": str(Path(args.model_dir).expanduser().resolve()),
             #         "downstream_model_path": str(Path(args.downstream_model_path).expanduser().resolve()),
             #         "decoder_path": str(decoder_path),
@@ -344,7 +346,7 @@ class demo():
             #         "batch_size": int(args.batch_size),
             #         "resolution": int(args.resolution),
             #         "world_size": int(world_size),
-            #         "requested_sample_indices": [int(item) for item in sample_index_list],
+            #         "requested_gids": [int(item) for item in gid_list],
             #         "output_mode": "rank_part",
             #     },
             #     shard_records=part_records,
@@ -357,9 +359,9 @@ import time
 def main():
     ensure_cuda_runtime_libs()
 
-    parser = argparse.ArgumentParser(description="Retrieve RVQ indices by sample_index and run RVQAE+UNet demo inference.")
+    parser = argparse.ArgumentParser(description="Retrieve RVQ indices by gid and run RVQAE+UNet demo inference.")
     parser.add_argument("--ind_dir", type=str, required=True, help="Directory containing tri2ind shard files.")
-    # parser.add_argument("--sample_index_file", type=str, required=True, help="Text file containing requested sample_index values.")
+    # parser.add_argument("--gid_file", type=str, required=True, help="Text file containing requested gid values.")
     parser.add_argument("--model_dir", type=str, required=True, help="Training `best` directory or its parent.")
     parser.add_argument("--downstream_model_path", type=str, required=True, help="Path to downstream UNet checkpoint.")
     parser.add_argument("--output_dir", type=str, required=True, help="Root output directory for timestamped demo results.")
@@ -374,9 +376,9 @@ def main():
     demo_test = demo(args,rank, world_size, device)
 
     ## get index request
-    sample_index_list = [i for i in range(10000)]#_parse_sample_index_file(args.sample_index_file)
+    gid_list = [i for i in range(10000)]#_parse_gid_file(args.gid_file)
     t_s = time.time()
-    demo_test.eval(sample_index_list=sample_index_list)
+    demo_test.eval(gid_list=gid_list)
     print(time.time() - t_s)
 
     dist.destroy_process_group()
