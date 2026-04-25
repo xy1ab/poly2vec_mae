@@ -25,7 +25,7 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(_REPO_ROOT))
 
     ensure_cuda_runtime_libs = importlib.import_module(
-        "mae_pretrain.scripts.runtime_bootstrap"
+        "rvqae_pretrain.scripts.runtime_bootstrap"
     ).ensure_cuda_runtime_libs
 else:
     from .runtime_bootstrap import ensure_cuda_runtime_libs
@@ -35,7 +35,7 @@ def _inject_repo_root() -> Path:
     """Inject repository root into `sys.path` for direct script execution.
 
     Returns:
-        `mae_pretrain` project root path.
+        `rvqae_pretrain` project root path.
     """
     current_dir = Path(__file__).resolve().parent
     project_root = current_dir.parent
@@ -62,7 +62,7 @@ def main() -> None:
     ensure_cuda_runtime_libs()
     project_root = _inject_repo_root()
     if __package__ in {None, ""}:
-        build_module = importlib.import_module("mae_pretrain.src.datasets.build_dataset_triangle")
+        build_module = importlib.import_module("rvqae_pretrain.src.datasets.build_dataset_triangle")
     else:
         from ..src.datasets import build_dataset_triangle as build_module
     process_and_save = build_module.process_and_save

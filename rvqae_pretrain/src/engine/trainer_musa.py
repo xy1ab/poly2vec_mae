@@ -118,6 +118,10 @@ _RUN_CONFIG_KEYS = (
     "lr",
     "weight_decay",
     "grad_clip_norm",
+    "collapse_mag_ratio",
+    "collapse_phase_ratio",
+    "collapse_baseline_steps",
+    "collapse_patience",
     "augment_times",
     "precision",
     "checkpoint_dtype",
@@ -131,6 +135,10 @@ _RESUME_RUNTIME_OVERRIDE_KEYS = {
     "lr",
     "weight_decay",
     "grad_clip_norm",
+    "collapse_mag_ratio",
+    "collapse_phase_ratio",
+    "collapse_baseline_steps",
+    "collapse_patience",
     "eval_every",
     "log_interval",
     "gpu",
@@ -139,6 +147,9 @@ _RESUME_RUNTIME_OVERRIDE_KEYS = {
 
 
 _RESUME_LOCKED_KEYS = set(_RUN_CONFIG_KEYS) - _RESUME_RUNTIME_OVERRIDE_KEYS
+COLLAPSE_EXIT_CODE = 88
+_COLLAPSE_TRIGGER_NONE_RANK = 2**30
+_COLLAPSE_DIAG_FILENAME = "collapse_guard_last.json"
 
 
 def mag_phase_to_real_imag(mag_log: torch.Tensor, phase: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -536,6 +547,16 @@ def _validate_training_args(args) -> None:
     _validate_run_name(args.run_name)
     if args.grad_clip_norm < 0:
         raise ValueError(f"`grad_clip_norm` must be >= 0, got {args.grad_clip_norm}")
+    if args.collapse_mag_ratio < 1.0:
+        raise ValueError(f"`collapse_mag_ratio` must be >= 1.0, got {args.collapse_mag_ratio}")
+    if args.collapse_phase_ratio < 1.0:
+        raise ValueError(f"`collapse_phase_ratio` must be >= 1.0, got {args.collapse_phase_ratio}")
+    if args.collapse_baseline_steps <= 0:
+        raise ValueError(
+            f"`collapse_baseline_steps` must be > 0, got {args.collapse_baseline_steps}"
+        )
+    if args.collapse_patience <= 0:
+        raise ValueError(f"`collapse_patience` must be > 0, got {args.collapse_patience}")
     if args.batch_size <= 0:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
     if args.patch_size <= 0:
@@ -697,6 +718,190 @@ def _write_json(path: str | Path, payload: dict) -> Path:
     with out_path.open("w", encoding="utf-8") as fp:
         json.dump(payload, fp, indent=4, ensure_ascii=False)
     return out_path
+
+
+def _scalar_float(value) -> float:
+    """Convert a scalar-like value to a JSON-friendly float."""
+    if torch.is_tensor(value):
+        return float(value.detach().float().item())
+    return float(value)
+
+
+def _metric_list(value, *, as_int: bool = False) -> list[float] | list[int] | None:
+    """Convert scalar/vector metric tensors into plain Python lists."""
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        items = value.detach().float().flatten().cpu().tolist()
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    if as_int:
+        return [int(round(float(item))) for item in items]
+    return [float(item) for item in items]
+
+
+def _median_float(values: list[float]) -> float:
+    """Return a deterministic median without depending on numpy."""
+    sorted_values = sorted(float(item) for item in values)
+    midpoint = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        return sorted_values[midpoint]
+    return 0.5 * (sorted_values[midpoint - 1] + sorted_values[midpoint])
+
+
+class _CollapseGuard:
+    """Detect irreversible-looking reconstruction loss spikes from recent train steps."""
+
+    def __init__(
+        self,
+        *,
+        baseline_steps: int,
+        mag_ratio: float,
+        phase_ratio: float,
+        patience: int,
+    ) -> None:
+        self.baseline_steps = int(baseline_steps)
+        self.mag_ratio = float(mag_ratio)
+        self.phase_ratio = float(phase_ratio)
+        self.patience = int(patience)
+        self.mag_window: list[float] = []
+        self.phase_window: list[float] = []
+        self.bad_steps = 0
+        self.observed_steps = 0
+
+    def _append(self, mag_value: float, phase_value: float) -> None:
+        self.mag_window.append(float(mag_value))
+        self.phase_window.append(float(phase_value))
+        if len(self.mag_window) > self.baseline_steps:
+            self.mag_window.pop(0)
+        if len(self.phase_window) > self.baseline_steps:
+            self.phase_window.pop(0)
+        self.observed_steps += 1
+
+    def state_dict(self) -> dict:
+        """Serialize only runtime detector history, not threshold configuration."""
+        return {
+            "mag_window": list(self.mag_window),
+            "phase_window": list(self.phase_window),
+            "bad_steps": int(self.bad_steps),
+            "observed_steps": int(self.observed_steps),
+        }
+
+    def load_state_dict(self, state: dict | None) -> None:
+        """Restore detector history while honoring current CLI thresholds."""
+        if not state:
+            return
+        self.mag_window = [float(item) for item in state.get("mag_window", [])][-self.baseline_steps :]
+        self.phase_window = [float(item) for item in state.get("phase_window", [])][-self.baseline_steps :]
+        self.bad_steps = max(0, int(state.get("bad_steps", 0)))
+        self.observed_steps = max(0, int(state.get("observed_steps", len(self.mag_window))))
+
+    @staticmethod
+    def _ratio_or_none(value: float, baseline: float | None) -> float | None:
+        if baseline is None or baseline <= 0.0:
+            return None
+        return float(value) / float(baseline)
+
+    def check(
+        self,
+        *,
+        step_outputs: dict,
+        epoch: int,
+        step: int,
+        use_vq: bool,
+        current_vq_beta: float,
+    ) -> tuple[bool, dict]:
+        mag_value = _scalar_float(step_outputs["loss_mag"])
+        phase_value = _scalar_float(step_outputs["loss_phase"])
+        total_value = _scalar_float(step_outputs["loss_total"])
+        weighted_vq_value = _scalar_float(step_outputs["weighted_vq"])
+        raw_vq_value = _scalar_float(step_outputs["vq_loss"])
+
+        enough_baseline = (
+            len(self.mag_window) >= self.baseline_steps
+            and len(self.phase_window) >= self.baseline_steps
+        )
+        mag_baseline = _median_float(self.mag_window) if enough_baseline else None
+        phase_baseline = _median_float(self.phase_window) if enough_baseline else None
+        mag_current_ratio = self._ratio_or_none(mag_value, mag_baseline)
+        phase_current_ratio = self._ratio_or_none(phase_value, phase_baseline)
+
+        reasons = []
+        if mag_current_ratio is not None and mag_current_ratio > self.mag_ratio:
+            reasons.append("mag")
+        if phase_current_ratio is not None and phase_current_ratio > self.phase_ratio:
+            reasons.append("phase")
+
+        if reasons:
+            self.bad_steps += 1
+        else:
+            self.bad_steps = 0
+            self._append(mag_value, phase_value)
+
+        triggered = bool(reasons and self.bad_steps >= self.patience)
+        outputs = step_outputs["outputs"]
+        payload = {
+            "epoch": int(epoch + 1),
+            "step": int(step),
+            "stage": "RVQAE" if use_vq else "AE warmup",
+            "use_vq": bool(use_vq),
+            "vq_beta": float(current_vq_beta),
+            "triggered": triggered,
+            "reasons": reasons,
+            "consecutive_bad_steps": int(self.bad_steps),
+            "baseline_steps": int(self.baseline_steps),
+            "observed_steps": int(self.observed_steps),
+            "thresholds": {
+                "mag_ratio": float(self.mag_ratio),
+                "phase_ratio": float(self.phase_ratio),
+            },
+            "loss": {
+                "total": total_value,
+                "mag": mag_value,
+                "phase": phase_value,
+                "vq_raw": raw_vq_value,
+                "vq_weighted": weighted_vq_value,
+            },
+            "baseline": {
+                "mag": mag_baseline,
+                "phase": phase_baseline,
+            },
+            "current_ratio": {
+                "mag": mag_current_ratio,
+                "phase": phase_current_ratio,
+            },
+            "vq": {
+                "perplexity": _metric_list(outputs.perplexity) if triggered else None,
+                "active_codes": _metric_list(outputs.active_codes, as_int=True) if triggered else None,
+            },
+        }
+        return triggered, payload
+
+
+def _sync_collapse_status(
+    *,
+    local_triggered: bool,
+    device: torch.device,
+    dist_ctx: DistContext,
+) -> tuple[bool, int | None]:
+    """Synchronize collapse decisions so every rank exits through the same path."""
+    flag = torch.tensor([int(local_triggered)], device=device, dtype=torch.int32)
+    trigger_rank = torch.tensor(
+        [dist_ctx.rank if local_triggered else _COLLAPSE_TRIGGER_NONE_RANK],
+        device=device,
+        dtype=torch.int64,
+    )
+    if dist_ctx.enabled and dist.is_initialized():
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        dist.all_reduce(trigger_rank, op=dist.ReduceOp.MIN)
+    if int(flag.item()) == 0:
+        return False, None
+    rank_value = int(trigger_rank.item())
+    if rank_value >= _COLLAPSE_TRIGGER_NONE_RANK:
+        rank_value = int(dist_ctx.rank)
+    return True, rank_value
 
 
 def _sync_run_metadata(best_dir: Path, ckpt_dir: Path, run_config: dict, model_config: dict) -> None:
@@ -1867,6 +2072,15 @@ def train_main(args) -> None:
     if resume_state is not None:
         restore_rng_state(resume_state.get("rng_state"))
 
+    collapse_guard = _CollapseGuard(
+        baseline_steps=args.collapse_baseline_steps,
+        mag_ratio=args.collapse_mag_ratio,
+        phase_ratio=args.collapse_phase_ratio,
+        patience=args.collapse_patience,
+    )
+    if resume_state is not None:
+        collapse_guard.load_state_dict(resume_state.get("collapse_guard_state"))
+
     prev_vq_debug_active = None
 
     try:
@@ -1982,6 +2196,38 @@ def train_main(args) -> None:
                     stage="train_loss",
                 )
                 loss = step_outputs["loss_total"]
+                local_collapse_triggered, collapse_payload = collapse_guard.check(
+                    step_outputs=step_outputs,
+                    epoch=epoch,
+                    step=step,
+                    use_vq=use_vq,
+                    current_vq_beta=current_vq_beta,
+                )
+                collapse_triggered, collapse_trigger_rank = _sync_collapse_status(
+                    local_triggered=local_collapse_triggered,
+                    device=device,
+                    dist_ctx=dist_ctx,
+                )
+                if collapse_triggered:
+                    collapse_payload["global_triggered"] = True
+                    collapse_payload["trigger_rank"] = collapse_trigger_rank
+                    collapse_payload["local_rank"] = int(dist_ctx.rank)
+                    collapse_payload["exit_code"] = COLLAPSE_EXIT_CODE
+                    if is_main_process(dist_ctx):
+                        _write_json(ckpt_dir / _COLLAPSE_DIAG_FILENAME, collapse_payload)
+                        reasons = ",".join(collapse_payload.get("reasons") or ["remote_rank"])
+                        mag_ratio = collapse_payload["current_ratio"]["mag"]
+                        phase_ratio = collapse_payload["current_ratio"]["phase"]
+                        print(
+                            "[COLLAPSE] "
+                            f"ep={epoch + 1} step={step} trigger_rank={collapse_trigger_rank} "
+                            f"reasons={reasons} mag_ratio={_format_optional(mag_ratio)} "
+                            f"phase_ratio={_format_optional(phase_ratio)} "
+                            f"exit_code={COLLAPSE_EXIT_CODE}. "
+                            "Latest epoch checkpoint will be used by auto-resume."
+                        )
+                    distributed_barrier(dist_ctx)
+                    raise SystemExit(COLLAPSE_EXIT_CODE)
                 grad_norm, grad_clipped = None, False
 
                 if scaler.is_enabled():
@@ -2240,6 +2486,7 @@ def train_main(args) -> None:
                     save_training_state(best_dir / "quantizer.pth", model_to_save.quantizer.state_dict())
                     print(f"  [Best] Updated best checkpoint at epoch {epoch + 1} | val={best_val_loss:.4f}")
 
+            if is_main_process(dist_ctx):
                 train_state = {
                     "checkpoint_version": 1,
                     "completed_epoch": epoch + 1,
@@ -2249,6 +2496,7 @@ def train_main(args) -> None:
                     "scheduler_state": scheduler.state_dict(),
                     "scaler_state": scaler.state_dict(),
                     "rng_state": capture_rng_state(),
+                    "collapse_guard_state": collapse_guard.state_dict(),
                     "train_indices": train_indices,
                     "val_indices": val_indices,
                     "run_config": run_config,
@@ -2359,6 +2607,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--grad_clip_norm", type=float, default=0.0)
     parser.add_argument("--grad_debug", action="store_true")
+    parser.add_argument("--collapse_mag_ratio", type=float, default=2.0)
+    parser.add_argument("--collapse_phase_ratio", type=float, default=2.0)
+    parser.add_argument("--collapse_baseline_steps", type=int, default=100)
+    parser.add_argument("--collapse_patience", type=int, default=1)
     parser.add_argument("--augment_times", type=int, default=10)
 
     parser.add_argument("--precision", type=str, default="bf16")

@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
-import multiprocessing as mp
+import os
 from pathlib import Path
 import sys
 
@@ -28,10 +27,6 @@ else:
     from .runtime_bootstrap import ensure_cuda_runtime_libs
 
 
-_WORKER_PIPELINE = None
-_WORKER_HELPERS = None
-
-
 def _inject_repo_root() -> Path:
     current_dir = Path(__file__).resolve().parent
     project_root = current_dir.parent
@@ -41,53 +36,48 @@ def _inject_repo_root() -> Path:
     return project_root
 
 
-def _init_worker(repo_root: str, checkpoint_path: str, config_path: str, device: str) -> None:
-    """Initialize one per-process inference pipeline bound to one device."""
-    global _WORKER_PIPELINE, _WORKER_HELPERS
+def _setup_distributed(args, helpers):
+    import torch
+    import torch.distributed as dist
 
-    repo_root = str(repo_root)
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-    import importlib
-
-    pipeline_module = importlib.import_module("rvqae_pretrain.src.engine.pipeline")
-    _WORKER_HELPERS = importlib.import_module("rvqae_pretrain.scripts.batch_infer_common")
-    _WORKER_PIPELINE = pipeline_module.PolyRvqAePipeline(
-        weight_path=str(checkpoint_path),
-        config_path=str(config_path),
-        device=str(device),
-        precision="fp32",
+    device = f"cuda:{local_rank}"
+    torch.cuda.set_device(torch.device(device))
+    dist.init_process_group(
+        backend="nccl",
+        device_id=torch.device(f"cuda:{local_rank}")
     )
+    return rank, local_rank, world_size, device
+
+def _build_rank_output_path(output_dir: str, input_shard_path: Path, rank: int) -> Path:
+    output_root = Path(output_dir).expanduser().resolve()
+    in_path = Path(input_shard_path).expanduser().resolve()
+    stem_path = output_root / f"tri2ind_{in_path.stem}.pt"
+    return stem_path.with_name(f"{stem_path.stem}_rank{rank:03d}{stem_path.suffix}")
 
 
-def _process_one_batch(
-    start_index: int,
-    tri_batch,
-    meta_batch,
-):
-    """Process one triangle batch and return output records with global start index."""
-    global _WORKER_PIPELINE, _WORKER_HELPERS
-    if _WORKER_PIPELINE is None or _WORKER_HELPERS is None:
-        raise RuntimeError("Worker pipeline is not initialized.")
-
+def _process_one_batch(pipeline, helpers, tri_batch, meta_batch, gid_batch):
+    """Process one triangle batch and return output records with gid payload."""
     import torch
 
-    indices_batch = _WORKER_PIPELINE.quantize_triangles(tri_batch)
+    indices_batch = pipeline.quantize_triangles(tri_batch)
     if indices_batch.ndim == 3:
         indices_batch = indices_batch.unsqueeze(1)
-    indices_batch = _WORKER_HELPERS.to_uint16_indices(indices_batch, context="tri2ind")
+    indices_batch = helpers.to_uint16_indices(indices_batch, context="tri2ind")
 
     records = []
     for sample_offset in range(len(tri_batch)):
         records.append(
             {
+                "gid": int(gid_batch[sample_offset]),
                 "indices": indices_batch[sample_offset].cpu(),
                 "meta": torch.as_tensor(meta_batch[sample_offset], dtype=torch.float32).cpu(),
             }
         )
     return {
-        "start_index": int(start_index),
         "sample_count": int(len(records)),
         "records": records,
     }
@@ -96,136 +86,202 @@ def _process_one_batch(
 def main() -> None:
     ensure_cuda_runtime_libs()
     project_root = _inject_repo_root()
+    import torch
+    import torch.distributed as dist
 
     if __package__ in {None, ""}:
         import importlib
 
         helpers = importlib.import_module("rvqae_pretrain.scripts.batch_infer_common")
+        pipeline_module = importlib.import_module("rvqae_pretrain.src.engine.pipeline")
     else:
         from . import batch_infer_common as helpers
+        from ..src.engine import pipeline as pipeline_module
 
     parser = argparse.ArgumentParser(description="Encode triangle shards to RVQ indices (with meta).")
     parser.add_argument("--tri_dir", type=str, required=True, help="Directory containing triangle+meta shard files.")
     parser.add_argument("--model_dir", type=str, required=True, help="Training `best` directory or its parent.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for tri2ind shards.")
-    parser.add_argument("--batch_size", type=int, default=64, help="Per-GPU inference micro-batch size.")
-    parser.add_argument("--device", type=str, default="cuda", help="Fallback single runtime device.")
-    parser.add_argument("--gpus", type=str, default="", help="GPU id CSV for multi-GPU workers, e.g. `0,1,2,3`.")
+    parser.add_argument("--batch_size", type=int, default=512, help="Per-rank inference micro-batch size.")
+    parser.add_argument("--device", type=str, default="cuda", help="Runtime device type, usually `cuda`.")
     args = parser.parse_args()
 
     if args.batch_size <= 0:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
 
-    worker_devices = helpers.parse_gpu_devices(args.gpus, fallback_device=args.device)
-    checkpoint_path, config_path = helpers.resolve_model_paths(args.model_dir)
-    tri_meta_pairs = helpers.resolve_tri_meta_pairs(args.tri_dir)
-    total_samples = helpers.preflight_validate_tri_meta_pairs(tri_meta_pairs)
-    print(
-        f"[INFO] Tri/meta preflight passed: {len(tri_meta_pairs)} shard pairs, "
-        f"total_samples={total_samples}, workers={worker_devices}"
-    )
-
-    helpers.clear_task_outputs(args.output_dir, task_prefix="tri2ind", manifest_name="tri2ind.manifest.json")
-
-    executors: list[ProcessPoolExecutor] = []
-    mp_context = mp.get_context("spawn")
+    rank = 0
+    world_size = 1
     shard_records = []
-    import torch
+    total_progress = None
 
     try:
-        for device in worker_devices:
-            executor = ProcessPoolExecutor(
-                max_workers=1,
-                mp_context=mp_context,
-                initializer=_init_worker,
-                initargs=(str(project_root.parent), str(checkpoint_path), str(config_path), str(device)),
+        rank, local_rank, world_size, device = _setup_distributed(args, helpers)
+        is_rank0 = rank == 0
+
+        checkpoint_path, config_path = helpers.resolve_model_paths(args.model_dir)
+        tri_meta_gid_triplets = helpers.resolve_tri_meta_gid_triplets(args.tri_dir)
+
+        total_samples = 0
+        if is_rank0:
+            total_samples = helpers.preflight_validate_tri_meta_gid_triplets(tri_meta_gid_triplets)
+            print(
+                f"[INFO] Tri/meta/gid preflight passed: {len(tri_meta_gid_triplets)} shard triplets, "
+                f"total_samples={total_samples}, world_size={world_size}, device={device}"
             )
-            executors.append(executor)
+            helpers.clear_task_outputs(
+                args.output_dir,
+                task_prefix="tri2ind",
+                manifest_name="tri2ind.manifest.json",
+            )
 
-        with tqdm(total=total_samples, desc="tri2ind total", unit="sample", position=0) as total_progress:
-            for shard_index, pair in enumerate(tri_meta_pairs, start=1):
-                tri_samples = helpers.load_torch_list(pair.tri_path)
-                meta_samples = helpers.load_torch_list(pair.meta_path)
-                if len(tri_samples) != len(meta_samples):
-                    raise ValueError(
-                        f"Triangle/meta sample count mismatch for {pair.tri_path.name} and {pair.meta_path.name}: "
-                        f"{len(tri_samples)} vs {len(meta_samples)}"
-                    )
+        dist.barrier(device_ids=[torch.device(device).index])
 
-                shard_size = len(tri_samples)
-                shard_outputs: list[dict | None] = [None] * shard_size
-                futures = []
-                batch_index = 0
-                for start in range(0, shard_size, args.batch_size):
-                    end = min(start + args.batch_size, shard_size)
-                    tri_batch = [np.asarray(sample, dtype=np.float32) for sample in tri_samples[start:end]]
-                    meta_batch = meta_samples[start:end]
-                    executor = executors[batch_index % len(executors)]
-                    futures.append(executor.submit(_process_one_batch, int(start), tri_batch, meta_batch))
-                    batch_index += 1
+        pipeline = pipeline_module.PolyRvqAePipeline(
+            weight_path=str(checkpoint_path),
+            config_path=str(config_path),
+            device=str(device),
+            precision="fp32",
+        )
 
-                with tqdm(
+        if is_rank0:
+            total_progress = tqdm(total=total_samples, desc="tri2ind total", unit="sample", position=0)
+
+        for shard_index, pair in enumerate(tri_meta_gid_triplets, start=1):
+            if is_rank0:
+                print(f"[INFO] Loading shard {shard_index}/{len(tri_meta_gid_triplets)}: {pair.tri_path.name}")
+            tri_samples = helpers.load_torch_list(pair.tri_path)
+            meta_samples = helpers.load_torch_list(pair.meta_path)
+            gid_samples = helpers.load_torch_list(pair.gid_path)
+            if len(tri_samples) != len(meta_samples) or len(tri_samples) != len(gid_samples):
+                raise ValueError(
+                    "Triangle/meta/gid sample count mismatch for "
+                    f"{pair.tri_path.name}, {pair.meta_path.name}, {pair.gid_path.name}: "
+                    f"{len(tri_samples)}, {len(meta_samples)}, {len(gid_samples)}"
+                )
+
+            shard_size = len(tri_samples)
+            rank_outputs = []
+            rank_sample_count = 0
+            shard_progress = (
+                tqdm(
                     total=shard_size,
-                    desc=f"tri2ind shard {shard_index}/{len(tri_meta_pairs)}",
+                    desc=f"tri2ind shard {shard_index}/{len(tri_meta_gid_triplets)}",
                     unit="sample",
                     leave=False,
                     position=1,
-                ) as shard_progress:
-                    for future in as_completed(futures):
-                        record = future.result()
-                        start_index = int(record["start_index"])
-                        sample_count = int(record["sample_count"])
-                        records = list(record["records"])
-                        if len(records) != sample_count:
-                            raise RuntimeError("Worker returned inconsistent tri2ind batch result length.")
-                        shard_outputs[start_index : start_index + sample_count] = records
-                        shard_progress.update(sample_count)
-                        total_progress.update(sample_count)
-
-                if any(item is None for item in shard_outputs):
-                    raise RuntimeError(f"tri2ind shard has missing outputs: {pair.tri_path}")
-                output_samples = [item for item in shard_outputs if item is not None]
-                output_path = helpers.build_task_output_path(args.output_dir, "tri2ind", pair.tri_path)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(output_samples, output_path)
-                shard_records.append(
-                    {
-                        "path": str(output_path.resolve()),
-                        "sample_count": int(len(output_samples)),
-                        "size_bytes": int(output_path.stat().st_size),
-                        "input_tri_path": str(pair.tri_path),
-                        "input_meta_path": str(pair.meta_path),
-                    }
                 )
+                if is_rank0
+                else None
+            )
+
+            num_batches = (shard_size + args.batch_size - 1) // args.batch_size
+            if is_rank0:
                 print(
-                    f"[INFO] Encoded shard {shard_index}/{len(tri_meta_pairs)}: {pair.tri_path.name} "
-                    f"-> {output_path.name} ({len(output_samples)} samples)"
+                    f"[INFO] Processing shard {shard_index}/{len(tri_meta_gid_triplets)}: "
+                    f"samples={shard_size}, batches={num_batches}, world_size={world_size}, output_mode=rank_part"
                 )
+            for round_start in range(0, num_batches, world_size):
+                batch_index = round_start + rank
+
+                if batch_index < num_batches:
+                    start = batch_index * args.batch_size
+                    end = min(start + args.batch_size, shard_size)
+                    tri_batch = [np.asarray(sample, dtype=np.float32) for sample in tri_samples[start:end]]
+                    meta_batch = meta_samples[start:end]
+                    gid_batch = gid_samples[start:end]
+                    local_payload = _process_one_batch(
+                        pipeline=pipeline,
+                        helpers=helpers,
+                        tri_batch=tri_batch,
+                        meta_batch=meta_batch,
+                        gid_batch=gid_batch,
+                    )
+                    records = list(local_payload["records"])
+                    if len(records) != int(local_payload["sample_count"]):
+                        raise RuntimeError("Local tri2ind batch result length is inconsistent.")
+                    rank_outputs.extend(records)
+                    rank_sample_count += len(records)
+
+                if is_rank0:
+                    round_sample_count = 0
+                    for round_rank in range(world_size):
+                        round_batch_index = round_start + round_rank
+                        if round_batch_index >= num_batches:
+                            continue
+                        start_index = round_batch_index * args.batch_size
+                        end_index = min(start_index + args.batch_size, shard_size)
+                        round_sample_count += end_index - start_index
+                    shard_progress.update(round_sample_count)
+                    total_progress.update(round_sample_count)
+
+            output_path = _build_rank_output_path(args.output_dir, pair.tri_path, rank)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            print(
+                f"[RANK {rank}] Saving part shard {shard_index}/{len(tri_meta_gid_triplets)}: "
+                f"{output_path.name} ({rank_sample_count} samples)",
+                flush=True,
+            )
+            torch.save(rank_outputs, output_path)
+
+            dist.barrier(device_ids=[torch.device(device).index])
+
+            if is_rank0:
+                for part_rank in range(world_size):
+                    part_path = _build_rank_output_path(args.output_dir, pair.tri_path, part_rank)
+                    if not part_path.is_file():
+                        raise FileNotFoundError(f"Missing rank output part: {part_path}")
+                    part_samples = 0
+                    for batch_index in range(part_rank, num_batches, world_size):
+                        start = batch_index * args.batch_size
+                        end = min(start + args.batch_size, shard_size)
+                        part_samples += end - start
+                    shard_records.append(
+                        {
+                            "path": str(part_path.resolve()),
+                            "rank": int(part_rank),
+                            "sample_count": int(part_samples),
+                            "size_bytes": int(part_path.stat().st_size),
+                            "input_tri_path": str(pair.tri_path),
+                            "input_meta_path": str(pair.meta_path),
+                            "input_gid_path": str(pair.gid_path),
+                        }
+                    )
+                print(
+                    f"[INFO] Encoded shard {shard_index}/{len(tri_meta_gid_triplets)}: {pair.tri_path.name} "
+                    f"-> {world_size} rank part files"
+                )
+                shard_progress.close()
+
+            dist.barrier(device_ids=[torch.device(device).index])
+
+        if is_rank0:
+            total_progress.close()
+            manifest_path = helpers.write_task_manifest(
+                output_dir=args.output_dir,
+                manifest_name="tri2ind.manifest.json",
+                metadata={
+                    "id_field": "gid",
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "tri_dir": str(Path(args.tri_dir).expanduser().resolve()),
+                    "model_dir": str(Path(args.model_dir).expanduser().resolve()),
+                    "checkpoint_path": str(checkpoint_path),
+                    "config_path": str(config_path),
+                    "batch_size": int(args.batch_size),
+                    "device": str(args.device),
+                    "world_size": int(world_size),
+                    "output_mode": "rank_part",
+                    "project_root": str(project_root),
+                },
+                shard_records=shard_records,
+            )
+            print(f"[INFO] Saved tri2ind shards to: {Path(args.output_dir).expanduser().resolve()}")
+            print(f"[INFO] Manifest: {manifest_path}")
+            print(f"[INFO] Exported samples: {sum(int(item['sample_count']) for item in shard_records)}")
     finally:
-        for executor in executors:
-            executor.shutdown(wait=True, cancel_futures=False)
+        if total_progress is not None:
+            total_progress.close()
 
-    manifest_path = helpers.write_task_manifest(
-        output_dir=args.output_dir,
-        manifest_name="tri2ind.manifest.json",
-        metadata={
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "tri_dir": str(Path(args.tri_dir).expanduser().resolve()),
-            "model_dir": str(Path(args.model_dir).expanduser().resolve()),
-            "checkpoint_path": str(checkpoint_path),
-            "config_path": str(config_path),
-            "batch_size": int(args.batch_size),
-            "device": str(args.device),
-            "gpus": str(args.gpus),
-            "worker_devices": worker_devices,
-            "project_root": str(project_root),
-        },
-        shard_records=shard_records,
-    )
-
-    print(f"[INFO] Saved tri2ind shards to: {Path(args.output_dir).expanduser().resolve()}")
-    print(f"[INFO] Manifest: {manifest_path}")
-    print(f"[INFO] Exported samples: {sum(int(item['sample_count']) for item in shard_records)}")
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
