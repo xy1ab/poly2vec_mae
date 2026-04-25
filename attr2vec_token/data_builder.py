@@ -98,6 +98,11 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
         df = load_csv_safely(csv_file)
         if df is None: continue
 
+        # 🌟 针对 CSV：拦截并剔除 gid
+        gid_col = next((c for c in df.columns if c.lower() == 'gid'), None)
+        if gid_col:
+            df = df.drop(columns=[gid_col])
+
         layer_name = os.path.basename(csv_file).split('.')[0]
 
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -129,6 +134,12 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
                 
                 df = pyogrio.read_dataframe(gdb_file, layer=layer_name, read_geometry=False)
                 if len(df) == 0: continue
+
+                # 🌟 针对 GDB：拦截并剔除 gid
+                gid_col = next((c for c in df.columns if c.lower() == 'gid'), None)
+                if gid_col:
+                    df = df.drop(columns=[gid_col])
+
                 num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
                 str_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in ['geometry', 'shape']]
                 
@@ -160,6 +171,11 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
             df = pyogrio.read_dataframe(shp_file, read_geometry=False)
             if len(df) == 0: continue
             
+            # 🌟 针对 SHP：拦截并剔除 gid
+            gid_col = next((c for c in df.columns if c.lower() == 'gid'), None)
+            if gid_col:
+                df = df.drop(columns=[gid_col])
+
             # ----------- ✅ SHP 专属验证打印 -----------
             print(f"\n✅ [SHP 验证] 成功连接文件: {os.path.basename(shp_file)}")
             print(f"📊 样本量: {len(df)} 行 | 属性维度: {len(df.columns)} 列")
@@ -243,9 +259,9 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZrZy Data Builder: Sniff Dims & Train Tokenizer")
-    parser.add_argument("--data_dir", type=str, default="/mnt/data/yqmeng/ZRZYB/NRE_GIT_V5_1/raw_data/")
-    parser.add_argument("--output_dir", type=str, default="/mnt/data/yqmeng/ZRZYB/NRE_GIT_V5_1/output")
-    parser.add_argument("--config_path", type=str, default="/mnt/data/yqmeng/ZRZYB/NRE_GIT_V5_1/output/config.json")
+    parser.add_argument("--data_dir", type=str, default="/mnt/data/yqmeng/ZRZYB/NRE_GIT_V8/raw_data/")
+    parser.add_argument("--output_dir", type=str, default="/mnt/data/yqmeng/ZRZYB/NRE_GIT_V8/output")
+    parser.add_argument("--config_path", type=str, default="/mnt/data/yqmeng/ZRZYB/NRE_GIT_V8/output/config.json")
     args = parser.parse_args()
     
     cfg = ModelConfig()

@@ -33,7 +33,7 @@ class ModelConfig:
         self.warmup_epochs = 2
         self.mask_ratio = 0.20
         self.data_dir = "./raw_data"
-        self.output_dir = "./processed"
+        self.output_dir = "./output"
         self.tokenizer_path = os.path.join(self.output_dir, "zrzy_tokenizer.json")
         
     @property
