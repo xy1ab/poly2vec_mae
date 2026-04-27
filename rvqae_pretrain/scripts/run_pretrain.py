@@ -30,6 +30,10 @@ else:
     from .runtime_bootstrap import ensure_cuda_runtime_libs
 
 
+COLLAPSE_EXIT_CODE = 88
+_COLLAPSE_DIAG_FILENAME = "collapse_guard_last.json"
+
+
 def _inject_repo_root() -> Path:
     """Inject repository root into `sys.path` for direct script execution.
 
@@ -183,6 +187,16 @@ def _normalize_runtime_config(config: dict) -> dict:
     return normalized
 
 
+def _collapse_diag_updated(config: dict, *, since: float) -> bool:
+    """Check whether the current run wrote a fresh collapse guard diagnostic."""
+    run_dir = Path(str(config["save_dir"])).expanduser() / str(config["run_name"])
+    diag_path = run_dir / "ckpt" / _COLLAPSE_DIAG_FILENAME
+    try:
+        return diag_path.is_file() and diag_path.stat().st_mtime >= float(since) - 1.0
+    except OSError:
+        return False
+
+
 def _terminate_process_group(proc: subprocess.Popen, timeout_sec: float = 8.0) -> int | None:
     """Terminate a spawned process group with graceful fallback to SIGKILL.
 
@@ -334,6 +348,12 @@ def main() -> None:
         required=True,
         help="Stable run directory name under `save_dir`; existing checkpoints auto-resume.",
     )
+    pre_parser.add_argument(
+        "--save_dir",
+        type=str,
+        default=None,
+        help="Optional save directory override used by launcher-side collapse auto-restart.",
+    )
     pre_parser.add_argument("--no_auto_spawn", action="store_true")
     pre_args, remaining = pre_parser.parse_known_args()
 
@@ -343,6 +363,8 @@ def main() -> None:
     )
     config = _normalize_runtime_config(config)
     config["run_name"] = str(pre_args.run_name)
+    if pre_args.save_dir is not None:
+        config["save_dir"] = str(Path(pre_args.save_dir).expanduser().resolve())
 
     # Apply early GPU override so DDP process-count follows CLI user intent.
     if pre_args.gpu is not None:
@@ -373,6 +395,8 @@ def main() -> None:
         cmd.extend(["--config", str(pre_args.config)])
         cmd.append("--no_auto_spawn")
         cmd.extend(["--run_name", str(pre_args.run_name)])
+        if pre_args.save_dir is not None:
+            cmd.extend(["--save_dir", str(pre_args.save_dir)])
         if pre_args.gpu is not None:
             cmd.extend(["--gpu", str(pre_args.gpu)])
         if pre_args.eval_every is not None:
@@ -381,16 +405,29 @@ def main() -> None:
         env = dict(os.environ)
         # Ensure torchrun local ranks map strictly to requested GPU subset.
         env["CUDA_VISIBLE_DEVICES"] = visible_gpu_csv
-        return_code = _run_torchrun_with_signal_guard(cmd=cmd, env=env)
-        if return_code == 0:
-            return
-        if return_code >= 128:
-            raise SystemExit(return_code)
-        print(
-            "[WARN] Auto DDP spawn failed; fallback to single-process launch. "
-            f"Exit code: {return_code}",
-            file=sys.stderr,
-        )
+        collapse_restarts = 0
+        while True:
+            started_at = time.time()
+            return_code = _run_torchrun_with_signal_guard(cmd=cmd, env=env)
+            if return_code == 0:
+                return
+            if return_code == COLLAPSE_EXIT_CODE or _collapse_diag_updated(config, since=started_at):
+                collapse_restarts += 1
+                print(
+                    "[COLLAPSE] Training collapse detected; relaunching from latest "
+                    f"resume checkpoint. restart={collapse_restarts}",
+                    file=sys.stderr,
+                )
+                time.sleep(2.0)
+                continue
+            if return_code >= 128:
+                raise SystemExit(return_code)
+            print(
+                "[WARN] Auto DDP spawn failed; fallback to single-process launch. "
+                f"Exit code: {return_code}",
+                file=sys.stderr,
+            )
+            break
 
     if len(gpu_list) > 1 and not pre_args.no_auto_spawn and not cuda_available:
         print(
