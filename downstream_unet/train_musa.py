@@ -177,6 +177,11 @@ def main():
         activation='sigmoid'
     ).to(device)
 
+    if local_rank == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"总参数量: {total_params:,}")
+
+
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     
     dice_loss = smp.losses.DiceLoss(mode='binary')
