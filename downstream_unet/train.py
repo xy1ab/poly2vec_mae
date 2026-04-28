@@ -10,9 +10,6 @@
 
 import os
 import time
-import json
-import hashlib
-from functools import partial
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -23,66 +20,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LinearLR
 from pytorch_msssim import ssim
-import webdataset as wds
-import glob
+from dataloader import get_wds_loader, load_samples
 
 
-def load_samples(index_file):
-    with open(index_file, "r") as f:
-        index = json.load(f)
-        train_info = index['train']
-        val_info = index['val']        
-    return train_info, val_info
-
-
-
-def sample_belongs_to_rank(sample, rank, world_size):
-    key = sample["__key__"]
-    if not isinstance(key, str):
-        key = key.decode("utf-8")
-    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
-    sample_rank = int.from_bytes(digest, "little") % world_size
-    return sample_rank == rank
-
-
-def get_wds_loader(url_pattern, batch_size, total_samples, is_training=True, num_workers=4, split_by_rank=True, split_samples_by_rank=False):
-    file_list = sorted(glob.glob(url_pattern))
-    
-    if dist.is_initialized():
-        print(f"Rank {dist.get_rank()} found {len(file_list)} shards for {url_pattern}")
-        
-    if not file_list:
-        raise FileNotFoundError(f"未找到匹配的文件: {url_pattern}")
-
-    # nodesplitter=wds.split_by_node 自动实现 DDP 分片
-    shard_shuffle_buffer = 5000 if is_training else 0
-    nodesplitter = wds.split_by_node if split_by_rank else None
-    dataset = wds.WebDataset(file_list, shardshuffle=shard_shuffle_buffer, nodesplitter=nodesplitter, empty_check=False)
-
-    if dist.is_initialized() and split_samples_by_rank:
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        dataset = dataset.select(partial(sample_belongs_to_rank, rank=rank, world_size=world_size))
-
-    dataset = (
-        dataset
-        .decode("torch")
-        .to_tuple("input.npy", "label.npy") # 根据你保存的 key
-        .batched(batch_size, partial=not is_training)
-    )
-
-    epoch_batches = None
-    if dist.is_initialized() and is_training:
-        world_size = dist.get_world_size() if split_by_rank else 1
-        epoch_batches = total_samples // (batch_size * world_size)
-        if epoch_batches < 1:
-            raise ValueError("训练样本数小于全局 batch size，无法在 drop_last=True 下安全启动 DDP")
-
-    # WDS 已经完成了 batch 组装，DataLoader 的 batch_size 需设为 None
-    loader = wds.WebLoader(dataset, batch_size=None, num_workers=num_workers, pin_memory=True)
-    if epoch_batches is not None:
-        loader = loader.with_epoch(nbatches=epoch_batches)
-    return loader
 
 def calculate_iou(pred, target, threshold=0.5):
     pred_bin = (pred > threshold).float()
@@ -103,7 +43,7 @@ def setup_distributed():
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     
-    dist.init_process_group(backend='nccl', device_id=device)
+    dist.init_process_group(backend='nccl')
     return local_rank, world_size, device
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="downstream_UNet")
@@ -112,9 +52,9 @@ def build_arg_parser():
     parser.add_argument("--test_data_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_ckpt")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--warmup_epochs", type=int, default=10)
+    parser.add_argument("--warmup_epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1.5e-4)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_freq", type=int, default=20)
     parser.add_argument("--dice_weight", type=float, default=1.)
@@ -131,7 +71,6 @@ def main():
     index_file = args.index_file
     batch_size = int(args.batch_size)
     epochs = int(args.epochs)
-    lr = float(args.lr)
     warmup_epochs = int(args.warmup_epochs)
     num_workers = int(args.num_workers)
     save_dir = args.save_dir
@@ -146,7 +85,8 @@ def main():
     # ⚙️ DDP 初始化
     # ==========================================
     local_rank, world_size, device = setup_distributed()
-
+    base_lr = float(args.lr)
+    target_lr = base_lr * (world_size**0.5)
     if local_rank == 0:
         os.makedirs(save_dir, exist_ok=True)
         print(f"🚀 训练启动！DDP进程数: {world_size}")
@@ -154,7 +94,7 @@ def main():
         print(f"   数据路径: {index_file}")
         print(f"   批次大小: {batch_size}")
         print(f"   训练轮数: {epochs}")
-        print(f"   学习率: {lr}")
+        print(f"   学习率: {target_lr}")
         print(f"   验证频率: 每 {eval_every} 轮")
 
     # ==========================================
@@ -167,7 +107,7 @@ def main():
     val_urls = os.path.join(val_info['path'], "val-*.tar") 
     train_loader = get_wds_loader(train_urls, batch_size, total_samples=train_info['num_samples'], is_training=True, num_workers=num_workers, split_by_rank=True)
     val_loader = get_wds_loader(val_urls, batch_size, total_samples=val_info['num_samples'], is_training=False, num_workers=num_workers, split_by_rank=False, split_samples_by_rank=True)
-    log_interval = train_info['num_samples'] // 5
+    log_interval = 100#train_info['num_samples'] // 5
     # ==========================================
     # 2. 模型初始化
     # ==========================================
@@ -179,12 +119,16 @@ def main():
         activation=None
     ).to(device)
 
+    if local_rank == 0:
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"总参数量: {total_params / 1e6:.2f} M")
+
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     
     dice_loss = smp.losses.DiceLoss(mode='binary')
     bce_loss = nn.BCEWithLogitsLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+    optimizer = optim.AdamW(model.parameters(), lr=target_lr, weight_decay=0.01)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6
     )
@@ -206,12 +150,7 @@ def main():
         train_loss = 0.0
         train_count = 0
 
-        if local_rank == 0:
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
-        else:
-            pbar = train_loader
-
-        for input, label in pbar:
+        for step, (input, label) in enumerate(train_loader):
             input, label = input.to(device), label.float().to(device)
             optimizer.zero_grad()
             logits = model(input)
@@ -224,13 +163,15 @@ def main():
             loss = dice_weight * l_dice + bce_weight * l_bce + ssim_weight * l_ssim
 
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(),max_norm=1.0)
             optimizer.step()
             
+
             batch_samples = input.size(0)
             train_loss += loss.item() * batch_samples
             train_count += batch_samples
-            if local_rank == 0 and train_count % log_interval == 0:
-                print(f"dice_loss: {l_dice.item():.3f}, bce_loss: {l_bce.item():.3f}")
+            if local_rank == 0 and step % log_interval == 0:
+                print(f"Epoch: {epoch}, Step: {step} | dice_loss: {l_dice.item():.3f}, bce_loss: {l_bce.item():.3f}")
         
         # 指标同步
         train_loss_tensor = torch.tensor(train_loss, device=device)
@@ -251,12 +192,8 @@ def main():
             model.eval()
             eval_model = model.module
             with torch.no_grad():
-                if local_rank == 0:
-                    val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]", leave=False)
-                else:
-                    val_pbar = val_loader
-
-                for input, label in val_pbar:
+      
+                for step, (input, label) in enumerate(val_loader):
                     input, label = input.to(device), label.float().to(device)
                     logits = eval_model(input)
                     pred = torch.sigmoid(logits)

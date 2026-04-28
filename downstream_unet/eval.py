@@ -1,3 +1,13 @@
+#!/usr/bin/env python
+# -*- encoding: utf-8 -*-
+'''
+@File    :   eval.py
+@Time    :   2026/04/25 15:10:39
+@Author  :   Hu Bin 
+@Version :   1.0
+@Desc    :   None
+'''
+
 import os
 import sys
 from pathlib import Path
@@ -10,7 +20,7 @@ from torch.utils.data import Subset
 import time
 import yaml
 import argparse
-
+from dataloader import get_wds_loader, load_samples
 
 
 def calculate_metrics(pred, target, input_blur, threshold=0.5):
@@ -39,41 +49,30 @@ def calculate_metrics(pred, target, input_blur, threshold=0.5):
 def build_arg_parser() -> argparse.ArgumentParser:
     """构建南湖平台标准 CLI 解析器"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_path", type=str, default=None)
-    parser.add_argument("--data_path", type=str, default="") 
+    parser.add_argument("--index_file", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset/index_file.json")
+    parser.add_argument("--model_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_ckpt/unet_best.pth")
+    parser.add_argument("--data_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_traindataset/val") 
+    parser.add_argument("--vis_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_ckpe/vis")
+    parser.add_argument("--batch_size", type=int, default=128) 
+    parser.add_argument("--num_workers", type=int, default=4)
+    
     return parser
 
 def main():
     args = build_arg_parser().parse_args()
-    device = torch.device('musa' if torch.musa.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     current_time = time.strftime("%Y%m%d_%H%M%S")
     
-    # ========== 1. 路径配置（从 YAML 读取或硬编码） ==========
-    # 方式1：从训练配置读取（推荐）
-    config_path = args.config_path
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            cfg = yaml.safe_load(f)
-        data_path = cfg['data']['data_path']
-        indices_path = cfg['data']['test_dataset']
-        model_dir = cfg['logging']['save_dir']
-        model_path = os.path.join(model_dir, 'unet_best.pth')
-    else:
-        # 方式2：硬编码（根据您的实际路径修改）
-        data_path = args.data_path      # 单文件数据
-        indices_path = args.indices_path   # 测试集索引
-        model_path = args.model_path
-    
     # 可视化输出目录
-    vis_dir = args.vis_dir
-    os.makedirs(vis_dir, exist_ok=True)
-    report_path = os.path.join(vis_dir, f'evaluation_report_{current_time}.txt')
+    os.makedirs(args.vis_dir, exist_ok=True)
+    report_path = os.path.join(args.vis_dir, f'evaluation_report_{current_time}.txt')
     
     # ========== 2. 加载测试集 ==========
-    full_dataset = V2Dataset(data_path)  # 支持单文件
-    test_indices = torch.load(indices_path)
-    test_set = Subset(full_dataset, test_indices)
-    print(f"\n📦 成功解封测试集！共抽取 {len(test_set)} 道陌生样本。")
+    _, val_info = load_samples(args.index_file)
+    val_urls = os.path.join(val_info['path'], "val-*.tar") 
+    val_loader = get_wds_loader(val_urls, args.batch_size, total_samples=val_info['num_samples'], is_training=False, num_workers=args.num_workers, split_by_rank=False, split_samples_by_rank=True)
+
+    print(f"\n📦 测试集 共抽取 {val_info['num_samples']} 道样本。")
     
     # ========== 3. 加载模型（从 YAML 读取模型参数） ==========
     model = smp.Unet(
@@ -81,17 +80,18 @@ def main():
         encoder_weights=None,
         in_channels=3,
         classes=1,
-        activation='sigmoid'
+        activation=None
     ).to(device)
     
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(args.model_path, map_location=device))
     model.eval()
-    print(f"🤖 模型加载完毕: {model_path}")
+    print(f"🤖 模型加载完毕: {args.model_path}")
     print("开始进行数据分析...\n" + "="*50)
     
     # ========== 4. 随机抽取测试样本 ==========
+
     num_samples = 2
-    sample_indices = random.sample(range(len(test_set)), num_samples)
+    sample_indices = random.sample(range(val_loader)), num_samples)
     
     fig, axes = plt.subplots(num_samples, 4, figsize=(22, 6 * num_samples))
     plt.subplots_adjust(hspace=0.4)
