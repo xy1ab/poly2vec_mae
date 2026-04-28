@@ -28,7 +28,7 @@ if __package__ in {None, ""}:
     ind2emd = importlib.import_module("rvqae_pretrain.scripts.run_ind2emd")
 else:
     from .runtime_bootstrap import ensure_cuda_runtime_libs
-    from . import run_ind2emd as ind2emd
+    from . import run_ind2emb as ind2emd
 
 
 def _resolve_manifest_entry_path(raw_path: str | Path, manifest_path: Path) -> Path:
